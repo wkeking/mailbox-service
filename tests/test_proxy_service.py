@@ -1,0 +1,127 @@
+"""Focused regression tests for sticky egress proxy assignment behavior."""
+
+from __future__ import annotations
+
+from base64 import urlsafe_b64encode
+
+import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session, sessionmaker
+
+from mailbox_service.config import Settings
+from mailbox_service.database import Base
+from mailbox_service.models import EgressProxy, EgressProxyProtocol, EgressProxyStatus, Mailbox
+from mailbox_service.proxy_service import EgressProxyService, NoHealthyEgressProxyError
+from mailbox_service.security import CredentialCipher
+
+
+def create_test_service(failure_threshold: int = 3) -> tuple[Session, EgressProxyService]:
+    """Build an isolated SQLite-backed service with a deterministic encryption key."""
+    database_engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    Base.metadata.create_all(database_engine)
+    session = sessionmaker(bind=database_engine, expire_on_commit=False)()
+    encryption_key = urlsafe_b64encode(b"p" * 32).decode("ascii")
+    settings = Settings(
+        database_url="sqlite+pysqlite:///:memory:",
+        credential_encryption_key=encryption_key,
+        proxy_failure_threshold=failure_threshold,
+    )
+    return session, EgressProxyService(session, settings, CredentialCipher(encryption_key))
+
+
+def create_proxy(name: str, priority: int = 100) -> EgressProxy:
+    """Create a healthy proxy suitable for deterministic selection assertions."""
+    return EgressProxy(
+        name=name,
+        protocol=EgressProxyProtocol.SOCKS5,
+        host=f"{name}.example.test",
+        port=1080,
+        priority=priority,
+        status=EgressProxyStatus.HEALTHY,
+    )
+
+
+def test_mailbox_reuses_its_healthy_proxy_binding() -> None:
+    """OAuth and IMAP callers resolve the same proxy while it remains healthy."""
+    session, proxy_service = create_test_service()
+    first_proxy = create_proxy("first", priority=10)
+    second_proxy = create_proxy("second", priority=20)
+    mailbox = Mailbox(primary_email="owner@outlook.com")
+    session.add_all([first_proxy, second_proxy, mailbox])
+    session.flush()
+
+    first_resolution = proxy_service.resolve_for_mailbox(mailbox.id)
+    second_resolution = proxy_service.resolve_for_mailbox(mailbox.id)
+
+    assert first_resolution is not None
+    assert second_resolution is not None
+    assert first_resolution.id == first_proxy.id
+    assert second_resolution.id == first_proxy.id
+    assert mailbox.egress_proxy_id == first_proxy.id
+
+
+def test_failed_proxy_enters_cooldown_and_mailbox_switches() -> None:
+    """A failed sticky proxy is excluded while a healthy alternative is available."""
+    session, proxy_service = create_test_service(failure_threshold=1)
+    first_proxy = create_proxy("first", priority=10)
+    second_proxy = create_proxy("second", priority=20)
+    mailbox = Mailbox(primary_email="owner@outlook.com")
+    session.add_all([first_proxy, second_proxy, mailbox])
+    session.flush()
+
+    initial_resolution = proxy_service.resolve_for_mailbox(mailbox.id)
+    assert initial_resolution is not None
+    proxy_service.record_proxy_failure(initial_resolution.id, TimeoutError("connect timed out"))
+
+    replacement_resolution = proxy_service.resolve_for_mailbox(mailbox.id)
+
+    assert first_proxy.status == EgressProxyStatus.COOLDOWN
+    assert replacement_resolution is not None
+    assert replacement_resolution.id == second_proxy.id
+    assert mailbox.egress_proxy_id == second_proxy.id
+
+
+def test_required_proxy_policy_never_silently_falls_back_to_direct() -> None:
+    """The resolver emits the stable error when a required pool is empty."""
+    session, proxy_service = create_test_service()
+    mailbox = Mailbox(primary_email="owner@outlook.com")
+    session.add(mailbox)
+    session.flush()
+    policy = proxy_service.ensure_policy()
+    policy.required = True
+
+    with pytest.raises(NoHealthyEgressProxyError) as raised_error:
+        proxy_service.resolve_for_mailbox(mailbox.id)
+
+    assert raised_error.value.error_code == "NO_HEALTHY_EGRESS_PROXY"
+
+
+def test_proxy_credentials_are_encrypted_and_hidden_from_representation() -> None:
+    """Connection settings retain credentials only in non-repr in-memory fields."""
+    session, proxy_service = create_test_service()
+    encryption_key = urlsafe_b64encode(b"p" * 32).decode("ascii")
+    cipher = CredentialCipher(encryption_key)
+    proxy = EgressProxy(
+        name="authenticated",
+        protocol=EgressProxyProtocol.HTTP_CONNECT,
+        host="proxy.example.test",
+        port=8080,
+        username_ciphertext=cipher.encrypt("proxy-user"),
+        password_ciphertext=cipher.encrypt("proxy-secret"),
+        status=EgressProxyStatus.HEALTHY,
+    )
+    mailbox = Mailbox(primary_email="owner@outlook.com")
+    session.add_all([proxy, mailbox])
+    session.flush()
+
+    resolution = proxy_service.resolve_for_mailbox(mailbox.id)
+
+    assert resolution is not None
+    assert "proxy-secret" not in repr(resolution)
+    assert "proxy-user" not in repr(resolution)
+    assert proxy.password_ciphertext != "proxy-secret"
+
+
+def test_orm_enum_values_match_the_mysql_migration_contract() -> None:
+    """Avoid storing Python enum names that MySQL ENUM columns do not accept."""
+    assert EgressProxy.__table__.c.protocol.type.enums == ["http_connect", "socks5"]
