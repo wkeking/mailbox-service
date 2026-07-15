@@ -563,6 +563,80 @@ tbody tr:hover {
   background: rgb(0 0 0 / 6%);
 }
 
+.created-key-panel {
+  margin-bottom: 24px;
+  border: 1px solid #d8ecd9;
+}
+
+.created-key-box {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px;
+  border-radius: 8px;
+  background: #fcfcfc;
+}
+
+.created-key-value {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow-x: auto;
+  white-space: nowrap;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.scope-chip-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  max-width: 320px;
+}
+
+.scope-chip {
+  display: inline-flex;
+  align-items: center;
+  min-height: 20px;
+  padding: 0 8px;
+  border-radius: 999px;
+  background: #eaeaea;
+  color: #4a4a4a;
+  font-size: 11px;
+}
+
+.scope-fieldset {
+  border: 0;
+  margin: 0;
+  padding: 0;
+}
+
+.scope-fieldset legend {
+  margin-bottom: 8px;
+  color: #4a4a4a;
+  font-size: 12px;
+}
+
+.scope-option-list {
+  display: grid;
+  gap: 10px;
+}
+
+.scope-option {
+  align-items: flex-start;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: #f5f5f4;
+}
+
+.scope-option strong {
+  display: block;
+  margin-bottom: 2px;
+  color: #171717;
+  font-size: 12px;
+  font-weight: 500;
+}
+
 .dialog-backdrop {
   position: fixed;
   inset: 0;
@@ -819,6 +893,21 @@ tbody tr:hover {
   .client-id-summary .truncated-hover-label,
   .scope-summary .truncated-hover-label {
     color: #d4d4d4;
+  }
+
+  .created-key-panel {
+    border-color: #3d5a40;
+  }
+
+  .created-key-box,
+  .scope-option,
+  .scope-chip {
+    background: #333;
+    color: #d4d4d4;
+  }
+
+  .scope-option strong {
+    color: #f2f2f2;
   }
 
   .truncated-hover-tooltip {

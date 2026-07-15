@@ -18,6 +18,23 @@ def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def ensure_utc(value: datetime) -> datetime:
+    """Normalize a stored or computed timestamp to timezone-aware UTC.
+
+    MySQL DATETIME columns often come back as naive datetimes. Application code
+    uses aware UTC via :func:`utc_now`, so comparisons must normalize first.
+    """
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def is_expired(expires_at: datetime, *, current_time: datetime | None = None) -> bool:
+    """Return whether ``expires_at`` is at or before the current time in UTC."""
+    comparable_now = ensure_utc(current_time or utc_now())
+    return ensure_utc(expires_at) <= comparable_now
+
+
 def enum_values(enum_type: type[enum.Enum]) -> list[str]:
     """Persist enum values so ORM storage matches the explicit MySQL migration."""
     return [member.value for member in enum_type]

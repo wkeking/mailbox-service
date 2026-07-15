@@ -43,8 +43,10 @@ from mailbox_service.models import (
     Lease,
     LeaseMode,
     Mailbox,
+    MailboxCapability,
     MailboxStatus,
     ProxyPolicy,
+    is_expired,
     utc_now,
 )
 from mailbox_service.proxy_service import (
@@ -1061,10 +1063,18 @@ def get_dashboard_summary(
     _: AdminDependency,
 ) -> DashboardSummaryResponse:
     """Return overview metrics for the Admin console without exposing secrets."""
-    current_time = utc_now()
+    # MySQL DATETIME is typically naive; strip tzinfo so SQL comparisons stay consistent.
+    current_time = utc_now().replace(tzinfo=None)
     total_mailbox_count = session.scalar(select(func.count(Mailbox.id))) or 0
     active_mailbox_count = session.scalar(
         select(func.count(Mailbox.id)).where(Mailbox.status == MailboxStatus.ACTIVE)
+    ) or 0
+    # Operationally usable: active status plus a verified mail-access channel.
+    usable_mailbox_count = session.scalar(
+        select(func.count(Mailbox.id)).where(
+            Mailbox.status == MailboxStatus.ACTIVE,
+            Mailbox.capability.in_((MailboxCapability.IMAP, MailboxCapability.GRAPH)),
+        )
     ) or 0
     invalid_mailbox_count = session.scalar(
         select(func.count(Mailbox.id)).where(Mailbox.status == MailboxStatus.INVALID)
@@ -1074,6 +1084,19 @@ def get_dashboard_summary(
     ) or 0
     cooldown_mailbox_count = session.scalar(
         select(func.count(Mailbox.id)).where(Mailbox.status == MailboxStatus.COOLDOWN)
+    ) or 0
+    # Capability is the operational health signal used by the admin console mailbox list.
+    imap_capable_mailbox_count = session.scalar(
+        select(func.count(Mailbox.id)).where(Mailbox.capability == MailboxCapability.IMAP)
+    ) or 0
+    graph_capable_mailbox_count = session.scalar(
+        select(func.count(Mailbox.id)).where(Mailbox.capability == MailboxCapability.GRAPH)
+    ) or 0
+    unusable_mailbox_count = session.scalar(
+        select(func.count(Mailbox.id)).where(Mailbox.capability == MailboxCapability.UNUSABLE)
+    ) or 0
+    unprobed_capability_mailbox_count = session.scalar(
+        select(func.count(Mailbox.id)).where(Mailbox.capability.is_(None))
     ) or 0
     active_lease_count = session.scalar(
         select(func.count(Lease.id)).where(Lease.released_at.is_(None), Lease.expires_at > current_time)
@@ -1097,9 +1120,14 @@ def get_dashboard_summary(
     return DashboardSummaryResponse(
         total_mailbox_count=total_mailbox_count,
         active_mailbox_count=active_mailbox_count,
+        usable_mailbox_count=usable_mailbox_count,
         invalid_mailbox_count=invalid_mailbox_count,
         disabled_mailbox_count=disabled_mailbox_count,
         cooldown_mailbox_count=cooldown_mailbox_count,
+        imap_capable_mailbox_count=imap_capable_mailbox_count,
+        graph_capable_mailbox_count=graph_capable_mailbox_count,
+        unusable_mailbox_count=unusable_mailbox_count,
+        unprobed_capability_mailbox_count=unprobed_capability_mailbox_count,
         active_lease_count=active_lease_count,
         expired_lease_count=expired_lease_count,
         total_proxy_count=total_proxy_count,
@@ -1338,7 +1366,6 @@ def list_leases(
     page_size: int = Query(default=20, ge=1, le=100),
 ) -> LeaseListResponse:
     """List mailbox leases page by page for operational review."""
-    current_time = utc_now()
     total_lease_count = session.scalar(select(func.count(Lease.id))) or 0
     total_pages = max(1, (total_lease_count + page_size - 1) // page_size)
     offset = (page - 1) * page_size
@@ -1353,7 +1380,7 @@ def list_leases(
     for lease, primary_email in rows:
         if lease.released_at is not None:
             lease_status = "released"
-        elif lease.expires_at <= current_time:
+        elif is_expired(lease.expires_at):
             lease_status = "expired"
         else:
             lease_status = "active"

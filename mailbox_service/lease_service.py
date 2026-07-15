@@ -103,11 +103,13 @@ class LeaseService:
             raise LeaseModeError("外部租约暂不支持 mail_read mode")
 
         current_time = utc_now()
+        # MySQL DATETIME is typically naive; compare with a naive UTC value in SQL.
+        sql_current_time = current_time.replace(tzinfo=None)
         active_lease_exists = exists(
             select(Lease.id).where(
                 Lease.mailbox_id == Mailbox.id,
                 Lease.released_at.is_(None),
-                Lease.expires_at > current_time,
+                Lease.expires_at > sql_current_time,
             )
         )
         mailbox_query = select(Mailbox).where(
@@ -291,16 +293,15 @@ class LeaseService:
 
     @staticmethod
     def _is_expired(expires_at: datetime) -> bool:
-        current_time = utc_now()
-        if expires_at.tzinfo is None and current_time.tzinfo is not None:
-            current_time = current_time.replace(tzinfo=None)
-        return expires_at <= current_time
+        from mailbox_service.models import is_expired
+
+        return is_expired(expires_at)
 
     @staticmethod
     def _as_utc(value: datetime) -> datetime:
-        if value.tzinfo is None:
-            return value.replace(tzinfo=timezone.utc)
-        return value.astimezone(timezone.utc)
+        from mailbox_service.models import ensure_utc
+
+        return ensure_utc(value)
 
 
 def hmac_compare(current_value: str, candidate_value: str) -> bool:

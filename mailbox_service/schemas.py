@@ -11,16 +11,16 @@ from mailbox_service.models import EgressProxyProtocol, EgressProxyStatus, Lease
 
 
 class EgressProxyCreate(BaseModel):
-    """Writable fields for registering a global egress proxy."""
+    """创建出口代理的请求参数。"""
 
-    name: str = Field(min_length=1, max_length=100)
-    protocol: EgressProxyProtocol
-    host: str = Field(min_length=1, max_length=255)
-    port: int = Field(ge=1, le=65535)
-    username: str | None = Field(default=None, max_length=255)
-    password: str | None = Field(default=None, max_length=4096)
-    enabled: bool = True
-    priority: int = Field(default=100, ge=0, le=1_000_000)
+    name: str = Field(min_length=1, max_length=100, description="代理显示名称，全局唯一。")
+    protocol: EgressProxyProtocol = Field(description="代理协议：socks5 或 http_connect。")
+    host: str = Field(min_length=1, max_length=255, description="代理主机名或 IP。")
+    port: int = Field(ge=1, le=65535, description="代理端口。")
+    username: str | None = Field(default=None, max_length=255, description="代理认证用户名；可选。")
+    password: str | None = Field(default=None, max_length=4096, description="代理认证密码；可选，不会在列表中回显。")
+    enabled: bool = Field(default=True, description="创建后是否立即启用。")
+    priority: int = Field(default=100, ge=0, le=1_000_000, description="选择优先级，数值越小越优先。")
 
     @field_validator("name", "host")
     @classmethod
@@ -33,16 +33,16 @@ class EgressProxyCreate(BaseModel):
 
 
 class EgressProxyUpdate(BaseModel):
-    """Optional writable fields; omitted credentials remain untouched."""
+    """更新出口代理的请求参数；未提供的凭证字段保持不变。"""
 
-    name: str | None = Field(default=None, min_length=1, max_length=100)
-    protocol: EgressProxyProtocol | None = None
-    host: str | None = Field(default=None, min_length=1, max_length=255)
-    port: int | None = Field(default=None, ge=1, le=65535)
-    username: str | None = Field(default=None, max_length=255)
-    password: str | None = Field(default=None, max_length=4096)
-    enabled: bool | None = None
-    priority: int | None = Field(default=None, ge=0, le=1_000_000)
+    name: str | None = Field(default=None, min_length=1, max_length=100, description="新的代理显示名称。")
+    protocol: EgressProxyProtocol | None = Field(default=None, description="新的代理协议。")
+    host: str | None = Field(default=None, min_length=1, max_length=255, description="新的代理主机。")
+    port: int | None = Field(default=None, ge=1, le=65535, description="新的代理端口。")
+    username: str | None = Field(default=None, max_length=255, description="新的用户名；传空字符串可清空。")
+    password: str | None = Field(default=None, max_length=4096, description="新的密码；传空字符串可清空。")
+    enabled: bool | None = Field(default=None, description="是否启用该代理。")
+    priority: int | None = Field(default=None, ge=0, le=1_000_000, description="新的选择优先级。")
 
     @field_validator("name", "host")
     @classmethod
@@ -56,231 +56,249 @@ class EgressProxyUpdate(BaseModel):
 
 
 class EgressProxyResponse(BaseModel):
-    """Safe proxy representation intentionally excluding username and password."""
+    """不包含认证凭证明文的出口代理响应。"""
 
     model_config = ConfigDict(from_attributes=True)
 
-    id: str
-    name: str
-    protocol: EgressProxyProtocol
-    host_preview: str
-    port: int
-    enabled: bool
-    priority: int
-    status: EgressProxyStatus
-    has_credentials: bool
-    consecutive_failure_count: int
-    cooldown_until: datetime | None
-    last_success_at: datetime | None
-    last_failure_at: datetime | None
-    last_error_summary: str | None
-    bound_mailbox_count: int = 0
-    created_at: datetime
-    updated_at: datetime
+    id: str = Field(description="代理唯一 ID。")
+    name: str = Field(description="代理显示名称。")
+    protocol: EgressProxyProtocol = Field(description="代理协议。")
+    host_preview: str = Field(description="脱敏后的主机预览，不暴露完整地址。")
+    port: int = Field(description="代理端口。")
+    enabled: bool = Field(description="是否启用。")
+    priority: int = Field(description="选择优先级，数值越小越优先。")
+    status: EgressProxyStatus = Field(description="健康状态：healthy / cooldown / unknown。")
+    has_credentials: bool = Field(description="是否已配置用户名或密码。")
+    consecutive_failure_count: int = Field(description="连续失败次数。")
+    cooldown_until: datetime | None = Field(default=None, description="冷却结束时间；非冷却中为空。")
+    last_success_at: datetime | None = Field(default=None, description="最近一次连通成功时间。")
+    last_failure_at: datetime | None = Field(default=None, description="最近一次连通失败时间。")
+    last_error_summary: str | None = Field(default=None, description="最近一次错误摘要，不含敏感信息。")
+    bound_mailbox_count: int = Field(default=0, description="当前粘性绑定到该代理的邮箱数量。")
+    created_at: datetime = Field(description="创建时间。")
+    updated_at: datetime = Field(description="最后更新时间。")
 
 
 class ProxyPolicyResponse(BaseModel):
-    """Safe configuration returned to administrators."""
+    """全局出口代理策略响应。"""
 
     model_config = ConfigDict(from_attributes=True)
 
-    enabled: bool
-    required: bool
-    allowed_protocols: list[str]
-    connect_timeout_seconds: int
-    read_timeout_seconds: int
-    health_check_interval_seconds: int
-    failure_threshold: int
-    cooldown_seconds: int
-    switch_minimum_interval_seconds: int
-    allow_direct_development: bool
-    updated_at: datetime
+    enabled: bool = Field(description="是否启用代理池。")
+    required: bool = Field(description="是否强制使用代理；为 true 时不可回退直连。")
+    allowed_protocols: list[str] = Field(description="允许参与选择的协议列表。")
+    connect_timeout_seconds: int = Field(description="代理连接超时（秒）。")
+    read_timeout_seconds: int = Field(description="代理读超时（秒）。")
+    health_check_interval_seconds: int = Field(description="健康探测间隔（秒）。")
+    failure_threshold: int = Field(description="进入冷却前允许的连续失败次数。")
+    cooldown_seconds: int = Field(description="冷却持续时间（秒）。")
+    switch_minimum_interval_seconds: int = Field(description="同一邮箱最短换绑间隔（秒）。")
+    allow_direct_development: bool = Field(description="开发场景下是否允许无代理直连。")
+    updated_at: datetime = Field(description="策略最后更新时间。")
 
 
 class ProxyPolicyUpdate(BaseModel):
-    """Administrative updates for global proxy routing behavior."""
+    """全局出口代理策略更新请求。"""
 
-    enabled: bool | None = None
-    required: bool | None = None
-    allowed_protocols: list[EgressProxyProtocol] | None = None
-    connect_timeout_seconds: int | None = Field(default=None, ge=1, le=120)
-    read_timeout_seconds: int | None = Field(default=None, ge=1, le=300)
-    health_check_interval_seconds: int | None = Field(default=None, ge=30, le=86_400)
-    failure_threshold: int | None = Field(default=None, ge=1, le=100)
-    cooldown_seconds: int | None = Field(default=None, ge=30, le=86_400)
-    switch_minimum_interval_seconds: int | None = Field(default=None, ge=0, le=86_400)
-    allow_direct_development: bool | None = None
+    enabled: bool | None = Field(default=None, description="是否启用代理池。")
+    required: bool | None = Field(default=None, description="是否强制使用代理。")
+    allowed_protocols: list[EgressProxyProtocol] | None = Field(default=None, description="允许的协议列表。")
+    connect_timeout_seconds: int | None = Field(default=None, ge=1, le=120, description="连接超时（秒）。")
+    read_timeout_seconds: int | None = Field(default=None, ge=1, le=300, description="读超时（秒）。")
+    health_check_interval_seconds: int | None = Field(default=None, ge=30, le=86_400, description="健康探测间隔（秒）。")
+    failure_threshold: int | None = Field(default=None, ge=1, le=100, description="连续失败阈值。")
+    cooldown_seconds: int | None = Field(default=None, ge=30, le=86_400, description="冷却时长（秒）。")
+    switch_minimum_interval_seconds: int | None = Field(default=None, ge=0, le=86_400, description="最短换绑间隔（秒）。")
+    allow_direct_development: bool | None = Field(default=None, description="是否允许开发直连。")
 
 
 class ProxyConnectivityTestResponse(BaseModel):
-    """Result of a bounded proxy handshake test without remote response content."""
+    """出口代理连通性测试结果。"""
 
-    successful: bool
-    error_code: str | None = None
-    error_summary: str | None = None
+    successful: bool = Field(description="握手是否成功。")
+    error_code: str | None = Field(default=None, description="失败时的稳定错误码。")
+    error_summary: str | None = Field(default=None, description="失败原因摘要，不含上游响应正文。")
 
 
 class ProxyBoundMailboxResponse(BaseModel):
-    """Mailbox metadata exposed from the proxy impact endpoint."""
+    """出口代理影响范围内的邮箱信息。"""
 
-    id: str
-    primary_email: str
-    status: str
-    proxy_bound_at: datetime | None
-    proxy_last_switch_at: datetime | None
+    id: str = Field(description="邮箱 ID。")
+    primary_email: str = Field(description="主邮箱地址。")
+    status: str = Field(description="邮箱状态。")
+    proxy_bound_at: datetime | None = Field(default=None, description="绑定到该代理的时间。")
+    proxy_last_switch_at: datetime | None = Field(default=None, description="最近一次换绑时间。")
 
 
 class ProxyBindingUpdate(BaseModel):
-    """Manual binding update; null explicitly requests direct routing."""
+    """邮箱出口代理绑定更新请求；空值表示请求直连。"""
 
-    egress_proxy_id: str | None = None
+    egress_proxy_id: str | None = Field(default=None, description="目标代理 ID；null 表示解除绑定/直连。")
 
 
 class MailboxImportRequest(BaseModel):
-    """Bulk mailbox import payload using the four-segment text format."""
+    """四段文本格式的邮箱批量导入请求。"""
 
-    content: str = Field(min_length=1)
-    on_conflict: str = Field(default="replace_token", pattern="^(skip|replace_token|error)$")
+    content: str = Field(min_length=1, description="多行导入文本，每行：邮箱----密码----ClientID----RefreshToken。")
+    on_conflict: str = Field(
+        default="replace_token",
+        pattern="^(skip|replace_token|error)$",
+        description="邮箱已存在时的策略：skip 跳过，replace_token 替换凭证，error 记为失败。",
+    )
 
 
 class MailboxImportLineError(BaseModel):
-    """A validation error for one import line."""
+    """邮箱导入内容中的单行错误。"""
 
-    line_number: int
-    message: str
+    line_number: int = Field(description="出错行号，从 1 开始。")
+    message: str = Field(description="错误说明，不包含密钥明文。")
 
 
 class MailboxImportResponse(BaseModel):
-    """Bulk import result summary safe for UI display."""
+    """邮箱批量导入结果汇总。"""
 
-    created: int
-    updated: int
-    skipped: int
-    failed: int
-    errors: list[MailboxImportLineError]
+    created: int = Field(description="新建邮箱数量。")
+    updated: int = Field(description="更新邮箱数量。")
+    skipped: int = Field(description="跳过数量。")
+    failed: int = Field(description="失败数量。")
+    errors: list[MailboxImportLineError] = Field(description="失败行明细。")
 
 
 class MailboxAccessTokenResponse(BaseModel):
-    """A usable access token returned only by protected token endpoints."""
+    """受保护接口返回的可用 Access Token。"""
 
-    mailbox_id: str
-    primary_email: str
-    access_token: str
-    expires_at: datetime
-    token_version: int
-    refreshed: bool
-    refresh_token_rotated: bool
+    mailbox_id: str = Field(description="邮箱 ID。")
+    primary_email: str = Field(description="主邮箱地址。")
+    access_token: str = Field(description="可用的 Microsoft Access Token 明文。")
+    expires_at: datetime = Field(description="Access Token 过期时间（UTC）。")
+    token_version: int = Field(description="当前 Refresh Token 版本号。")
+    refreshed: bool = Field(description="本次是否触发了 Microsoft 刷新。")
+    refresh_token_rotated: bool = Field(description="本次是否写入了轮换后的 Refresh Token。")
 
 
 class MailboxAccessTokenRefreshRequest(BaseModel):
-    """Administrative batch refresh request; null or empty means all active mailboxes."""
+    """批量刷新请求；邮箱 ID 为空时刷新全部可用邮箱。"""
 
-    mailbox_ids: list[str] | None = None
+    mailbox_ids: list[str] | None = Field(default=None, description="待刷新邮箱 ID 列表；null/空表示全部 active 邮箱。")
 
 
 class MailboxAccessTokenRefreshItemResponse(BaseModel):
-    """One mailbox result in an administrative access-token refresh batch."""
+    """单个邮箱的 Token 刷新结果。"""
 
-    mailbox_id: str
-    primary_email: str | None
-    successful: bool
-    refreshed: bool
-    refresh_token_rotated: bool
-    access_token_expires_at: datetime | None
-    error_summary: str | None = None
+    mailbox_id: str = Field(description="邮箱 ID。")
+    primary_email: str | None = Field(default=None, description="主邮箱地址；邮箱不存在时可能为空。")
+    successful: bool = Field(description="该行是否刷新成功。")
+    refreshed: bool = Field(description="是否实际调用了 Microsoft 刷新。")
+    refresh_token_rotated: bool = Field(description="是否轮换了 Refresh Token。")
+    access_token_expires_at: datetime | None = Field(default=None, description="成功时的 AT 过期时间。")
+    error_summary: str | None = Field(default=None, description="失败原因摘要。")
 
 
 class MailboxAccessTokenRefreshResponse(BaseModel):
-    """Batch AT refresh summary safe for UI display."""
+    """批量刷新汇总响应，不返回 Token 明文。"""
 
-    successful: int
-    failed: int
-    results: list[MailboxAccessTokenRefreshItemResponse]
+    successful: int = Field(description="成功数量。")
+    failed: int = Field(description="失败数量。")
+    results: list[MailboxAccessTokenRefreshItemResponse] = Field(description="逐邮箱结果列表。")
 
 
 class DashboardSummaryResponse(BaseModel):
-    """Compact overview metrics for the admin dashboard."""
+    """管理台概览指标响应。"""
 
-    total_mailbox_count: int
-    active_mailbox_count: int
-    invalid_mailbox_count: int
-    disabled_mailbox_count: int
-    cooldown_mailbox_count: int
-    active_lease_count: int
-    expired_lease_count: int
-    total_proxy_count: int
-    healthy_proxy_count: int
-    cooldown_proxy_count: int
-    bound_mailbox_count: int
-    recent_audit_count: int
+    total_mailbox_count: int = Field(description="邮箱总数。")
+    active_mailbox_count: int = Field(description="状态为 active 的邮箱数。")
+    usable_mailbox_count: int = Field(
+        description="运营可用邮箱数：status=active 且 capability 为 imap 或 graph。",
+    )
+    invalid_mailbox_count: int = Field(description="凭证失效（status=invalid）邮箱数。")
+    disabled_mailbox_count: int = Field(description="停用（status=disabled）邮箱数。")
+    cooldown_mailbox_count: int = Field(description="冷却中（status=cooldown）邮箱数。")
+    imap_capable_mailbox_count: int = Field(description="运行时能力为 IMAP 的邮箱数。")
+    graph_capable_mailbox_count: int = Field(description="运行时能力为 Graph 的邮箱数。")
+    unusable_mailbox_count: int = Field(description="运行时能力为不可用（unusable）的邮箱数。")
+    unprobed_capability_mailbox_count: int = Field(description="尚未完成能力探测的邮箱数。")
+    active_lease_count: int = Field(description="进行中租约数。")
+    expired_lease_count: int = Field(description="已过期未释放租约数。")
+    total_proxy_count: int = Field(description="出口代理总数。")
+    healthy_proxy_count: int = Field(description="健康代理数。")
+    cooldown_proxy_count: int = Field(description="冷却中代理数。")
+    bound_mailbox_count: int = Field(description="已绑定出口代理的邮箱数。")
+    recent_audit_count: int = Field(description="近期审计事件数量。")
 
 
 class MailboxListItemResponse(BaseModel):
-    """Safe mailbox list item for the Admin console."""
+    """邮箱管理列表项，不包含敏感凭证明文。"""
 
-    id: str
-    primary_email: str
-    status: MailboxStatus
-    client_id: str | None
-    token_version: int
-    egress_proxy_id: str | None
-    egress_proxy_name: str | None
-    proxy_bound_at: datetime | None
-    proxy_last_switch_at: datetime | None
-    has_access_token: bool
-    access_token_expires_at: datetime | None
-    access_token_refreshed_at: datetime | None
-    scope: str | None
-    capability: str | None
-    capability_probed_at: datetime | None
-    capability_probe_error: str | None
-    active_lease_count: int
-    created_at: datetime
-    updated_at: datetime
+    id: str = Field(description="邮箱 ID。")
+    primary_email: str = Field(description="主邮箱地址。")
+    status: MailboxStatus = Field(description="邮箱健康状态。")
+    client_id: str | None = Field(default=None, description="OAuth Client ID。")
+    token_version: int = Field(description="Refresh Token 版本号。")
+    egress_proxy_id: str | None = Field(default=None, description="粘性绑定的出口代理 ID。")
+    egress_proxy_name: str | None = Field(default=None, description="绑定代理名称。")
+    proxy_bound_at: datetime | None = Field(default=None, description="绑定时间。")
+    proxy_last_switch_at: datetime | None = Field(default=None, description="最近换绑时间。")
+    has_access_token: bool = Field(description="是否已缓存 Access Token。")
+    access_token_expires_at: datetime | None = Field(default=None, description="缓存 AT 过期时间。")
+    access_token_refreshed_at: datetime | None = Field(default=None, description="最近一次刷新 AT 的时间。")
+    scope: str | None = Field(default=None, description="识别到的 OAuth scope 字符串。")
+    capability: str | None = Field(default=None, description="运行时探测能力：imap / graph / unusable / unknown。")
+    capability_probed_at: datetime | None = Field(default=None, description="能力最近探测时间。")
+    capability_probe_error: str | None = Field(default=None, description="能力探测失败摘要。")
+    active_lease_count: int = Field(description="当前活跃租约数。")
+    created_at: datetime = Field(description="创建时间。")
+    updated_at: datetime = Field(description="最后更新时间。")
 
 
 class MailboxListResponse(BaseModel):
-    """Paginated mailbox list response for the Admin console."""
+    """邮箱分页查询响应。"""
 
-    total: int
-    page: int
-    page_size: int
-    total_pages: int
-    items: list[MailboxListItemResponse]
+    total: int = Field(description="总记录数。")
+    page: int = Field(description="当前页码，从 1 开始。")
+    page_size: int = Field(description="每页条数。")
+    total_pages: int = Field(description="总页数。")
+    items: list[MailboxListItemResponse] = Field(description="当前页邮箱列表。")
 
 
 class LeaseListItemResponse(BaseModel):
-    """Lease list item with mailbox metadata but without secrets."""
+    """租约列表项，不包含邮箱敏感凭证。"""
 
-    id: str
-    mailbox_id: str
-    primary_email: str
-    client_key_id: str | None
-    client_tag: str | None
-    purpose: str | None
-    mode: LeaseMode
-    status: str
-    expires_at: datetime
-    released_at: datetime | None
-    created_at: datetime
+    id: str = Field(description="租约 ID。")
+    mailbox_id: str = Field(description="邮箱 ID。")
+    primary_email: str = Field(description="主邮箱地址。")
+    client_key_id: str | None = Field(default=None, description="领取方 Client Key ID。")
+    client_tag: str | None = Field(default=None, description="调用方自定义标签。")
+    purpose: str | None = Field(default=None, description="领取用途说明。")
+    mode: LeaseMode = Field(description="租约模式：access_token 或 refresh_token。")
+    status: str = Field(description="租约状态：active / released / expired。")
+    expires_at: datetime = Field(description="租约到期时间。")
+    released_at: datetime | None = Field(default=None, description="释放时间；未释放为空。")
+    created_at: datetime = Field(description="创建时间。")
 
 
 class LeaseListResponse(BaseModel):
-    """Paginated lease list response for the Admin console."""
+    """租约分页查询响应。"""
 
-    total: int
-    page: int
-    page_size: int
-    total_pages: int
-    items: list[LeaseListItemResponse]
+    total: int = Field(description="总记录数。")
+    page: int = Field(description="当前页码，从 1 开始。")
+    page_size: int = Field(description="每页条数。")
+    total_pages: int = Field(description="总页数。")
+    items: list[LeaseListItemResponse] = Field(description="当前页租约列表。")
 
 
 class ClientKeyCreateRequest(BaseModel):
     """管理员创建外部 Client Key 的请求。"""
 
-    name: str = Field(min_length=1, max_length=100)
-    scopes: list[str] = Field(min_length=1)
-    expires_at: datetime | None = None
+    name: str = Field(min_length=1, max_length=100, description="Client Key 显示名称，全局唯一。")
+    scopes: list[str] = Field(
+        min_length=1,
+        description=(
+            "权限列表，可选："
+            "leases:acquire、leases:release、tokens:access:read、"
+            "tokens:refresh:read、tokens:refresh:write。"
+        ),
+    )
+    expires_at: datetime | None = Field(default=None, description="过期时间（UTC）；为空表示不过期。")
 
     @field_validator("name")
     @classmethod
@@ -294,36 +312,47 @@ class ClientKeyCreateRequest(BaseModel):
 class ClientKeyCreatedResponse(BaseModel):
     """包含仅显示一次的 API Key 明文的创建响应。"""
 
-    id: str
-    name: str
-    api_key: str
-    scopes: list[str]
-    enabled: bool
-    expires_at: datetime | None
-    created_at: datetime
+    id: str = Field(description="Client Key ID。")
+    name: str = Field(description="显示名称。")
+    api_key: str = Field(description="明文 API Key，仅本次响应返回，请立即保存。")
+    scopes: list[str] = Field(description="已授予的权限列表。")
+    enabled: bool = Field(description="是否启用。")
+    expires_at: datetime | None = Field(default=None, description="过期时间；为空表示不过期。")
+    created_at: datetime = Field(description="创建时间。")
 
 
 class ClientKeyListItemResponse(BaseModel):
     """不包含 API Key 明文或摘要的管理列表项。"""
 
-    id: str
-    name: str
-    scopes: list[str]
-    enabled: bool
-    expires_at: datetime | None
-    last_used_at: datetime | None
-    created_at: datetime
-    updated_at: datetime
+    id: str = Field(description="Client Key ID。")
+    name: str = Field(description="显示名称。")
+    scopes: list[str] = Field(description="已授予的权限列表。")
+    enabled: bool = Field(description="是否启用。")
+    expires_at: datetime | None = Field(default=None, description="过期时间；为空表示不过期。")
+    last_used_at: datetime | None = Field(default=None, description="最近一次成功鉴权时间。")
+    created_at: datetime = Field(description="创建时间。")
+    updated_at: datetime = Field(description="最后更新时间。")
 
 
 class LeaseAcquireRequest(BaseModel):
     """外部调用方领取邮箱租约的请求。"""
 
-    mode: Literal[LeaseMode.ACCESS_TOKEN, LeaseMode.REFRESH_TOKEN]
-    lease_ttl_seconds: int = Field(default=600, ge=60, le=86_400)
-    preferred_email: str | None = Field(default=None, max_length=320)
-    client_tag: str | None = Field(default=None, max_length=100)
-    purpose: str | None = Field(default=None, max_length=100)
+    mode: Literal[LeaseMode.ACCESS_TOKEN, LeaseMode.REFRESH_TOKEN] = Field(
+        description="凭证模式：access_token 返回短期 AT；refresh_token 返回 RT 与版本号。"
+    )
+    lease_ttl_seconds: int = Field(
+        default=600,
+        ge=60,
+        le=86_400,
+        description="租约有效期（秒），默认 600，范围 60–86400。",
+    )
+    preferred_email: str | None = Field(
+        default=None,
+        max_length=320,
+        description="优先领取的邮箱地址；不传则由服务分配可用邮箱。",
+    )
+    client_tag: str | None = Field(default=None, max_length=100, description="调用方自定义标签，便于排查。")
+    purpose: str | None = Field(default=None, max_length=100, description="领取用途说明。")
 
     @field_validator("preferred_email", "client_tag", "purpose")
     @classmethod
@@ -337,65 +366,72 @@ class LeaseAcquireRequest(BaseModel):
 class AccessTokenLeaseCredentialResponse(BaseModel):
     """Access Token mode 租约返回的短期凭证。"""
 
-    type: Literal["access_token"] = "access_token"
-    access_token: str
-    expires_at: datetime
-    refreshed: bool
-    token_version: int
+    type: Literal["access_token"] = Field(default="access_token", description="凭证类型固定为 access_token。")
+    access_token: str = Field(description="Microsoft Access Token 明文。")
+    expires_at: datetime = Field(description="Access Token 过期时间（UTC）。")
+    refreshed: bool = Field(description="领取时是否触发了 Token 刷新。")
+    token_version: int = Field(description="当前 Refresh Token 版本号。")
 
 
 class RefreshTokenLeaseCredentialResponse(BaseModel):
     """Refresh Token mode 租约返回的长期凭证。"""
 
-    type: Literal["refresh_token"] = "refresh_token"
-    client_id: str
-    refresh_token: str
-    token_version: int
+    type: Literal["refresh_token"] = Field(default="refresh_token", description="凭证类型固定为 refresh_token。")
+    client_id: str = Field(description="OAuth Client ID，刷新 Token 时使用。")
+    refresh_token: str = Field(description="当前 Refresh Token 明文。")
+    token_version: int = Field(description="Refresh Token 版本号，回写时用于 CAS。")
 
 
 LeaseCredentialResponse = Annotated[
     AccessTokenLeaseCredentialResponse | RefreshTokenLeaseCredentialResponse,
-    Field(discriminator="type"),
+    Field(discriminator="type", description="按 mode 返回的凭证联合体。"),
 ]
 
 
 class LeaseAcquireResponse(BaseModel):
     """外部邮箱租约及其 mode 对应凭证。"""
 
-    lease_id: str
-    mailbox_id: str
-    primary_email: str
-    mode: LeaseMode
-    expires_at: datetime
-    created_at: datetime
-    credential: LeaseCredentialResponse
+    lease_id: str = Field(description="租约 ID，后续释放/取 Token 时使用。")
+    mailbox_id: str = Field(description="被领取邮箱的 ID。")
+    primary_email: str = Field(description="被领取邮箱地址。")
+    mode: LeaseMode = Field(description="本次租约模式。")
+    expires_at: datetime = Field(description="租约到期时间。")
+    created_at: datetime = Field(description="租约创建时间。")
+    credential: LeaseCredentialResponse = Field(description="与 mode 对应的凭证内容。")
 
 
 class LeaseReleaseResponse(BaseModel):
     """幂等租约释放响应。"""
 
-    lease_id: str
-    released_at: datetime
+    lease_id: str = Field(description="已释放的租约 ID。")
+    released_at: datetime = Field(description="释放时间；重复释放时返回原释放时间。")
 
 
 class LeaseAccessTokenResponse(BaseModel):
     """有效租约内返回的可用 Access Token。"""
 
-    lease_id: str
-    mailbox_id: str
-    primary_email: str
-    access_token: str
-    expires_at: datetime
-    token_version: int
-    refreshed: bool
-    refresh_token_rotated: bool
+    lease_id: str = Field(description="租约 ID。")
+    mailbox_id: str = Field(description="邮箱 ID。")
+    primary_email: str = Field(description="主邮箱地址。")
+    access_token: str = Field(description="可用的 Access Token 明文。")
+    expires_at: datetime = Field(description="Access Token 过期时间（UTC）。")
+    token_version: int = Field(description="当前 Refresh Token 版本号。")
+    refreshed: bool = Field(description="本次是否触发了刷新。")
+    refresh_token_rotated: bool = Field(description="本次是否轮换了 Refresh Token。")
 
 
 class LeaseRefreshTokenUpdateRequest(BaseModel):
     """使用 token_version 进行 CAS 的 Refresh Token 回写请求。"""
 
-    expected_token_version: int = Field(ge=1)
-    refresh_token: str = Field(min_length=1, max_length=16_384)
+    expected_token_version: int = Field(
+        ge=1,
+        description="调用方持有的 token_version；与库中不一致时拒绝覆盖。",
+    )
+    refresh_token: str = Field(
+        min_length=1,
+        max_length=16_384,
+        description="要回写的新 Refresh Token 明文。",
+    )
 
     @field_validator("refresh_token")
     @classmethod
@@ -411,7 +447,7 @@ class LeaseRefreshTokenUpdateRequest(BaseModel):
 class LeaseRefreshTokenUpdateResponse(BaseModel):
     """Refresh Token CAS 回写结果，不回显 Token 明文。"""
 
-    lease_id: str
-    mailbox_id: str
-    updated: bool
-    token_version: int
+    lease_id: str = Field(description="租约 ID。")
+    mailbox_id: str = Field(description="邮箱 ID。")
+    updated: bool = Field(description="是否成功写入新的 Refresh Token。")
+    token_version: int = Field(description="写入后的 token_version；未更新时为当前版本。")

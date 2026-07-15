@@ -44,11 +44,17 @@ def test_openapi_documentation_uses_chinese_descriptions() -> None:
     openapi_schema = app.openapi()
     acquire_operation = openapi_schema["paths"]["/api/v1/leases/acquire"]["post"]
     lease_schema = openapi_schema["components"]["schemas"]["LeaseAcquireResponse"]
+    acquire_request = openapi_schema["components"]["schemas"]["LeaseAcquireRequest"]
+    access_token_response = openapi_schema["components"]["schemas"]["LeaseAccessTokenResponse"]
 
     assert openapi_schema["info"]["title"] == "邮箱服务外部 API"
     assert acquire_operation["summary"] == "领取邮箱租约"
     assert acquire_operation["tags"] == ["外部租约"]
     assert lease_schema["description"] == "外部邮箱租约及其 mode 对应凭证。"
+    assert acquire_request["properties"]["mode"]["description"]
+    assert "凭证模式" in acquire_request["properties"]["mode"]["description"]
+    assert "租约 ID" in lease_schema["properties"]["lease_id"]["description"]
+    assert "Access Token" in access_token_response["properties"]["access_token"]["description"]
 
 
 def test_openapi_viewer_has_readable_fixed_colors() -> None:
