@@ -1,0 +1,31 @@
+.git
+.github
+.agents
+.venv
+venv
+__pycache__
+**/__pycache__
+**/*.py[cod]
+**/.pytest_cache
+**/.mypy_cache
+**/.ruff_cache
+**/*.egg-info
+.env
+.env.*
+!.env.example
+*.log
+.DS_Store
+
+# Frontend local artifacts (rebuilt inside Docker)
+frontend/node_modules
+frontend/dist
+frontend/.vite
+
+# IDE / local notes
+.idea
+.vscode
+# Local image export artifacts
+dist
+
+# Tests are not needed in the runtime image
+tests

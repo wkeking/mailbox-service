@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 import hmac
+from pathlib import Path
 from typing import Annotated, Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
@@ -11,9 +12,10 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
 from fastapi.openapi.utils import get_openapi
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.routing import APIRoute
 from fastapi.security import APIKeyHeader
+from fastapi.staticfiles import StaticFiles
 from email_validator import EmailNotValidError, validate_email
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
@@ -494,11 +496,14 @@ def get_public_redoc() -> HTMLResponse:
     return get_redoc_html(openapi_url="/openapi.json", title="邮箱服务外部 API - ReDoc")
 
 
+_cors_settings = get_settings()
+_cors_origins = _cors_settings.cors_origins_list
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "PATCH", "DELETE"],
+    allow_origins=_cors_origins,
+    # Browsers reject allow_credentials=True together with Access-Control-Allow-Origin: *.
+    allow_credentials="*" not in _cors_origins,
+    allow_methods=["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["Content-Type", "X-Admin-Token", "X-API-Key"],
 )
 
@@ -1939,3 +1944,47 @@ def handle_no_healthy_egress_proxy(
         status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
         content={"detail": {"code": error.error_code, "message": "没有可用的全局出口代理"}},
     )
+
+
+def _resolve_frontend_dist_directory() -> Path | None:
+    """Locate baked-in admin SPA assets (Docker image) or a local frontend/dist build."""
+    candidate_directories = (
+        Path(__file__).resolve().parent.parent / "frontend_dist",
+        Path(__file__).resolve().parent.parent / "frontend" / "dist",
+    )
+    for directory in candidate_directories:
+        if (directory / "index.html").is_file():
+            return directory
+    return None
+
+
+FRONTEND_DIST_DIRECTORY = _resolve_frontend_dist_directory()
+if FRONTEND_DIST_DIRECTORY is not None:
+    frontend_assets_directory = FRONTEND_DIST_DIRECTORY / "assets"
+    if frontend_assets_directory.is_dir():
+        app.mount(
+            "/assets",
+            StaticFiles(directory=frontend_assets_directory),
+            name="frontend-assets",
+        )
+
+    @app.get("/", include_in_schema=False)
+    def get_admin_spa_index() -> FileResponse:
+        """Serve the React admin console when static assets are packaged with the service."""
+        return FileResponse(FRONTEND_DIST_DIRECTORY / "index.html")
+
+    @app.get("/{spa_path:path}", include_in_schema=False)
+    def get_admin_spa_fallback(spa_path: str) -> FileResponse:
+        """SPA fallback for client-side routes; API routes registered above take precedence."""
+        if spa_path.startswith("api/") or spa_path in {
+            "health",
+            "docs",
+            "redoc",
+            "openapi.json",
+            "openapi-viewer",
+        }:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
+        candidate_file = FRONTEND_DIST_DIRECTORY / spa_path
+        if spa_path and candidate_file.is_file():
+            return FileResponse(candidate_file)
+        return FileResponse(FRONTEND_DIST_DIRECTORY / "index.html")

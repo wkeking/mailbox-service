@@ -20,6 +20,9 @@ class Settings(BaseSettings):
     credential_encryption_key: str | None = None
     app_env: Literal["development", "test", "production"] = "production"
     debug_token_logging: bool = False
+    # Comma-separated browser origins for CORS. Use "*" only when the admin UI
+    # is not relying on credentialed cross-site cookies (this project uses headers).
+    cors_allow_origins: str = "http://localhost:5173"
 
     proxy_enabled: bool = True
     proxy_required: bool = False
@@ -50,6 +53,16 @@ class Settings(BaseSettings):
     def token_diagnostic_logging_enabled(self) -> bool:
         """Allow sensitive-adjacent Token diagnostics only in explicit development mode."""
         return self.app_env == "development" and self.debug_token_logging
+
+    @property
+    def cors_origins_list(self) -> list[str]:
+        """Parse CORS_ALLOW_ORIGINS into a list suitable for CORSMiddleware."""
+        raw_value = (self.cors_allow_origins or "").strip()
+        if not raw_value:
+            return ["http://localhost:5173"]
+        if raw_value == "*":
+            return ["*"]
+        return [origin.strip() for origin in raw_value.split(",") if origin.strip()]
 
     @field_validator("credential_encryption_key")
     @classmethod
