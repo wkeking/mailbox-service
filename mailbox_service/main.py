@@ -169,12 +169,14 @@ OPENAPI_OPERATION_DOCUMENTATION: dict[tuple[str, str], tuple[str, str, str]] = {
     ),
     ("POST", "/api/v1/mailboxes/acquire"): (
         "领取可用邮箱账号",
-        "领取一个 status=active 的邮箱并创建 mail_read 租约，只返回邮箱地址与租约信息，不返回 Token。",
+        "领取一个 status=active 的邮箱并创建 mail_read 租约；"
+        "可选择生成 plus alias 作为 allocated_email，只返回邮箱地址与租约信息，不返回 Token。",
         "外部邮箱",
     ),
     ("POST", "/api/v1/leases/{lease_id}/verification-code"): (
         "获取收件箱验证码",
-        "在 mail_read 租约下读取最近邮件并提取验证码；默认查看最近 3 分钟、最多等待 60 秒。",
+        "在 mail_read 租约下读取最近邮件并提取验证码；优先 xAI（ABC-123）格式再兜底数字，"
+        "默认按收件人匹配，IMAP 使用 UID SEARCH ALL 取最近 N 封。",
         "外部邮箱",
     ),
     ("GET", "/api/v1/admin/dashboard"): (
@@ -932,6 +934,8 @@ def acquire_mailbox_account(
             preferred_email=payload.preferred_email,
             client_tag=payload.client_tag,
             purpose=payload.purpose,
+            use_plus_alias=payload.use_plus_alias,
+            preferred_alias_suffix=payload.alias_suffix,
         )
     except Exception as error:
         raise to_external_http_exception(error) from error
@@ -939,6 +943,7 @@ def acquire_mailbox_account(
         lease_id=result.lease_id,
         mailbox_id=result.mailbox_id,
         primary_email=result.primary_email,
+        allocated_email=result.allocated_email or result.primary_email,
         mode=LeaseMode.MAIL_READ,
         expires_at=result.expires_at,
         created_at=result.created_at,
@@ -959,6 +964,8 @@ def get_lease_verification_code(
     """Extract a verification code from recent inbox mail for an owned mail_read lease."""
     try:
         lease, mailbox = lease_service.load_active_mail_read_lease(principal, lease_id)
+        # Prefer request override, then lease allocated alias/primary, then mailbox primary.
+        default_recipient = lease.allocated_email or mailbox.primary_email
         lookup_result = verification_code_service.wait_for_verification_code(
             mailbox,
             VerificationCodeLookupOptions(
@@ -969,6 +976,8 @@ def get_lease_verification_code(
                 subject_contains=payload.subject_contains,
                 body_contains=payload.body_contains,
                 code_regex=payload.code_regex,
+                recipient=payload.recipient or default_recipient,
+                require_recipient_match=payload.require_recipient_match,
             ),
         )
     except Exception as error:
@@ -977,6 +986,7 @@ def get_lease_verification_code(
         lease_id=lease.id,
         mailbox_id=mailbox.id,
         primary_email=mailbox.primary_email,
+        allocated_email=lease.allocated_email or mailbox.primary_email,
         found=lookup_result.found,
         code=lookup_result.code,
         matched_from=lookup_result.matched_from,
@@ -1527,6 +1537,7 @@ def list_leases(
                 id=lease.id,
                 mailbox_id=lease.mailbox_id,
                 primary_email=primary_email,
+                allocated_email=lease.allocated_email,
                 client_key_id=lease.client_key_id,
                 client_tag=lease.client_tag,
                 purpose=lease.purpose,

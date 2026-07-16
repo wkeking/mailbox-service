@@ -266,10 +266,14 @@ class LeaseListItemResponse(BaseModel):
     id: str = Field(description="租约 ID。")
     mailbox_id: str = Field(description="邮箱 ID。")
     primary_email: str = Field(description="主邮箱地址。")
+    allocated_email: str | None = Field(
+        default=None,
+        description="本租约分配的业务地址（主邮箱或 plus alias）；mail_read 常用。",
+    )
     client_key_id: str | None = Field(default=None, description="领取方 Client Key ID。")
     client_tag: str | None = Field(default=None, description="调用方自定义标签。")
     purpose: str | None = Field(default=None, description="领取用途说明。")
-    mode: LeaseMode = Field(description="租约模式：access_token 或 refresh_token。")
+    mode: LeaseMode = Field(description="租约模式：access_token、refresh_token 或 mail_read。")
     status: str = Field(description="租约状态：active / released / expired。")
     expires_at: datetime = Field(description="租约到期时间。")
     released_at: datetime | None = Field(default=None, description="释放时间；未释放为空。")
@@ -376,12 +380,27 @@ class MailboxAcquireRequest(BaseModel):
     preferred_email: str | None = Field(
         default=None,
         max_length=320,
-        description="优先领取的邮箱地址；不传则由服务分配可用邮箱。",
+        description="优先领取的主邮箱地址；不传则由服务分配可用邮箱。",
+    )
+    use_plus_alias: bool = Field(
+        default=False,
+        description=(
+            "为 true 时为本租约生成主邮箱的 plus alias（如 user+xxxxxxxx@domain），"
+            "后续取验证码默认按该别名匹配收件人；OAuth/IMAP 仍使用主邮箱。"
+        ),
+    )
+    alias_suffix: str | None = Field(
+        default=None,
+        max_length=32,
+        description=(
+            "可选：指定 plus alias 后缀（仅小写字母与数字）。"
+            "传入时等价于 use_plus_alias=true；不传且 use_plus_alias=true 时随机生成 8 位。"
+        ),
     )
     client_tag: str | None = Field(default=None, max_length=100, description="调用方自定义标签，便于排查。")
     purpose: str | None = Field(default=None, max_length=100, description="领取用途说明。")
 
-    @field_validator("preferred_email", "client_tag", "purpose")
+    @field_validator("preferred_email", "client_tag", "purpose", "alias_suffix")
     @classmethod
     def normalize_optional_mailbox_acquire_text(cls, value: str | None) -> str | None:
         if value is None:
@@ -395,7 +414,10 @@ class MailboxAcquireResponse(BaseModel):
 
     lease_id: str = Field(description="mail_read 租约 ID，后续取验证码 / 释放时使用。")
     mailbox_id: str = Field(description="被领取邮箱的 ID。")
-    primary_email: str = Field(description="被领取邮箱地址。")
+    primary_email: str = Field(description="主邮箱地址（OAuth / IMAP 登录身份）。")
+    allocated_email: str = Field(
+        description="本租约分配的业务收件地址：主邮箱或 plus alias，用于注册与验证码匹配。",
+    )
     mode: Literal[LeaseMode.MAIL_READ] = Field(
         default=LeaseMode.MAIL_READ,
         description="固定为 mail_read，不返回 access_token / refresh_token。",
@@ -440,14 +462,29 @@ class LeaseVerificationCodeRequest(BaseModel):
         max_length=200,
         description="可选：正文包含的关键词（不区分大小写）。",
     )
-    code_regex: str = Field(
-        default=r"\b(\d{4,8})\b",
-        min_length=1,
+    recipient: str | None = Field(
+        default=None,
+        max_length=320,
+        description=(
+            "期望收件人地址（支持 plus alias）。"
+            "默认使用租约 allocated_email（领取时分配的主邮箱或别名），"
+            "再回退到 primary_email；与 To/Cc/Delivered-To/X-Original-To/X-Envelope-To 匹配。"
+        ),
+    )
+    require_recipient_match: bool = Field(
+        default=True,
+        description="是否要求邮件收件人匹配 recipient（默认 true）。",
+    )
+    code_regex: str | None = Field(
+        default=None,
         max_length=200,
-        description="验证码提取正则，默认匹配 4–8 位数字；建议使用捕获组。",
+        description=(
+            "可选：自定义验证码正则（建议捕获组）。"
+            "默认优先匹配 xAI 格式 ABC-123，再兜底数字；传入时在 xAI 之后仅使用该正则。"
+        ),
     )
 
-    @field_validator("from_address", "subject_contains", "body_contains")
+    @field_validator("from_address", "subject_contains", "body_contains", "recipient", "code_regex")
     @classmethod
     def normalize_optional_filter_text(cls, value: str | None) -> str | None:
         if value is None:
@@ -462,6 +499,10 @@ class LeaseVerificationCodeResponse(BaseModel):
     lease_id: str = Field(description="mail_read 租约 ID。")
     mailbox_id: str = Field(description="邮箱 ID。")
     primary_email: str = Field(description="主邮箱地址。")
+    allocated_email: str | None = Field(
+        default=None,
+        description="本租约分配的业务收件地址（主邮箱或 plus alias）。",
+    )
     found: bool = Field(description="是否在时间窗内匹配到验证码。")
     code: str | None = Field(default=None, description="提取到的验证码；未找到时为 null。")
     matched_from: str | None = Field(default=None, description="匹配邮件的发件人。")

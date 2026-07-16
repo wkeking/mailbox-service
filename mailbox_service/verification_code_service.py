@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from email import message_from_bytes
 from email.header import decode_header, make_header
 from email.message import Message
-from email.utils import parsedate_to_datetime
+from email.utils import getaddresses, parsedate_to_datetime
 import imaplib
 import re
 import time
@@ -26,11 +26,27 @@ from mailbox_service.proxy_service import (
 from mailbox_service.security import summarize_exception
 from mailbox_service.token_service import MailboxAccessTokenService
 
+# Default digit fallback after xAI-style codes. Callers may override via code_regex.
 DEFAULT_VERIFICATION_CODE_REGEX = r"\b(\d{4,8})\b"
+XAI_SUBJECT_CODE_REGEX = re.compile(r"^([A-Z0-9]{3}-[A-Z0-9]{3})\s+xAI", re.IGNORECASE)
+XAI_BODY_CODE_REGEX = re.compile(r"\b([A-Z0-9]{3}-[A-Z0-9]{3})\b", re.IGNORECASE)
+DIGIT_KEYWORD_CODE_PATTERNS = (
+    re.compile(r"verification\s+code[:\s]+(\d{4,8})", re.IGNORECASE),
+    re.compile(r"your\s+code[:\s]+(\d{4,8})", re.IGNORECASE),
+    re.compile(r"confirm(?:ation)?\s+code[:\s]+(\d{4,8})", re.IGNORECASE),
+    re.compile(r"验证码[：:\s]*(\d{4,8})"),
+)
 DEFAULT_SINCE_SECONDS = 180
 DEFAULT_TIMEOUT_SECONDS = 60
 DEFAULT_POLL_INTERVAL_SECONDS = 3
 MAX_MESSAGES_PER_SCAN = 30
+RECIPIENT_HEADER_NAMES = (
+    "To",
+    "Cc",
+    "Delivered-To",
+    "X-Original-To",
+    "X-Envelope-To",
+)
 
 MailReadChannel = Literal["imap", "graph"]
 
@@ -48,6 +64,7 @@ class InboxMessageCandidate:
     body_text: str
     received_at: datetime | None
     channel: MailReadChannel
+    recipient_addresses: frozenset[str] = field(default_factory=frozenset)
 
 
 @dataclass(frozen=True)
@@ -84,7 +101,12 @@ class VerificationCodeLookupOptions:
     from_address: str | None = None
     subject_contains: str | None = None
     body_contains: str | None = None
-    code_regex: str = DEFAULT_VERIFICATION_CODE_REGEX
+    # When None, after xAI use built-in digit keyword / bare-digit fallbacks.
+    # When set, after xAI only this custom pattern is tried.
+    code_regex: str | None = None
+    # Expected recipient (supports plus alias). Defaults to mailbox.primary_email at call site.
+    recipient: str | None = None
+    require_recipient_match: bool = True
 
 
 class MicrosoftGraphMailReader:
@@ -138,7 +160,7 @@ class MicrosoftGraphMailReader:
             f"$filter={quote(filter_expression)}"
             f"&$orderby={quote('receivedDateTime desc')}"
             f"&$top={max_messages}"
-            f"&$select={quote('from,subject,body,bodyPreview,receivedDateTime')}"
+            f"&$select={quote('from,subject,body,bodyPreview,receivedDateTime,toRecipients,ccRecipients')}"
         )
         request_url = f"https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages?{query}"
         proxy_url = selected_proxy.as_httpx_proxy_url() if selected_proxy is not None else None
@@ -179,6 +201,7 @@ class MicrosoftGraphMailReader:
             subject = raw_message.get("subject") if isinstance(raw_message.get("subject"), str) else None
             body_text = _extract_graph_body_text(raw_message)
             received_at = _parse_iso_datetime(raw_message.get("receivedDateTime"))
+            recipient_addresses = _extract_graph_recipient_addresses(raw_message)
             candidates.append(
                 InboxMessageCandidate(
                     from_address=from_address,
@@ -186,6 +209,7 @@ class MicrosoftGraphMailReader:
                     body_text=body_text,
                     received_at=received_at,
                     channel="graph",
+                    recipient_addresses=recipient_addresses,
                 )
             )
         return candidates
@@ -215,14 +239,19 @@ class VerificationCodeService:
         options: VerificationCodeLookupOptions,
     ) -> VerificationCodeLookupResult:
         """Poll inbox until a matching code is found or timeout is reached."""
-        try:
-            code_pattern = re.compile(options.code_regex)
-        except re.error as error:
-            raise ValueError(f"验证码正则无效：{error}") from error
+        custom_code_pattern: re.Pattern[str] | None = None
+        if options.code_regex:
+            try:
+                custom_code_pattern = re.compile(options.code_regex)
+            except re.error as error:
+                raise ValueError(f"验证码正则无效：{error}") from error
 
         deadline = self._clock() + timedelta(seconds=max(options.timeout_seconds, 0))
         since_at = self._clock() - timedelta(seconds=max(options.since_seconds, 0))
         channels = self._resolve_channel_order(mailbox)
+        recipient_filter = _normalize_email_address(
+            options.recipient if options.recipient else mailbox.primary_email
+        )
         attempts = 0
         last_error: Exception | None = None
 
@@ -240,7 +269,12 @@ class VerificationCodeService:
                 except Exception as error:  # noqa: BLE001 - continue alternate channel / retry.
                     last_error = error
                     continue
-                match = self._find_code_in_messages(messages, options, code_pattern)
+                match = self._find_code_in_messages(
+                    messages,
+                    options,
+                    custom_code_pattern=custom_code_pattern,
+                    recipient_filter=recipient_filter,
+                )
                 if match is not None:
                     return VerificationCodeLookupResult(
                         found=True,
@@ -293,16 +327,16 @@ class VerificationCodeService:
             if status_code != "OK":
                 raise VerificationCodeReadError("无法选择 IMAP 收件箱")
 
-            since_date = ensure_utc(since_at).strftime("%d-%b-%Y")
-            status_code, search_data = client.search(None, "SINCE", since_date)
+            # UID SEARCH ALL then keep the newest N messages; time window is applied locally.
+            status_code, search_data = client.uid("search", None, "ALL")
             if status_code != "OK" or not search_data or not search_data[0]:
                 return []
 
-            message_ids = search_data[0].split()
-            selected_ids = message_ids[-MAX_MESSAGES_PER_SCAN:]
+            message_uids = search_data[0].split()
+            selected_uids = message_uids[-MAX_MESSAGES_PER_SCAN:]
             candidates: list[InboxMessageCandidate] = []
-            for message_id in reversed(selected_ids):
-                status_code, fetch_data = client.fetch(message_id, "(RFC822)")
+            for message_uid in reversed(selected_uids):
+                status_code, fetch_data = client.uid("fetch", message_uid, "(RFC822)")
                 if status_code != "OK" or not fetch_data:
                     continue
                 raw_bytes = _extract_imap_rfc822_bytes(fetch_data)
@@ -322,6 +356,7 @@ class VerificationCodeService:
                         body_text=body_text,
                         received_at=received_at,
                         channel="imap",
+                        recipient_addresses=_extract_message_recipient_addresses(email_message),
                     )
                 )
             return candidates
@@ -346,13 +381,21 @@ class VerificationCodeService:
     def _find_code_in_messages(
         messages: list[InboxMessageCandidate],
         options: VerificationCodeLookupOptions,
-        code_pattern: re.Pattern[str],
+        *,
+        custom_code_pattern: re.Pattern[str] | None,
+        recipient_filter: str | None,
     ) -> VerificationCodeMatch | None:
         from_filter = (options.from_address or "").strip().lower()
         subject_filter = (options.subject_contains or "").strip().lower()
         body_filter = (options.body_contains or "").strip().lower()
 
         for message in messages:
+            if options.require_recipient_match:
+                if not recipient_filter:
+                    continue
+                if recipient_filter not in message.recipient_addresses:
+                    continue
+
             from_value = (message.from_address or "").lower()
             subject_value = (message.subject or "").lower()
             body_value = message.body_text.lower()
@@ -363,13 +406,13 @@ class VerificationCodeService:
             if body_filter and body_filter not in body_value:
                 continue
 
-            searchable_text = "\n".join(
-                part for part in [message.subject or "", message.body_text] if part
+            code = extract_verification_code(
+                message.subject or "",
+                message.body_text,
+                custom_code_pattern=custom_code_pattern,
             )
-            match = code_pattern.search(searchable_text)
-            if match is None:
+            if code is None:
                 continue
-            code = match.group(1) if match.lastindex else match.group(0)
             return VerificationCodeMatch(
                 code=code,
                 matched_from=message.from_address,
@@ -378,6 +421,88 @@ class VerificationCodeService:
                 channel=message.channel,
             )
         return None
+
+
+def extract_verification_code(
+    subject: str,
+    body_text: str,
+    *,
+    custom_code_pattern: re.Pattern[str] | None = None,
+) -> str | None:
+    """Prefer xAI-style codes (ABC-123), then custom regex / digit fallbacks."""
+    subject_value = subject or ""
+    body_value = body_text or ""
+
+    subject_match = XAI_SUBJECT_CODE_REGEX.search(subject_value)
+    if subject_match is not None:
+        return subject_match.group(1)
+
+    searchable_text = "\n".join(part for part in [subject_value, body_value] if part)
+    body_xai_match = XAI_BODY_CODE_REGEX.search(searchable_text)
+    if body_xai_match is not None:
+        return body_xai_match.group(1)
+
+    if custom_code_pattern is not None:
+        custom_match = custom_code_pattern.search(searchable_text)
+        if custom_match is not None:
+            return custom_match.group(1) if custom_match.lastindex else custom_match.group(0)
+        return None
+
+    for keyword_pattern in DIGIT_KEYWORD_CODE_PATTERNS:
+        keyword_match = keyword_pattern.search(searchable_text)
+        if keyword_match is not None:
+            return keyword_match.group(1)
+
+    digit_match = re.search(DEFAULT_VERIFICATION_CODE_REGEX, searchable_text)
+    if digit_match is not None:
+        return digit_match.group(1)
+    return None
+
+
+def _normalize_email_address(raw_address: str | None) -> str | None:
+    if raw_address is None:
+        return None
+    normalized_value = raw_address.strip().lower()
+    if not normalized_value:
+        return None
+    # Strip display-name form: "Name <user@example.com>"
+    if "<" in normalized_value and ">" in normalized_value:
+        start_index = normalized_value.rfind("<")
+        end_index = normalized_value.rfind(">")
+        if start_index < end_index:
+            normalized_value = normalized_value[start_index + 1 : end_index].strip()
+    return normalized_value or None
+
+
+def _extract_message_recipient_addresses(email_message: Message) -> frozenset[str]:
+    raw_recipients: list[str] = []
+    for header_name in RECIPIENT_HEADER_NAMES:
+        raw_recipients.extend(email_message.get_all(header_name, []))
+    addresses: set[str] = set()
+    for _, recipient_address in getaddresses(raw_recipients):
+        normalized_address = _normalize_email_address(recipient_address)
+        if normalized_address:
+            addresses.add(normalized_address)
+    return frozenset(addresses)
+
+
+def _extract_graph_recipient_addresses(raw_message: dict[str, object]) -> frozenset[str]:
+    addresses: set[str] = set()
+    for field_name in ("toRecipients", "ccRecipients"):
+        recipients = raw_message.get(field_name)
+        if not isinstance(recipients, list):
+            continue
+        for recipient in recipients:
+            if not isinstance(recipient, dict):
+                continue
+            email_address = recipient.get("emailAddress")
+            if not isinstance(email_address, dict):
+                continue
+            address = email_address.get("address")
+            normalized_address = _normalize_email_address(address if isinstance(address, str) else None)
+            if normalized_address:
+                addresses.add(normalized_address)
+    return frozenset(addresses)
 
 
 def _extract_graph_from_address(from_payload: object) -> str | None:

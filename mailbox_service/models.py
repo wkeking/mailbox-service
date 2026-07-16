@@ -226,6 +226,10 @@ class Lease(Base):
     client_key_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     client_tag: Mapped[str | None] = mapped_column(String(100), nullable=True)
     purpose: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    # Business recipient for this lease: primary address or a plus alias of primary_email.
+    # IMAP/Graph auth always uses the mailbox primary identity; verification-code matching
+    # defaults to this allocated address when present.
+    allocated_email: Mapped[str | None] = mapped_column(String(320), nullable=True, index=True)
     mode: Mapped[LeaseMode] = mapped_column(
         Enum(LeaseMode, values_callable=enum_values), nullable=False, default=LeaseMode.ACCESS_TOKEN
     )

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import secrets
+import string
 
 from sqlalchemy import exists, select, update
 from sqlalchemy.orm import Session
@@ -20,6 +22,10 @@ from mailbox_service.models import (
 )
 from mailbox_service.security import CredentialCipher
 from mailbox_service.token_service import MailboxAccessTokenResult, MailboxAccessTokenService
+
+PLUS_ALIAS_SUFFIX_ALPHABET = string.ascii_lowercase + string.digits
+DEFAULT_PLUS_ALIAS_SUFFIX_LENGTH = 8
+MAX_PLUS_ALIAS_GENERATION_ATTEMPTS = 32
 
 
 class LeaseNotFoundError(Exception):
@@ -52,6 +58,8 @@ class LeaseAcquireResult:
     mode: LeaseMode
     expires_at: datetime
     created_at: datetime
+    # Business address for this lease (primary or plus alias). mail_read only.
+    allocated_email: str | None = None
     access_token: str | None = None
     access_token_expires_at: datetime | None = None
     access_token_refreshed: bool | None = None
@@ -100,6 +108,8 @@ class LeaseService:
         preferred_email: str | None = None,
         client_tag: str | None = None,
         purpose: str | None = None,
+        use_plus_alias: bool = False,
+        preferred_alias_suffix: str | None = None,
     ) -> LeaseAcquireResult:
         """Reserve one active mailbox that has no other unexpired lease."""
         if mode == LeaseMode.MAIL_READ:
@@ -112,6 +122,8 @@ class LeaseService:
                 principal.require_scope("tokens:refresh:read")
             else:
                 raise LeaseModeError(f"不支持的租约模式：{mode}")
+            if use_plus_alias or preferred_alias_suffix:
+                raise LeaseModeError("仅 mail_read 租约支持 plus alias 分配")
 
         current_time = utc_now()
         # MySQL DATETIME is typically naive; compare with a naive UTC value in SQL.
@@ -144,11 +156,22 @@ class LeaseService:
         if mailbox is None:
             raise LeaseUnavailableError("没有可用邮箱")
 
+        allocated_email: str | None = None
+        if mode == LeaseMode.MAIL_READ:
+            if use_plus_alias or preferred_alias_suffix:
+                allocated_email = self._allocate_plus_alias(
+                    mailbox.primary_email,
+                    preferred_alias_suffix=preferred_alias_suffix,
+                )
+            else:
+                allocated_email = mailbox.primary_email.strip().lower()
+
         lease = Lease(
             mailbox_id=mailbox.id,
             client_key_id=principal.client_key_id,
             client_tag=client_tag,
             purpose=purpose,
+            allocated_email=allocated_email,
             mode=mode,
             expires_at=current_time + timedelta(seconds=ttl_seconds),
             created_at=current_time,
@@ -160,6 +183,7 @@ class LeaseService:
             "lease_id": lease.id,
             "mailbox_id": mailbox.id,
             "primary_email": mailbox.primary_email,
+            "allocated_email": allocated_email,
             "mode": lease.mode,
             "expires_at": lease.expires_at,
             "created_at": lease.created_at,
@@ -188,7 +212,12 @@ class LeaseService:
             principal,
             "lease.acquired",
             lease.id,
-            {"mailbox_id": mailbox.id, "mode": lease.mode.value, "expires_at": lease.expires_at.isoformat()},
+            {
+                "mailbox_id": mailbox.id,
+                "mode": lease.mode.value,
+                "allocated_email": allocated_email,
+                "expires_at": lease.expires_at.isoformat(),
+            },
         )
         return result
 
@@ -307,6 +336,50 @@ class LeaseService:
         if require_active and (lease.released_at is not None or self._is_expired(lease.expires_at)):
             raise LeaseInactiveError("租约已释放或已过期")
         return lease
+
+    def _allocate_plus_alias(
+        self,
+        primary_email: str,
+        *,
+        preferred_alias_suffix: str | None = None,
+    ) -> str:
+        """Build a plus alias under the primary mailbox local-part."""
+        local_part, separator, domain_part = primary_email.strip().partition("@")
+        if not separator or not local_part or not domain_part:
+            raise ValueError(f"主邮箱地址格式无效：{primary_email}")
+
+        base_local_part = local_part.split("+", 1)[0]
+        if preferred_alias_suffix is not None:
+            normalized_suffix = preferred_alias_suffix.strip().lower()
+            if not normalized_suffix:
+                raise ValueError("alias_suffix 不能为空")
+            if not all(character in PLUS_ALIAS_SUFFIX_ALPHABET for character in normalized_suffix):
+                raise ValueError("alias_suffix 仅允许小写字母与数字")
+            if len(normalized_suffix) > 32:
+                raise ValueError("alias_suffix 最长 32 个字符")
+            return f"{base_local_part}+{normalized_suffix}@{domain_part.lower()}"
+
+        for _attempt in range(MAX_PLUS_ALIAS_GENERATION_ATTEMPTS):
+            random_suffix = "".join(
+                secrets.choice(PLUS_ALIAS_SUFFIX_ALPHABET)
+                for _index in range(DEFAULT_PLUS_ALIAS_SUFFIX_LENGTH)
+            )
+            candidate_email = f"{base_local_part}+{random_suffix}@{domain_part.lower()}"
+            if not self._is_allocated_email_in_use(candidate_email):
+                return candidate_email
+        raise LeaseUnavailableError("无法生成可用的 plus alias 地址")
+
+    def _is_allocated_email_in_use(self, allocated_email: str) -> bool:
+        """Return whether an active lease already holds this allocated address."""
+        sql_current_time = utc_now().replace(tzinfo=None)
+        existing_lease_id = self._session.scalar(
+            select(Lease.id).where(
+                Lease.allocated_email == allocated_email.strip().lower(),
+                Lease.released_at.is_(None),
+                Lease.expires_at > sql_current_time,
+            )
+        )
+        return existing_lease_id is not None
 
     def _write_audit_log(
         self,
