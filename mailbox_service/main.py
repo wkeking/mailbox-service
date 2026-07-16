@@ -55,6 +55,7 @@ from mailbox_service.proxy_service import (
     NoHealthyEgressProxyError,
 )
 from mailbox_service.proxy_scheduler import start_proxy_health_scheduler
+from mailbox_service.token_keepalive_scheduler import start_refresh_token_keepalive_scheduler
 from mailbox_service.schemas import (
     AccessTokenLeaseCredentialResponse,
     ClientKeyCreateRequest,
@@ -72,6 +73,10 @@ from mailbox_service.schemas import (
     LeaseRefreshTokenUpdateRequest,
     LeaseRefreshTokenUpdateResponse,
     LeaseReleaseResponse,
+    LeaseVerificationCodeRequest,
+    LeaseVerificationCodeResponse,
+    MailboxAcquireRequest,
+    MailboxAcquireResponse,
     MailboxAccessTokenRefreshRequest,
     MailboxAccessTokenRefreshResponse,
     MailboxAccessTokenResponse,
@@ -104,6 +109,12 @@ from mailbox_service.proxy_service import (
     MicrosoftInvalidGrantError,
     MicrosoftOAuthError,
 )
+from mailbox_service.verification_code_service import (
+    MicrosoftGraphMailReader,
+    VerificationCodeLookupOptions,
+    VerificationCodeReadError,
+    VerificationCodeService,
+)
 
 SessionDependency = Annotated[Session, Depends(get_session)]
 SettingsDependency = Annotated[Settings, Depends(get_settings)]
@@ -123,6 +134,7 @@ client_api_key_header = APIKeyHeader(
 OPENAPI_TAGS = [
     {"name": "服务状态", "description": "服务健康检查与基础可用性。"},
     {"name": "外部租约", "description": "外部调用方领取、使用和释放邮箱租约。"},
+    {"name": "外部邮箱", "description": "外部调用方领取可用邮箱账号并读取收件箱验证码。"},
     {"name": "概览", "description": "管理台概览与运行指标。"},
     {"name": "邮箱管理", "description": "邮箱凭证导入、Token 缓存、刷新和代理绑定。"},
     {"name": "租约管理", "description": "邮箱租约记录与生命周期查询。"},
@@ -131,7 +143,7 @@ OPENAPI_TAGS = [
     {"name": "Client Key 管理", "description": "外部调用方 Client API Key 的创建、查询和停用。"},
 ]
 
-PUBLIC_OPENAPI_TAG_NAMES = {"服务状态", "外部租约"}
+PUBLIC_OPENAPI_TAG_NAMES = {"服务状态", "外部租约", "外部邮箱"}
 
 OPENAPI_OPERATION_DOCUMENTATION: dict[tuple[str, str], tuple[str, str, str]] = {
     ("GET", "/health"): ("查询服务状态", "返回无副作用的服务健康状态。", "服务状态"),
@@ -154,6 +166,16 @@ OPENAPI_OPERATION_DOCUMENTATION: dict[tuple[str, str], tuple[str, str, str]] = {
         "回写租约 Refresh Token",
         "使用 expected_token_version 执行 CAS 更新，防止较旧 RT 覆盖数据库中的较新值。",
         "外部租约",
+    ),
+    ("POST", "/api/v1/mailboxes/acquire"): (
+        "领取可用邮箱账号",
+        "领取一个 status=active 的邮箱并创建 mail_read 租约，只返回邮箱地址与租约信息，不返回 Token。",
+        "外部邮箱",
+    ),
+    ("POST", "/api/v1/leases/{lease_id}/verification-code"): (
+        "获取收件箱验证码",
+        "在 mail_read 租约下读取最近邮件并提取验证码；默认查看最近 3 分钟、最多等待 60 秒。",
+        "外部邮箱",
     ),
     ("GET", "/api/v1/admin/dashboard"): (
         "查询管理概览",
@@ -293,6 +315,10 @@ OPENAPI_SCHEMA_DESCRIPTIONS = {
     "LeaseRefreshTokenUpdateRequest": "使用 token_version 进行 CAS 的 Refresh Token 回写请求。",
     "LeaseRefreshTokenUpdateResponse": "Refresh Token CAS 回写结果，不回显 Token 明文。",
     "LeaseReleaseResponse": "幂等租约释放响应。",
+    "LeaseVerificationCodeRequest": "mail_read 租约下提取收件箱验证码的请求。",
+    "LeaseVerificationCodeResponse": "验证码提取结果。",
+    "MailboxAcquireRequest": "领取可用邮箱账号（mail_read 租约）的请求。",
+    "MailboxAcquireResponse": "可用邮箱账号领取结果，不返回 Token。",
     "MailboxAccessTokenRefreshItemResponse": "单个邮箱的 Token 刷新结果。",
     "MailboxAccessTokenRefreshRequest": "批量刷新请求；邮箱 ID 为空时刷新全部可用邮箱。",
     "MailboxAccessTokenRefreshResponse": "批量刷新汇总响应，不返回 Token 明文。",
@@ -314,12 +340,16 @@ OPENAPI_SCHEMA_DESCRIPTIONS = {
 
 @asynccontextmanager
 async def application_lifespan(_: FastAPI):
-    """Run one bounded proxy health scheduler for the selected single instance."""
-    scheduler = start_proxy_health_scheduler(get_settings())
+    """Run process-local background jobs for the selected single instance."""
+    settings = get_settings()
+    proxy_health_scheduler = start_proxy_health_scheduler(settings)
+    refresh_token_keepalive_scheduler = start_refresh_token_keepalive_scheduler(settings)
     try:
         yield
     finally:
-        scheduler.shutdown(wait=False)
+        proxy_health_scheduler.shutdown(wait=False)
+        if refresh_token_keepalive_scheduler is not None:
+            refresh_token_keepalive_scheduler.shutdown(wait=False)
 
 
 app = FastAPI(
@@ -415,7 +445,11 @@ def get_public_openapi_routes() -> list[APIRoute]:
         for route in app.routes
         if isinstance(route, APIRoute)
         and route.include_in_schema
-        and (route.path == "/health" or route.path.startswith("/api/v1/leases"))
+        and (
+            route.path == "/health"
+            or route.path.startswith("/api/v1/leases")
+            or route.path.startswith("/api/v1/mailboxes")
+        )
     ]
 
 
@@ -594,6 +628,26 @@ def get_lease_service(
 LeaseServiceDependency = Annotated[LeaseService, Depends(get_lease_service)]
 
 
+def get_verification_code_service(
+    settings: SettingsDependency,
+    proxy_service: ProxyServiceDependency,
+    access_token_service: AccessTokenServiceDependency,
+) -> VerificationCodeService:
+    """Provide request-local verification-code extraction with proxy-aware mail readers."""
+    return VerificationCodeService(
+        access_token_service,
+        MicrosoftIMAPClient(proxy_service, settings),
+        MicrosoftGraphMailReader(
+            proxy_service,
+            settings.proxy_connect_timeout_seconds,
+            settings.proxy_read_timeout_seconds,
+        ),
+    )
+
+
+VerificationCodeServiceDependency = Annotated[VerificationCodeService, Depends(get_verification_code_service)]
+
+
 def require_admin(
     settings: SettingsDependency,
     admin_token: Annotated[str | None, Depends(admin_token_header)],
@@ -676,6 +730,16 @@ def to_external_http_exception(error: Exception) -> HTTPException:
         return HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail={"code": "MICROSOFT_TOKEN_REFRESH_FAILED", "message": str(error)},
+        )
+    if isinstance(error, VerificationCodeReadError):
+        return HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={"code": "MAILBOX_INBOX_READ_FAILED", "message": str(error)},
+        )
+    if isinstance(error, ValueError):
+        return HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"code": "INVALID_REQUEST", "message": str(error)},
         )
     return HTTPException(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -847,6 +911,80 @@ def parse_mailbox_import_line(line_number: int, raw_line: str) -> tuple[str, str
 def get_health() -> dict[str, str]:
     """Return a side-effect-free readiness response for local deployment checks."""
     return {"status": "ok"}
+
+
+@app.post(
+    "/api/v1/mailboxes/acquire",
+    response_model=MailboxAcquireResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def acquire_mailbox_account(
+    payload: MailboxAcquireRequest,
+    principal: ClientPrincipalDependency,
+    lease_service: LeaseServiceDependency,
+) -> MailboxAcquireResponse:
+    """Acquire one usable mailbox account as a mail_read lease without returning tokens."""
+    try:
+        result = lease_service.acquire_lease(
+            principal,
+            mode=LeaseMode.MAIL_READ,
+            ttl_seconds=payload.lease_ttl_seconds,
+            preferred_email=payload.preferred_email,
+            client_tag=payload.client_tag,
+            purpose=payload.purpose,
+        )
+    except Exception as error:
+        raise to_external_http_exception(error) from error
+    return MailboxAcquireResponse(
+        lease_id=result.lease_id,
+        mailbox_id=result.mailbox_id,
+        primary_email=result.primary_email,
+        mode=LeaseMode.MAIL_READ,
+        expires_at=result.expires_at,
+        created_at=result.created_at,
+    )
+
+
+@app.post(
+    "/api/v1/leases/{lease_id}/verification-code",
+    response_model=LeaseVerificationCodeResponse,
+)
+def get_lease_verification_code(
+    lease_id: str,
+    payload: LeaseVerificationCodeRequest,
+    principal: ClientPrincipalDependency,
+    lease_service: LeaseServiceDependency,
+    verification_code_service: VerificationCodeServiceDependency,
+) -> LeaseVerificationCodeResponse:
+    """Extract a verification code from recent inbox mail for an owned mail_read lease."""
+    try:
+        lease, mailbox = lease_service.load_active_mail_read_lease(principal, lease_id)
+        lookup_result = verification_code_service.wait_for_verification_code(
+            mailbox,
+            VerificationCodeLookupOptions(
+                timeout_seconds=payload.timeout_seconds,
+                since_seconds=payload.since_seconds,
+                poll_interval_seconds=payload.poll_interval_seconds,
+                from_address=payload.from_address,
+                subject_contains=payload.subject_contains,
+                body_contains=payload.body_contains,
+                code_regex=payload.code_regex,
+            ),
+        )
+    except Exception as error:
+        raise to_external_http_exception(error) from error
+    return LeaseVerificationCodeResponse(
+        lease_id=lease.id,
+        mailbox_id=mailbox.id,
+        primary_email=mailbox.primary_email,
+        found=lookup_result.found,
+        code=lookup_result.code,
+        matched_from=lookup_result.matched_from,
+        matched_subject=lookup_result.matched_subject,
+        message_received_at=lookup_result.message_received_at,
+        channel=lookup_result.channel,
+        attempts=lookup_result.attempts,
+    )
 
 
 @app.post(

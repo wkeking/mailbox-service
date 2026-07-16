@@ -52,6 +52,12 @@ const CLIENT_KEY_SCOPE_OPTIONS = [
   { id: "tokens:access:read", label: "读取 Access Token", description: "tokens:access:read" },
   { id: "tokens:refresh:read", label: "读取 Refresh Token", description: "tokens:refresh:read" },
   { id: "tokens:refresh:write", label: "回写 Refresh Token", description: "tokens:refresh:write" },
+  { id: "mailboxes:acquire", label: "领取可用邮箱", description: "mailboxes:acquire" },
+  {
+    id: "mail:verification-code:read",
+    label: "读取收件箱验证码",
+    description: "mail:verification-code:read",
+  },
 ] as const;
 
 type ClientKeyScope = (typeof CLIENT_KEY_SCOPE_OPTIONS)[number]["id"];

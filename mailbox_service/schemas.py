@@ -295,7 +295,8 @@ class ClientKeyCreateRequest(BaseModel):
         description=(
             "权限列表，可选："
             "leases:acquire、leases:release、tokens:access:read、"
-            "tokens:refresh:read、tokens:refresh:write。"
+            "tokens:refresh:read、tokens:refresh:write、"
+            "mailboxes:acquire、mail:verification-code:read。"
         ),
     )
     expires_at: datetime | None = Field(default=None, description="过期时间（UTC）；为空表示不过期。")
@@ -361,6 +362,116 @@ class LeaseAcquireRequest(BaseModel):
             return None
         normalized_value = value.strip()
         return normalized_value or None
+
+
+class MailboxAcquireRequest(BaseModel):
+    """领取一个可用邮箱账号用于后续读信 / 验证码，不返回 Token。"""
+
+    lease_ttl_seconds: int = Field(
+        default=600,
+        ge=60,
+        le=86_400,
+        description="mail_read 租约有效期（秒），默认 600，范围 60–86400。",
+    )
+    preferred_email: str | None = Field(
+        default=None,
+        max_length=320,
+        description="优先领取的邮箱地址；不传则由服务分配可用邮箱。",
+    )
+    client_tag: str | None = Field(default=None, max_length=100, description="调用方自定义标签，便于排查。")
+    purpose: str | None = Field(default=None, max_length=100, description="领取用途说明。")
+
+    @field_validator("preferred_email", "client_tag", "purpose")
+    @classmethod
+    def normalize_optional_mailbox_acquire_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized_value = value.strip()
+        return normalized_value or None
+
+
+class MailboxAcquireResponse(BaseModel):
+    """可用邮箱账号领取结果，仅返回邮箱身份与 mail_read 租约。"""
+
+    lease_id: str = Field(description="mail_read 租约 ID，后续取验证码 / 释放时使用。")
+    mailbox_id: str = Field(description="被领取邮箱的 ID。")
+    primary_email: str = Field(description="被领取邮箱地址。")
+    mode: Literal[LeaseMode.MAIL_READ] = Field(
+        default=LeaseMode.MAIL_READ,
+        description="固定为 mail_read，不返回 access_token / refresh_token。",
+    )
+    expires_at: datetime = Field(description="租约到期时间。")
+    created_at: datetime = Field(description="租约创建时间。")
+
+
+class LeaseVerificationCodeRequest(BaseModel):
+    """在 mail_read 租约下从收件箱提取验证码。"""
+
+    timeout_seconds: int = Field(
+        default=60,
+        ge=0,
+        le=300,
+        description="最长等待时间（秒）。默认 60；为 0 时只扫描一次。",
+    )
+    since_seconds: int = Field(
+        default=180,
+        ge=30,
+        le=3_600,
+        description="只查看最近 N 秒内的邮件，默认 180（3 分钟）。",
+    )
+    poll_interval_seconds: int = Field(
+        default=3,
+        ge=1,
+        le=30,
+        description="轮询间隔（秒），默认 3。",
+    )
+    from_address: str | None = Field(
+        default=None,
+        max_length=320,
+        description="可选：发件人地址子串过滤（不区分大小写）。",
+    )
+    subject_contains: str | None = Field(
+        default=None,
+        max_length=200,
+        description="可选：主题包含的关键词（不区分大小写）。",
+    )
+    body_contains: str | None = Field(
+        default=None,
+        max_length=200,
+        description="可选：正文包含的关键词（不区分大小写）。",
+    )
+    code_regex: str = Field(
+        default=r"\b(\d{4,8})\b",
+        min_length=1,
+        max_length=200,
+        description="验证码提取正则，默认匹配 4–8 位数字；建议使用捕获组。",
+    )
+
+    @field_validator("from_address", "subject_contains", "body_contains")
+    @classmethod
+    def normalize_optional_filter_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized_value = value.strip()
+        return normalized_value or None
+
+
+class LeaseVerificationCodeResponse(BaseModel):
+    """验证码提取结果。"""
+
+    lease_id: str = Field(description="mail_read 租约 ID。")
+    mailbox_id: str = Field(description="邮箱 ID。")
+    primary_email: str = Field(description="主邮箱地址。")
+    found: bool = Field(description="是否在时间窗内匹配到验证码。")
+    code: str | None = Field(default=None, description="提取到的验证码；未找到时为 null。")
+    matched_from: str | None = Field(default=None, description="匹配邮件的发件人。")
+    matched_subject: str | None = Field(default=None, description="匹配邮件的主题。")
+    message_received_at: datetime | None = Field(default=None, description="匹配邮件的接收时间（UTC）。")
+    channel: Literal["imap", "graph"] | None = Field(
+        default=None,
+        description="实际读信通道：imap 或 graph。",
+    )
+    attempts: int = Field(description="本次请求内的扫描次数。")
 
 
 class AccessTokenLeaseCredentialResponse(BaseModel):

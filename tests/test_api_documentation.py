@@ -28,6 +28,8 @@ def test_public_documentation_only_exposes_external_service_routes() -> None:
         "/api/v1/leases/{lease_id}/release",
         "/api/v1/leases/{lease_id}/access-token",
         "/api/v1/leases/{lease_id}/refresh-token",
+        "/api/v1/mailboxes/acquire",
+        "/api/v1/leases/{lease_id}/verification-code",
     }
     assert security_schemes["ClientApiKey"] == {
         "type": "apiKey",

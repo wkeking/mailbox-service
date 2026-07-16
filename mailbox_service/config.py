@@ -38,6 +38,14 @@ class Settings(BaseSettings):
     microsoft_graph_messages_url: str = "https://graph.microsoft.com/v1.0/me/messages?$top=1"
     access_token_refresh_skew_seconds: int = Field(default=120, ge=0, le=3600)
 
+    # Refresh Token keepalive: Microsoft identity platform default RT lifetime is ~90 days
+    # for non-SPA confidential/public client flows. Each successful refresh may rotate RT.
+    refresh_token_keepalive_enabled: bool = True
+    refresh_token_keepalive_interval_seconds: int = Field(default=86_400, ge=300, le=604_800)
+    refresh_token_lifetime_days: int = Field(default=90, ge=1, le=365)
+    refresh_token_keepalive_lead_days: int = Field(default=7, ge=0, le=90)
+    refresh_token_keepalive_batch_size: int = Field(default=20, ge=1, le=500)
+
     @property
     def token_diagnostic_logging_enabled(self) -> bool:
         """Allow sensitive-adjacent Token diagnostics only in explicit development mode."""

@@ -8,7 +8,7 @@ import hashlib
 import logging
 from typing import Protocol
 
-from sqlalchemy import select
+from sqlalchemy import exists, func, select
 from sqlalchemy.orm import Session
 
 from mailbox_service.access_token_scopes import extract_oauth_scopes_from_access_token
@@ -17,7 +17,7 @@ from mailbox_service.capability_probe_service import (
     apply_capability_probe_result,
 )
 from mailbox_service.config import Settings
-from mailbox_service.models import Mailbox, MailboxStatus, utc_now
+from mailbox_service.models import Lease, Mailbox, MailboxStatus, utc_now
 from mailbox_service.proxy_service import MicrosoftInvalidGrantError, MicrosoftOAuthError, MicrosoftTokenResponse
 from mailbox_service.security import CredentialCipher, summarize_exception
 
@@ -270,6 +270,55 @@ class MailboxAccessTokenService:
                 select(Mailbox.id).where(Mailbox.status == MailboxStatus.ACTIVE).order_by(Mailbox.primary_email.asc())
             )
         )
+
+    def list_mailbox_ids_due_for_refresh_token_keepalive(self, *, batch_size: int) -> list[str]:
+        """Select active mailboxes whose last successful OAuth refresh is older than the keepalive threshold.
+
+        Microsoft personal / work accounts typically receive refresh tokens that remain usable for
+        about 90 days unless revoked. This service tracks the last successful token endpoint call in
+        ``access_token_refreshed_at`` and refreshes early by ``refresh_token_keepalive_lead_days``.
+        Mailboxes holding an active lease are skipped to avoid rotating RT while a client still holds
+        an older refresh_token mode lease credential.
+        """
+        lifetime_days = self._settings.refresh_token_lifetime_days
+        lead_days = min(self._settings.refresh_token_keepalive_lead_days, lifetime_days)
+        due_before = utc_now() - timedelta(days=max(lifetime_days - lead_days, 0))
+        due_before_naive = due_before.replace(tzinfo=None)
+
+        current_time = utc_now()
+        sql_current_time = current_time.replace(tzinfo=None)
+        active_lease_exists = exists(
+            select(Lease.id).where(
+                Lease.mailbox_id == Mailbox.id,
+                Lease.released_at.is_(None),
+                Lease.expires_at > sql_current_time,
+            )
+        )
+        # Prefer access_token_refreshed_at; fall back to created_at for never-refreshed imports.
+        last_refresh_expression = func.coalesce(Mailbox.access_token_refreshed_at, Mailbox.created_at)
+        return list(
+            self._session.scalars(
+                select(Mailbox.id)
+                .where(
+                    Mailbox.status == MailboxStatus.ACTIVE,
+                    Mailbox.client_id.is_not(None),
+                    Mailbox.refresh_token_ciphertext.is_not(None),
+                    ~active_lease_exists,
+                    last_refresh_expression <= due_before_naive,
+                )
+                .order_by(last_refresh_expression.asc(), Mailbox.primary_email.asc())
+                .limit(batch_size)
+            )
+        )
+
+    def run_refresh_token_keepalive_batch(self) -> MailboxAccessTokenRefreshResult:
+        """Force-refresh due mailboxes so RT sliding lifetime is extended before expiry."""
+        due_mailbox_ids = self.list_mailbox_ids_due_for_refresh_token_keepalive(
+            batch_size=self._settings.refresh_token_keepalive_batch_size
+        )
+        if not due_mailbox_ids:
+            return MailboxAccessTokenRefreshResult(successful=0, failed=0, results=[])
+        return self.refresh_access_tokens(due_mailbox_ids)
 
     def _has_usable_cached_access_token(self, mailbox: Mailbox) -> bool:
         if not mailbox.access_token_ciphertext or mailbox.access_token_expires_at is None:

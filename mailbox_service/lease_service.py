@@ -9,7 +9,15 @@ from sqlalchemy import exists, select, update
 from sqlalchemy.orm import Session
 
 from mailbox_service.client_key_service import ClientPrincipal
-from mailbox_service.models import AuditLog, Lease, LeaseMode, Mailbox, MailboxStatus, utc_now
+from mailbox_service.models import (
+    AuditLog,
+    Lease,
+    LeaseMode,
+    Mailbox,
+    MailboxCapability,
+    MailboxStatus,
+    utc_now,
+)
 from mailbox_service.security import CredentialCipher
 from mailbox_service.token_service import MailboxAccessTokenResult, MailboxAccessTokenService
 
@@ -94,13 +102,16 @@ class LeaseService:
         purpose: str | None = None,
     ) -> LeaseAcquireResult:
         """Reserve one active mailbox that has no other unexpired lease."""
-        principal.require_scope("leases:acquire")
-        if mode == LeaseMode.ACCESS_TOKEN:
-            principal.require_scope("tokens:access:read")
-        elif mode == LeaseMode.REFRESH_TOKEN:
-            principal.require_scope("tokens:refresh:read")
+        if mode == LeaseMode.MAIL_READ:
+            principal.require_scope("mailboxes:acquire")
         else:
-            raise LeaseModeError("外部租约暂不支持 mail_read mode")
+            principal.require_scope("leases:acquire")
+            if mode == LeaseMode.ACCESS_TOKEN:
+                principal.require_scope("tokens:access:read")
+            elif mode == LeaseMode.REFRESH_TOKEN:
+                principal.require_scope("tokens:refresh:read")
+            else:
+                raise LeaseModeError(f"不支持的租约模式：{mode}")
 
         current_time = utc_now()
         # MySQL DATETIME is typically naive; compare with a naive UTC value in SQL.
@@ -118,6 +129,12 @@ class LeaseService:
             Mailbox.refresh_token_ciphertext.is_not(None),
             ~active_lease_exists,
         )
+        if mode == LeaseMode.MAIL_READ:
+            # mail_read needs a mail channel later; exclude known-unusable rows.
+            mailbox_query = mailbox_query.where(
+                (Mailbox.capability.is_(None))
+                | (Mailbox.capability != MailboxCapability.UNUSABLE)
+            )
         if preferred_email:
             mailbox_query = mailbox_query.where(Mailbox.primary_email == preferred_email.strip().lower())
         mailbox_query = mailbox_query.order_by(Mailbox.updated_at.asc(), Mailbox.primary_email.asc()).with_for_update(
@@ -156,13 +173,16 @@ class LeaseService:
                 access_token_refreshed=access_token_result.refreshed,
                 token_version=access_token_result.token_version,
             )
-        else:
+        elif mode == LeaseMode.REFRESH_TOKEN:
             result = LeaseAcquireResult(
                 **result_arguments,
                 client_id=mailbox.client_id,
                 refresh_token=self._credential_cipher.decrypt(mailbox.refresh_token_ciphertext or ""),
                 token_version=mailbox.token_version,
             )
+        else:
+            # mail_read leases only expose mailbox identity; tokens stay server-side.
+            result = LeaseAcquireResult(**result_arguments)
 
         self._write_audit_log(
             principal,
@@ -195,6 +215,21 @@ class LeaseService:
         if mailbox is None or mailbox.status != MailboxStatus.ACTIVE:
             raise LeaseInactiveError("租约邮箱当前不可用")
         return self._access_token_service.ensure_access_token(mailbox.id)
+
+    def load_active_mail_read_lease(
+        self,
+        principal: ClientPrincipal,
+        lease_id: str,
+    ) -> tuple[Lease, Mailbox]:
+        """Return an owned active mail_read lease and its mailbox row."""
+        principal.require_scope("mail:verification-code:read")
+        lease = self._load_owned_lease(principal, lease_id, require_active=True)
+        if lease.mode != LeaseMode.MAIL_READ:
+            raise LeaseModeError("该租约不是 mail_read mode")
+        mailbox = self._session.get(Mailbox, lease.mailbox_id)
+        if mailbox is None or mailbox.status != MailboxStatus.ACTIVE:
+            raise LeaseInactiveError("租约邮箱当前不可用")
+        return lease, mailbox
 
     def update_refresh_token(
         self,

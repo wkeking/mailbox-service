@@ -79,7 +79,9 @@ curl -X POST http://localhost:8000/api/v1/admin/client-keys \
       "leases:release",
       "tokens:access:read",
       "tokens:refresh:read",
-      "tokens:refresh:write"
+      "tokens:refresh:write",
+      "mailboxes:acquire",
+      "mail:verification-code:read"
     ]
   }'
 ```
@@ -91,6 +93,8 @@ curl -X POST http://localhost:8000/api/v1/admin/client-keys \
 - `tokens:access:read`：领取或读取 AT mode 租约
 - `tokens:refresh:read`：领取 RT mode 租约并读取当前 RT
 - `tokens:refresh:write`：在 RT mode 租约内 CAS 回写新 RT
+- `mailboxes:acquire`：领取可用邮箱账号（mail_read 租约，不返回 Token）
+- `mail:verification-code:read`：在 mail_read 租约下读取收件箱验证码
 
 ## 外部服务 API
 
@@ -102,6 +106,8 @@ curl -X POST http://localhost:8000/api/v1/admin/client-keys \
 | `POST` | `/api/v1/leases/{lease_id}/release` | 幂等释放租约 |
 | `POST` | `/api/v1/leases/{lease_id}/access-token` | 获取未过期缓存 AT，过期时自动刷新 |
 | `POST` | `/api/v1/leases/{lease_id}/refresh-token` | 按 `expected_token_version` CAS 回写 RT |
+| `POST` | `/api/v1/mailboxes/acquire` | 领取可用邮箱账号（mail_read，只返回邮箱与租约） |
+| `POST` | `/api/v1/leases/{lease_id}/verification-code` | 在 mail_read 租约下提取收件箱验证码 |
 
 ## 管理 API
 
@@ -122,6 +128,28 @@ curl -X POST http://localhost:8000/api/v1/admin/client-keys \
 | `POST` | `/api/v1/admin/client-keys` | 创建 Client Key，明文只返回一次 |
 | `GET` | `/api/v1/admin/client-keys` | 查询不含密钥和摘要的 Client Key 元数据 |
 | `POST` | `/api/v1/admin/client-keys/{id}/disable` | 停用 Client Key |
+
+## Refresh Token 保活
+
+Microsoft identity platform 对非 SPA 场景的 refresh token **默认寿命约 90 天**（不是 30 天）。  
+SPA / 某些 OTP 流程可能是 24 小时；个人 Outlook / Hotmail 常见为 90 天滑动/可轮换，且服务端可随时撤销。
+
+本服务提供进程内定时保活（与代理健康探测同类，单实例 APScheduler）：
+
+- 默认开启：`REFRESH_TOKEN_KEEPALIVE_ENABLED=true`
+- 默认每天扫描一次：`REFRESH_TOKEN_KEEPALIVE_INTERVAL_SECONDS=86400`
+- 默认按 90 天寿命、提前 7 天刷新：`REFRESH_TOKEN_LIFETIME_DAYS=90`、`REFRESH_TOKEN_KEEPALIVE_LEAD_DAYS=7`
+- 每批最多处理：`REFRESH_TOKEN_KEEPALIVE_BATCH_SIZE=20`
+
+规则摘要：
+
+1. 只处理 `status=active` 且具备 `client_id` / RT 的邮箱  
+2. 以 `access_token_refreshed_at`（无则 `created_at`）判断是否 overdue  
+3. 跳过仍有未过期租约的邮箱，避免 RT mode 持有方拿到旧 RT  
+4. 调用 Microsoft token 端点强制刷新；若返回新 RT 则加密落库并 `token_version + 1`  
+5. `invalid_grant` 会标记邮箱 `invalid`
+
+也可在管理台对选中/全部邮箱执行 `POST /api/v1/admin/mailboxes/access-tokens/refresh` 做手动批量刷新。
 
 ## 安全限制
 
