@@ -9,13 +9,16 @@ from email.header import decode_header, make_header
 from email.message import Message
 from email.utils import getaddresses, parsedate_to_datetime
 import imaplib
+import json
 import re
 import time
+from pathlib import Path
 from typing import Literal
 from urllib.parse import quote
 
 import httpx
 
+from mailbox_service.config import Settings
 from mailbox_service.models import Mailbox, MailboxCapability, ensure_utc, utc_now
 from mailbox_service.proxy_service import (
     EgressProxyService,
@@ -40,6 +43,17 @@ DEFAULT_SINCE_SECONDS = 180
 DEFAULT_TIMEOUT_SECONDS = 60
 DEFAULT_POLL_INTERVAL_SECONDS = 3
 MAX_MESSAGES_PER_SCAN = 30
+# Expand the lookback slightly so clock skew / mislabeled Date headers do not drop
+# fresh verification-code messages. Server INTERNALDATE is preferred over Date.
+TIME_FILTER_CLOCK_SKEW_SECONDS = 900
+IMAP_FETCH_ITEMS = "(INTERNALDATE RFC822)"
+# Consumer mail often lands in Junk; verification codes must still be readable there.
+IMAP_SCAN_FOLDERS = ("INBOX", "Junk")
+GRAPH_SCAN_FOLDERS = ("inbox", "junkemail")
+IMAP_INTERNALDATE_PATTERN = re.compile(
+    r'INTERNALDATE\s+"([^"]+)"',
+    re.IGNORECASE,
+)
 RECIPIENT_HEADER_NAMES = (
     "To",
     "Cc",
@@ -47,6 +61,40 @@ RECIPIENT_HEADER_NAMES = (
     "X-Original-To",
     "X-Envelope-To",
 )
+# region agent log
+_DEBUG_LOG_PATHS = (
+    Path("/path/to/mailbox-service/.cursor/debug-f3384b.log"),
+    Path("/tmp/debug-f3384b.log"),
+)
+
+
+def _agent_debug_log(
+    *,
+    location: str,
+    message: str,
+    hypothesis_id: str,
+    data: dict[str, object],
+) -> None:
+    """Append one NDJSON debug line for runtime hypothesis verification."""
+    payload = {
+        "sessionId": "f3384b",
+        "timestamp": int(time.time() * 1000),
+        "location": location,
+        "message": message,
+        "hypothesisId": hypothesis_id,
+        "data": data,
+    }
+    line = json.dumps(payload, ensure_ascii=False, default=str) + "\n"
+    for log_path in _DEBUG_LOG_PATHS:
+        try:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            with log_path.open("a", encoding="utf-8") as log_file:
+                log_file.write(line)
+        except Exception:  # noqa: BLE001 - debug logging must never break mail reads.
+            continue
+
+
+# endregion
 
 MailReadChannel = Literal["imap", "graph"]
 
@@ -154,7 +202,9 @@ class MicrosoftGraphMailReader:
         max_messages: int,
         selected_proxy: ResolvedProxy | None,
     ) -> list[InboxMessageCandidate]:
-        since_filter = ensure_utc(since_at).strftime("%Y-%m-%dT%H:%M:%SZ")
+        # Graph timestamps are UTC; still widen the API filter slightly for clock skew.
+        filter_since_at = expand_lookback_since_at(since_at)
+        since_filter = filter_since_at.strftime("%Y-%m-%dT%H:%M:%SZ")
         filter_expression = f"receivedDateTime ge {since_filter}"
         query = (
             f"$filter={quote(filter_expression)}"
@@ -162,7 +212,6 @@ class MicrosoftGraphMailReader:
             f"&$top={max_messages}"
             f"&$select={quote('from,subject,body,bodyPreview,receivedDateTime,toRecipients,ccRecipients')}"
         )
-        request_url = f"https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages?{query}"
         proxy_url = selected_proxy.as_httpx_proxy_url() if selected_proxy is not None else None
         timeout = httpx.Timeout(
             connect=self._connect_timeout,
@@ -170,48 +219,75 @@ class MicrosoftGraphMailReader:
             write=self._read_timeout,
             pool=self._connect_timeout,
         )
-        try:
-            with httpx.Client(proxy=proxy_url, timeout=timeout) as client:
-                response = client.get(
-                    request_url,
-                    headers={"Authorization": f"Bearer {access_token}"},
-                )
-        except (httpx.ProxyError, httpx.ConnectTimeout, httpx.ReadTimeout) as error:
-            raise EgressProxyTransportError("Graph 代理链路不可用") from error
-        except httpx.ConnectError as error:
-            if selected_proxy is not None:
-                raise EgressProxyTransportError("Graph 代理连接失败") from error
-            raise VerificationCodeReadError("无法连接 Microsoft Graph 读取收件箱") from error
-
-        if response.status_code in {401, 403}:
-            raise VerificationCodeReadError(f"Graph 鉴权失败，HTTP {response.status_code}")
-        if response.status_code >= 400:
-            raise VerificationCodeReadError(f"Graph 读取收件箱失败，HTTP {response.status_code}")
-
-        payload = response.json()
-        raw_messages = payload.get("value") if isinstance(payload, dict) else None
-        if not isinstance(raw_messages, list):
-            return []
-
         candidates: list[InboxMessageCandidate] = []
-        for raw_message in raw_messages:
-            if not isinstance(raw_message, dict):
-                continue
-            from_address = _extract_graph_from_address(raw_message.get("from"))
-            subject = raw_message.get("subject") if isinstance(raw_message.get("subject"), str) else None
-            body_text = _extract_graph_body_text(raw_message)
-            received_at = _parse_iso_datetime(raw_message.get("receivedDateTime"))
-            recipient_addresses = _extract_graph_recipient_addresses(raw_message)
-            candidates.append(
-                InboxMessageCandidate(
-                    from_address=from_address,
-                    subject=subject,
-                    body_text=body_text,
-                    received_at=received_at,
-                    channel="graph",
-                    recipient_addresses=recipient_addresses,
-                )
+        folder_scan_summary: dict[str, int] = {}
+        # Prefer inbox first, then junk; optional folders may be missing and should not fail the scan.
+        for folder_name in GRAPH_SCAN_FOLDERS:
+            request_url = (
+                f"https://graph.microsoft.com/v1.0/me/mailFolders/{folder_name}/messages?{query}"
             )
+            try:
+                with httpx.Client(proxy=proxy_url, timeout=timeout) as client:
+                    response = client.get(
+                        request_url,
+                        headers={"Authorization": f"Bearer {access_token}"},
+                    )
+            except (httpx.ProxyError, httpx.ConnectTimeout, httpx.ReadTimeout) as error:
+                raise EgressProxyTransportError("Graph 代理链路不可用") from error
+            except httpx.ConnectError as error:
+                if selected_proxy is not None:
+                    raise EgressProxyTransportError("Graph 代理连接失败") from error
+                raise VerificationCodeReadError("无法连接 Microsoft Graph 读取收件箱") from error
+
+            if response.status_code in {401, 403}:
+                raise VerificationCodeReadError(f"Graph 鉴权失败，HTTP {response.status_code}")
+            if response.status_code == 404 and folder_name != "inbox":
+                folder_scan_summary[folder_name] = -1
+                continue
+            if response.status_code >= 400:
+                if folder_name == "inbox":
+                    raise VerificationCodeReadError(
+                        f"Graph 读取收件箱失败，HTTP {response.status_code}"
+                    )
+                folder_scan_summary[folder_name] = -1
+                continue
+
+            payload = response.json()
+            raw_messages = payload.get("value") if isinstance(payload, dict) else None
+            if not isinstance(raw_messages, list):
+                folder_scan_summary[folder_name] = 0
+                continue
+
+            folder_count = 0
+            for raw_message in raw_messages:
+                if not isinstance(raw_message, dict):
+                    continue
+                from_address = _extract_graph_from_address(raw_message.get("from"))
+                subject = raw_message.get("subject") if isinstance(raw_message.get("subject"), str) else None
+                body_text = _extract_graph_body_text(raw_message)
+                received_at = _parse_iso_datetime(raw_message.get("receivedDateTime"))
+                recipient_addresses = _extract_graph_recipient_addresses(raw_message)
+                candidates.append(
+                    InboxMessageCandidate(
+                        from_address=from_address,
+                        subject=subject,
+                        body_text=body_text,
+                        received_at=received_at,
+                        channel="graph",
+                        recipient_addresses=recipient_addresses,
+                    )
+                )
+                folder_count += 1
+            folder_scan_summary[folder_name] = folder_count
+
+        # region agent log
+        _agent_debug_log(
+            location="verification_code_service.py:graph_list",
+            message="graph folder scan summary",
+            hypothesis_id="H1_junk_folder",
+            data={"folder_scan_summary": folder_scan_summary, "candidate_count": len(candidates)},
+        )
+        # endregion
         return candidates
 
 
@@ -221,15 +297,19 @@ class VerificationCodeService:
     def __init__(
         self,
         access_token_service: MailboxAccessTokenService,
-        imap_client: MicrosoftIMAPClient,
-        graph_reader: MicrosoftGraphMailReader,
+        imap_client: MicrosoftIMAPClient | None = None,
+        graph_reader: MicrosoftGraphMailReader | None = None,
         *,
+        settings: Settings | None = None,
         sleep_function=time.sleep,
         clock=utc_now,
     ) -> None:
         self._access_token_service = access_token_service
+        # Test doubles may inject fake clients. Production omits them and opens a short-lived
+        # proxy stack per poll so request-scoped sessions never hold locks across sleeps.
         self._imap_client = imap_client
         self._graph_reader = graph_reader
+        self._settings = settings
         self._sleep = sleep_function
         self._clock = clock
 
@@ -257,7 +337,14 @@ class VerificationCodeService:
 
         while True:
             attempts += 1
-            access_token_result = self._access_token_service.ensure_access_token(mailbox.id)
+            if self._imap_client is not None and self._graph_reader is not None:
+                # Unit tests inject fakes and share one in-memory session.
+                access_token_result = self._access_token_service.ensure_access_token(mailbox.id)
+            else:
+                # Production: short-lived session/commit so FOR UPDATE locks are not held across sleeps.
+                access_token_result = self._access_token_service.ensure_access_token_in_short_transaction(
+                    mailbox.id
+                )
             for channel in channels:
                 try:
                     messages = self._list_messages(
@@ -269,6 +356,25 @@ class VerificationCodeService:
                 except Exception as error:  # noqa: BLE001 - continue alternate channel / retry.
                     last_error = error
                     continue
+                # region agent log
+                _agent_debug_log(
+                    location="verification_code_service.py:wait_loop",
+                    message="channel scan result before match",
+                    hypothesis_id="H1_junk_folder",
+                    data={
+                        "attempt": attempts,
+                        "channel": channel,
+                        "message_count": len(messages),
+                        "recipient_filter": recipient_filter,
+                        "require_recipient_match": options.require_recipient_match,
+                        "sample_recipients": [
+                            sorted(message.recipient_addresses)[:3] for message in messages[:5]
+                        ],
+                        "sample_subjects": [message.subject for message in messages[:5]],
+                        "sample_body_snips": [message.body_text[:80] for message in messages[:5]],
+                    },
+                )
+                # endregion
                 match = self._find_code_in_messages(
                     messages,
                     options,
@@ -276,6 +382,20 @@ class VerificationCodeService:
                     recipient_filter=recipient_filter,
                 )
                 if match is not None:
+                    # region agent log
+                    _agent_debug_log(
+                        location="verification_code_service.py:wait_loop",
+                        message="verification code matched",
+                        hypothesis_id="H1_junk_folder",
+                        data={
+                            "attempt": attempts,
+                            "channel": match.channel,
+                            "code": match.code,
+                            "matched_from": match.matched_from,
+                            "matched_subject": match.matched_subject,
+                        },
+                    )
+                    # endregion
                     return VerificationCodeLookupResult(
                         found=True,
                         code=match.code,
@@ -294,6 +414,18 @@ class VerificationCodeService:
                 break
             self._sleep(sleep_seconds)
 
+        # region agent log
+        _agent_debug_log(
+            location="verification_code_service.py:wait_loop",
+            message="verification code not found before timeout",
+            hypothesis_id="H1_junk_folder",
+            data={
+                "attempts": attempts,
+                "last_error": summarize_exception(last_error) if last_error is not None else None,
+                "recipient_filter": recipient_filter,
+            },
+        )
+        # endregion
         if last_error is not None and attempts == 1:
             raise VerificationCodeReadError(summarize_exception(last_error)) from last_error
         return VerificationCodeLookupResult(found=False, attempts=attempts)
@@ -306,59 +438,143 @@ class VerificationCodeService:
         channel: MailReadChannel,
         since_at: datetime,
     ) -> list[InboxMessageCandidate]:
-        if channel == "graph":
-            return self._graph_reader.list_recent_messages(
+        if self._imap_client is not None and self._graph_reader is not None:
+            if channel == "graph":
+                return self._graph_reader.list_recent_messages(
+                    mailbox,
+                    access_token,
+                    since_at=since_at,
+                )
+            return self._list_imap_messages(
+                self._imap_client,
                 mailbox,
                 access_token,
                 since_at=since_at,
             )
-        return self._list_imap_messages(mailbox, access_token, since_at=since_at)
+
+        if self._settings is None:
+            raise RuntimeError("VerificationCodeService 缺少 settings，无法建立短事务邮件读取")
+
+        with self._access_token_service._session_factory() as session:
+            proxy_service = EgressProxyService(
+                session,
+                self._settings,
+                self._access_token_service._credential_cipher,
+            )
+            try:
+                if channel == "graph":
+                    graph_reader = MicrosoftGraphMailReader(
+                        proxy_service,
+                        self._settings.proxy_connect_timeout_seconds,
+                        self._settings.proxy_read_timeout_seconds,
+                    )
+                    messages = graph_reader.list_recent_messages(
+                        mailbox,
+                        access_token,
+                        since_at=since_at,
+                    )
+                else:
+                    imap_client = MicrosoftIMAPClient(proxy_service, self._settings)
+                    messages = self._list_imap_messages(
+                        imap_client,
+                        mailbox,
+                        access_token,
+                        since_at=since_at,
+                    )
+                session.commit()
+                return messages
+            except Exception:
+                session.rollback()
+                raise
 
     def _list_imap_messages(
         self,
+        imap_client: MicrosoftIMAPClient,
         mailbox: Mailbox,
         access_token: str,
         *,
         since_at: datetime,
     ) -> list[InboxMessageCandidate]:
-        client = self._imap_client.connect(mailbox, access_token)
+        client = imap_client.connect(mailbox, access_token)
         try:
-            status_code, _ = client.select("INBOX", readonly=True)
-            if status_code != "OK":
+            candidates: list[InboxMessageCandidate] = []
+            folder_scan_summary: dict[str, object] = {}
+            inbox_select_succeeded = False
+            for folder_name in IMAP_SCAN_FOLDERS:
+                status_code, _ = client.select(folder_name, readonly=True)
+                if status_code != "OK":
+                    folder_scan_summary[folder_name] = {"select": status_code, "kept": 0}
+                    if folder_name == "INBOX":
+                        raise VerificationCodeReadError("无法选择 IMAP 收件箱")
+                    continue
+                if folder_name == "INBOX":
+                    inbox_select_succeeded = True
+
+                # UID SEARCH ALL then keep the newest N messages; time window is applied locally.
+                status_code, search_data = client.uid("search", None, "ALL")
+                if status_code != "OK" or not search_data or not search_data[0]:
+                    folder_scan_summary[folder_name] = {
+                        "select": "OK",
+                        "total_uids": 0,
+                        "kept": 0,
+                    }
+                    continue
+
+                message_uids = search_data[0].split()
+                selected_uids = message_uids[-MAX_MESSAGES_PER_SCAN:]
+                kept_count = 0
+                for message_uid in reversed(selected_uids):
+                    # Prefer server INTERNALDATE for time filtering; Date headers often lack TZ
+                    # or use sender-local wall clocks and falsely fall outside the lookback window.
+                    status_code, fetch_data = client.uid("fetch", message_uid, IMAP_FETCH_ITEMS)
+                    if status_code != "OK" or not fetch_data:
+                        continue
+                    raw_bytes = _extract_imap_rfc822_bytes(fetch_data)
+                    if raw_bytes is None:
+                        continue
+                    email_message = message_from_bytes(raw_bytes)
+                    from_address = _decode_header_value(email_message.get("From"))
+                    subject = _decode_header_value(email_message.get("Subject"))
+                    body_text = _extract_email_body_text(email_message)
+                    server_received_at = _extract_imap_internaldate(fetch_data)
+                    header_received_at = _parse_email_date(email_message.get("Date"))
+                    received_at = server_received_at or header_received_at
+                    if not is_within_lookback_window(received_at, since_at):
+                        continue
+                    candidates.append(
+                        InboxMessageCandidate(
+                            from_address=from_address,
+                            subject=subject,
+                            body_text=body_text,
+                            received_at=received_at,
+                            channel="imap",
+                            recipient_addresses=_extract_message_recipient_addresses(email_message),
+                        )
+                    )
+                    kept_count += 1
+                folder_scan_summary[folder_name] = {
+                    "select": "OK",
+                    "total_uids": len(message_uids),
+                    "scanned": len(selected_uids),
+                    "kept": kept_count,
+                }
+
+            if not inbox_select_succeeded and not candidates:
                 raise VerificationCodeReadError("无法选择 IMAP 收件箱")
 
-            # UID SEARCH ALL then keep the newest N messages; time window is applied locally.
-            status_code, search_data = client.uid("search", None, "ALL")
-            if status_code != "OK" or not search_data or not search_data[0]:
-                return []
-
-            message_uids = search_data[0].split()
-            selected_uids = message_uids[-MAX_MESSAGES_PER_SCAN:]
-            candidates: list[InboxMessageCandidate] = []
-            for message_uid in reversed(selected_uids):
-                status_code, fetch_data = client.uid("fetch", message_uid, "(RFC822)")
-                if status_code != "OK" or not fetch_data:
-                    continue
-                raw_bytes = _extract_imap_rfc822_bytes(fetch_data)
-                if raw_bytes is None:
-                    continue
-                email_message = message_from_bytes(raw_bytes)
-                from_address = _decode_header_value(email_message.get("From"))
-                subject = _decode_header_value(email_message.get("Subject"))
-                body_text = _extract_email_body_text(email_message)
-                received_at = _parse_email_date(email_message.get("Date"))
-                if received_at is not None and ensure_utc(received_at) < ensure_utc(since_at):
-                    continue
-                candidates.append(
-                    InboxMessageCandidate(
-                        from_address=from_address,
-                        subject=subject,
-                        body_text=body_text,
-                        received_at=received_at,
-                        channel="imap",
-                        recipient_addresses=_extract_message_recipient_addresses(email_message),
-                    )
-                )
+            # region agent log
+            _agent_debug_log(
+                location="verification_code_service.py:imap_list",
+                message="imap folder scan summary",
+                hypothesis_id="H1_junk_folder",
+                data={
+                    "mailbox_id": mailbox.id,
+                    "folder_scan_summary": folder_scan_summary,
+                    "candidate_count": len(candidates),
+                    "since_at": since_at.isoformat(),
+                },
+            )
+            # endregion
             return candidates
         except imaplib.IMAP4.error as error:
             raise VerificationCodeReadError(summarize_exception(error)) from error
@@ -421,6 +637,22 @@ class VerificationCodeService:
                 channel=message.channel,
             )
         return None
+
+
+def expand_lookback_since_at(since_at: datetime) -> datetime:
+    """Return a slightly older lower bound to tolerate clock skew."""
+    return ensure_utc(since_at) - timedelta(seconds=TIME_FILTER_CLOCK_SKEW_SECONDS)
+
+
+def is_within_lookback_window(received_at: datetime | None, since_at: datetime) -> bool:
+    """Return whether a message timestamp should stay in the verification scan window.
+
+    Missing timestamps are kept (better to over-scan recent UIDs than drop a code mail).
+    Known timestamps are compared in UTC against ``since_at`` minus a clock-skew buffer.
+    """
+    if received_at is None:
+        return True
+    return ensure_utc(received_at) >= expand_lookback_since_at(since_at)
 
 
 def extract_verification_code(
@@ -535,6 +767,45 @@ def _extract_imap_rfc822_bytes(fetch_data: list[object]) -> bytes | None:
     return None
 
 
+def _extract_imap_internaldate(fetch_data: list[object]) -> datetime | None:
+    """Parse IMAP INTERNALDATE from a UID FETCH response metadata blob."""
+    for item in fetch_data:
+        metadata_text = _imap_fetch_metadata_text(item)
+        if metadata_text is None:
+            continue
+        match = IMAP_INTERNALDATE_PATTERN.search(metadata_text)
+        if match is None:
+            continue
+        parsed_internaldate = _parse_imap_internaldate(match.group(1))
+        if parsed_internaldate is not None:
+            return parsed_internaldate
+    return None
+
+
+def _imap_fetch_metadata_text(fetch_item: object) -> str | None:
+    if isinstance(fetch_item, tuple) and fetch_item:
+        metadata = fetch_item[0]
+    else:
+        metadata = fetch_item
+    if isinstance(metadata, (bytes, bytearray)):
+        return bytes(metadata).decode("utf-8", errors="replace")
+    if isinstance(metadata, str):
+        return metadata
+    return None
+
+
+def _parse_imap_internaldate(raw_value: str) -> datetime | None:
+    """Parse ``DD-Mon-YYYY HH:MM:SS ±HHMM`` INTERNALDATE into aware UTC."""
+    cleaned_value = raw_value.strip().strip('"')
+    if not cleaned_value:
+        return None
+    try:
+        parsed_value = datetime.strptime(cleaned_value, "%d-%b-%Y %H:%M:%S %z")
+    except ValueError:
+        return None
+    return parsed_value.astimezone(timezone.utc)
+
+
 def _decode_header_value(raw_value: str | None) -> str | None:
     if raw_value is None:
         return None
@@ -588,13 +859,20 @@ def _strip_html(value: str) -> str:
 
 
 def _parse_email_date(raw_value: str | None) -> datetime | None:
+    """Parse the RFC822 Date header into aware UTC when possible.
+
+    Naive Date values are treated as UTC only as a last-resort fallback. Callers
+    should prefer IMAP INTERNALDATE / Graph receivedDateTime when available.
+    """
     if not raw_value:
         return None
     try:
         parsed = parsedate_to_datetime(raw_value)
-    except (TypeError, ValueError, IndexError):
+    except (TypeError, ValueError, IndexError, OverflowError):
         return None
     if parsed.tzinfo is None:
+        # Sender wall clocks without TZ are untrustworthy; still normalize so the
+        # widened lookback window can absorb moderate offsets.
         return parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 import hmac
+import logging
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -18,7 +19,7 @@ from fastapi.security import APIKeyHeader
 from fastapi.staticfiles import StaticFiles
 from email_validator import EmailNotValidError, validate_email
 from sqlalchemy import delete, func, select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
 from mailbox_service.config import Settings, get_settings
@@ -177,7 +178,7 @@ OPENAPI_OPERATION_DOCUMENTATION: dict[tuple[str, str], tuple[str, str, str]] = {
     ),
     ("POST", "/api/v1/mailboxes/acquire"): (
         "领取可用邮箱账号",
-        "领取一个 status=active 的邮箱并创建 mail_read 租约；"
+        "领取一个 status=active 且 capability 为 imap/graph 的邮箱并创建 mail_read 租约；"
         "可选择生成 plus alias 作为 allocated_email，只返回邮箱地址与租约信息，不返回 Token。",
         "外部邮箱",
     ),
@@ -669,18 +670,12 @@ LeaseServiceDependency = Annotated[LeaseService, Depends(get_lease_service)]
 
 def get_verification_code_service(
     settings: SettingsDependency,
-    proxy_service: ProxyServiceDependency,
     access_token_service: AccessTokenServiceDependency,
 ) -> VerificationCodeService:
-    """Provide request-local verification-code extraction with proxy-aware mail readers."""
+    """Provide verification-code extraction that uses short-lived sessions per poll attempt."""
     return VerificationCodeService(
         access_token_service,
-        MicrosoftIMAPClient(proxy_service, settings),
-        MicrosoftGraphMailReader(
-            proxy_service,
-            settings.proxy_connect_timeout_seconds,
-            settings.proxy_read_timeout_seconds,
-        ),
+        settings=settings,
     )
 
 
@@ -1008,12 +1003,20 @@ def get_lease_verification_code(
     principal: ClientPrincipalDependency,
     lease_service: LeaseServiceDependency,
     verification_code_service: VerificationCodeServiceDependency,
+    session: SessionDependency,
 ) -> LeaseVerificationCodeResponse:
     """Extract a verification code from recent inbox mail for an owned mail_read lease."""
     try:
         lease, mailbox = lease_service.load_active_mail_read_lease(principal, lease_id)
-        # Prefer request override, then lease allocated alias/primary, then mailbox primary.
-        default_recipient = lease.allocated_email or mailbox.primary_email
+        # Snapshot identity fields, then end the request transaction before long polling so
+        # lease/mailbox locks are not held for the entire timeout window.
+        response_lease_id = lease.id
+        response_mailbox_id = mailbox.id
+        response_primary_email = mailbox.primary_email
+        response_allocated_email = lease.allocated_email or mailbox.primary_email
+        default_recipient = payload.recipient or response_allocated_email
+        session.commit()
+
         lookup_result = verification_code_service.wait_for_verification_code(
             mailbox,
             VerificationCodeLookupOptions(
@@ -1024,17 +1027,17 @@ def get_lease_verification_code(
                 subject_contains=payload.subject_contains,
                 body_contains=payload.body_contains,
                 code_regex=payload.code_regex,
-                recipient=payload.recipient or default_recipient,
+                recipient=default_recipient,
                 require_recipient_match=payload.require_recipient_match,
             ),
         )
     except Exception as error:
         raise to_external_http_exception(error) from error
     return LeaseVerificationCodeResponse(
-        lease_id=lease.id,
-        mailbox_id=mailbox.id,
-        primary_email=mailbox.primary_email,
-        allocated_email=lease.allocated_email or mailbox.primary_email,
+        lease_id=response_lease_id,
+        mailbox_id=response_mailbox_id,
+        primary_email=response_primary_email,
+        allocated_email=response_allocated_email,
         found=lookup_result.found,
         code=lookup_result.code,
         matched_from=lookup_result.matched_from,
@@ -1715,6 +1718,17 @@ def refresh_unprobed_mailbox_access_tokens(
 ) -> MailboxUnprobedRefreshResponse:
     """Force-refresh one batch of unprobed/unknown mailboxes to classify usable vs invalid RT."""
     result = access_token_service.refresh_unprobed_or_unknown_access_tokens(batch_size=payload.batch_size)
+    failure_reason_counts: dict[str, int] = {}
+    for item in result.results:
+        if item.successful:
+            continue
+        reason = (item.error_summary or "").strip() or "识别失败（无 error_summary）"
+        failure_reason_counts[reason] = failure_reason_counts.get(reason, 0) + 1
+    top_failure_reasons = sorted(
+        failure_reason_counts.items(),
+        key=lambda pair: pair[1],
+        reverse=True,
+    )[:10]
     create_audit_log(
         session,
         admin_id,
@@ -1728,6 +1742,10 @@ def refresh_unprobed_mailbox_access_tokens(
             "failed": result.failed,
             "remaining_candidates": result.remaining_candidates,
             "batch_size": result.batch_size,
+            "worker_count": result.worker_count,
+            "top_failure_reasons": [
+                {"reason": reason, "count": count} for reason, count in top_failure_reasons
+            ],
         },
     )
     return MailboxUnprobedRefreshResponse(
@@ -1737,6 +1755,7 @@ def refresh_unprobed_mailbox_access_tokens(
         failed=result.failed,
         remaining_candidates=result.remaining_candidates,
         batch_size=result.batch_size,
+        worker_count=result.worker_count,
         results=[
             {
                 "mailbox_id": item.mailbox_id,
@@ -1752,38 +1771,87 @@ def refresh_unprobed_mailbox_access_tokens(
     )
 
 
+def _is_mysql_lock_wait_timeout(error: Exception) -> bool:
+    """Return whether the failure is MySQL 1205 lock wait timeout (or a nested cause)."""
+    current_error: BaseException | None = error
+    while current_error is not None:
+        if isinstance(current_error, OperationalError):
+            original_error = getattr(current_error, "orig", None)
+            if original_error is not None and getattr(original_error, "args", None):
+                if original_error.args and original_error.args[0] == 1205:
+                    return True
+            if "1205" in str(current_error) and "Lock wait timeout" in str(current_error):
+                return True
+        current_error = current_error.__cause__ or current_error.__context__
+    return False
+
+
 @app.post("/api/v1/admin/mailboxes/delete-invalid", response_model=MailboxDeleteInvalidResponse)
 def delete_invalid_mailboxes(
     session: SessionDependency,
     admin_id: AdminDependency,
 ) -> MailboxDeleteInvalidResponse:
-    """Delete every mailbox currently marked invalid and cascade-related leases."""
-    invalid_mailboxes = list(
-        session.scalars(
-            select(Mailbox)
+    """Delete invalid mailboxes in small batches to reduce lock-wait conflicts with long readers."""
+    invalid_mailbox_rows = list(
+        session.execute(
+            select(Mailbox.id, Mailbox.primary_email)
             .where(Mailbox.status == MailboxStatus.INVALID)
             .order_by(Mailbox.primary_email.asc())
         ).all()
     )
-    deleted_mailbox_ids = [mailbox.id for mailbox in invalid_mailboxes]
-    deleted_primary_emails = [mailbox.primary_email for mailbox in invalid_mailboxes]
-
-    if deleted_mailbox_ids:
-        session.execute(delete(Lease).where(Lease.mailbox_id.in_(deleted_mailbox_ids)))
-        session.execute(delete(Mailbox).where(Mailbox.id.in_(deleted_mailbox_ids)))
-        session.flush()
-        create_audit_log(
-            session,
-            admin_id,
-            "mailbox.invalid_deleted",
-            "mailbox",
-            None,
-            {
-                "deleted": len(deleted_mailbox_ids),
-                "deleted_mailbox_ids": deleted_mailbox_ids,
-                "deleted_primary_emails": deleted_primary_emails,
-            },
+    if not invalid_mailbox_rows:
+        return MailboxDeleteInvalidResponse(
+            deleted=0,
+            deleted_mailbox_ids=[],
+            deleted_primary_emails=[],
         )
+
+    deleted_mailbox_ids: list[str] = []
+    deleted_primary_emails: list[str] = []
+    delete_batch_size = 25
+
+    for batch_start in range(0, len(invalid_mailbox_rows), delete_batch_size):
+        batch_rows = invalid_mailbox_rows[batch_start : batch_start + delete_batch_size]
+        batch_mailbox_ids = [row[0] for row in batch_rows]
+        batch_primary_emails = [row[1] for row in batch_rows]
+        try:
+            session.execute(delete(Lease).where(Lease.mailbox_id.in_(batch_mailbox_ids)))
+            session.execute(delete(Mailbox).where(Mailbox.id.in_(batch_mailbox_ids)))
+            session.flush()
+        except OperationalError as error:
+            session.rollback()
+            if _is_mysql_lock_wait_timeout(error):
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail={
+                        "code": "MAILBOX_DELETE_LOCK_TIMEOUT",
+                        "message": (
+                            "删除失效邮箱时等待数据库锁超时。"
+                            "可能有验证码轮询或其他写操作仍占用相关行锁，请稍后重试或避开高峰操作。"
+                        ),
+                        "deleted": len(deleted_mailbox_ids),
+                        "remaining": len(invalid_mailbox_rows) - len(deleted_mailbox_ids),
+                    },
+                ) from error
+            raise
+
+        deleted_mailbox_ids.extend(batch_mailbox_ids)
+        deleted_primary_emails.extend(batch_primary_emails)
+        # Commit each batch so locks are released before the next batch starts.
+        session.commit()
+
+    create_audit_log(
+        session,
+        admin_id,
+        "mailbox.invalid_deleted",
+        "mailbox",
+        None,
+        {
+            "deleted": len(deleted_mailbox_ids),
+            "deleted_mailbox_ids": deleted_mailbox_ids,
+            "deleted_primary_emails": deleted_primary_emails,
+        },
+    )
 
     return MailboxDeleteInvalidResponse(
         deleted=len(deleted_mailbox_ids),

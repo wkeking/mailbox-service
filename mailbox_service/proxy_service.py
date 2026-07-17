@@ -6,8 +6,10 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import timedelta
 import imaplib
+import json
 import socket
 import ssl
+import time
 from typing import Any, TypeVar
 from urllib.parse import quote
 
@@ -28,24 +30,19 @@ from mailbox_service.models import (
 )
 from mailbox_service.security import CredentialCipher, summarize_exception
 
-
 class NoHealthyEgressProxyError(RuntimeError):
     """Raised when policy forbids direct routing and no usable proxy exists."""
 
     error_code = "NO_HEALTHY_EGRESS_PROXY"
 
-
 class EgressProxyTransportError(RuntimeError):
     """A proxy-chain failure that may safely trigger a single failover retry."""
-
 
 class MicrosoftOAuthError(RuntimeError):
     """A Microsoft token endpoint error unrelated to local proxy health."""
 
-
 class MicrosoftInvalidGrantError(MicrosoftOAuthError):
     """An unrecoverable refresh-token failure returned by Microsoft."""
-
 
 @dataclass(frozen=True)
 class ResolvedProxy:
@@ -68,7 +65,6 @@ class ResolvedProxy:
             credentials = f"{encoded_username}:{encoded_password}@"
         return f"{scheme}://{credentials}{self.host}:{self.port}"
 
-
 @dataclass(frozen=True)
 class MicrosoftTokenResponse:
     """Sanitized Microsoft token response for internal credential services only."""
@@ -77,7 +73,6 @@ class MicrosoftTokenResponse:
     expires_in: int
     rotated_refresh_token: str | None = field(default=None, repr=False)
     scope: str | None = None
-
 
 class EgressProxyService:
     """Own proxy lifecycle, sticky mailbox assignments, and health transitions."""
@@ -128,6 +123,11 @@ class EgressProxyService:
 
         The mailbox row is locked before creating or changing a binding. This makes
         concurrent token refreshes and IMAP reads converge on one proxy assignment.
+
+        Proxy row locks from candidate selection are only needed for the brief bind
+        window. Callers that perform network I/O afterward should commit via
+        :meth:`commit_open_transaction` so concurrent workers do not observe an empty
+        pool through ``SKIP LOCKED`` while OAuth/IMAP is still running.
         """
         policy = self.ensure_policy()
         if not policy.enabled:
@@ -147,7 +147,7 @@ class EgressProxyService:
         ):
             return self._to_resolved_proxy(current_proxy)
 
-        selected_proxy = self._select_candidate(policy, excluded_proxy_ids)
+        selected_proxy = self._select_candidate_with_retry(policy, excluded_proxy_ids)
         if selected_proxy is None:
             if policy.required or not policy.allow_direct_development:
                 raise NoHealthyEgressProxyError("没有可用的全局出口代理")
@@ -156,6 +156,10 @@ class EgressProxyService:
 
         self._update_binding(mailbox, selected_proxy, "automatic_failover")
         return self._to_resolved_proxy(selected_proxy)
+
+    def commit_open_transaction(self) -> None:
+        """Commit the current session transaction to release row locks before network I/O."""
+        self._session.commit()
 
     def bind_mailbox_to_proxy(
         self,
@@ -258,11 +262,43 @@ class EgressProxyService:
             return None
         return self._session.get(EgressProxy, mailbox.egress_proxy_id)
 
+    def _select_candidate_with_retry(
+        self,
+        policy: ProxyPolicy,
+        excluded_proxy_ids: set[str],
+    ) -> EgressProxy | None:
+        """Retry brief SKIP LOCKED contention instead of failing the whole mailbox."""
+        # Concurrent batch recognition can momentarily lock every healthy proxy row while
+        # another worker is still binding. Wait a few short intervals before giving up.
+        max_attempts = 8
+        for attempt_index in range(max_attempts):
+            selected_proxy = self._select_candidate(policy, excluded_proxy_ids)
+            if selected_proxy is not None:
+                return selected_proxy
+            if attempt_index + 1 >= max_attempts:
+                break
+            # Exponential-ish backoff: 20ms, 40ms, 80ms... capped.
+            time.sleep(min(0.02 * (2**attempt_index), 0.25))
+        return None
+
     def _select_candidate(
         self,
         policy: ProxyPolicy,
         excluded_proxy_ids: set[str],
     ) -> EgressProxy | None:
+        """Pick one available proxy without monopolizing the rest of the pool.
+
+        MySQL InnoDB can lock more than one index record when ``FOR UPDATE`` is combined
+        with ``ORDER BY`` on a secondary index (gap / supremum locks). Loading every
+        candidate with ``FOR UPDATE SKIP LOCKED`` is worse: the first concurrent worker
+        holds the entire pool until its long OAuth transaction commits, and sibling
+        workers immediately observe an empty set → ``NoHealthyEgressProxyError``.
+
+        Strategy: rank candidate IDs without locking, then lock **one primary key at a
+        time** with ``SKIP LOCKED`` so each concurrent worker claims a different proxy.
+        Callers must commit soon after binding so those row locks are not held across
+        multi-second Microsoft network calls.
+        """
         now = utc_now()
         bound_mailbox_count = (
             select(func.count(Mailbox.id))
@@ -270,23 +306,38 @@ class EgressProxyService:
             .correlate(EgressProxy)
             .scalar_subquery()
         )
-        candidates = self._session.scalars(
-            select(EgressProxy)
-            .where(EgressProxy.enabled.is_(True))
-            .where(EgressProxy.protocol.in_(policy.allowed_protocols))
-            .where(
-                (EgressProxy.status != EgressProxyStatus.COOLDOWN)
-                | (EgressProxy.cooldown_until.is_(None))
-                | (EgressProxy.cooldown_until <= now)
+        candidate_proxy_ids = list(
+            self._session.scalars(
+                select(EgressProxy.id)
+                .where(EgressProxy.enabled.is_(True))
+                .where(EgressProxy.protocol.in_(policy.allowed_protocols))
+                .where(
+                    (EgressProxy.status != EgressProxyStatus.COOLDOWN)
+                    | (EgressProxy.cooldown_until.is_(None))
+                    | (EgressProxy.cooldown_until <= now)
+                )
+                .where(EgressProxy.id.not_in(excluded_proxy_ids) if excluded_proxy_ids else True)
+                .order_by(EgressProxy.priority.asc(), bound_mailbox_count.asc(), EgressProxy.id.asc())
             )
-            .where(EgressProxy.id.not_in(excluded_proxy_ids) if excluded_proxy_ids else True)
-            .order_by(EgressProxy.priority.asc(), bound_mailbox_count.asc(), EgressProxy.id.asc())
-            .with_for_update(skip_locked=True)
-        ).all()
-        if not candidates:
+        )
+
+        selected_proxy: EgressProxy | None = None
+        for proxy_id in candidate_proxy_ids:
+            locked_proxy = self._session.scalar(
+                select(EgressProxy)
+                .where(EgressProxy.id == proxy_id)
+                .with_for_update(skip_locked=True)
+            )
+            if locked_proxy is None:
+                continue
+            if not self._is_proxy_available(locked_proxy, policy):
+                continue
+            selected_proxy = locked_proxy
+            break
+
+        if selected_proxy is None:
             return None
 
-        selected_proxy = candidates[0]
         if selected_proxy.status == EgressProxyStatus.COOLDOWN:
             selected_proxy.status = EgressProxyStatus.UNKNOWN
             selected_proxy.cooldown_until = None
@@ -385,9 +436,7 @@ class EgressProxyService:
             )
         )
 
-
 OperationResult = TypeVar("OperationResult")
-
 
 class MicrosoftOAuthClient:
     """Refresh Microsoft tokens with sticky proxy routing and one failover retry."""
@@ -464,17 +513,22 @@ class MicrosoftOAuthClient:
         operation: Callable[[ResolvedProxy | None], OperationResult],
     ) -> OperationResult:
         selected_proxy = self._proxy_service.resolve_for_mailbox(mailbox_id)
+        # Release mailbox/proxy FOR UPDATE locks before multi-second Microsoft HTTP I/O so
+        # concurrent batch workers can claim other proxies instead of seeing an empty pool.
+        self._proxy_service.commit_open_transaction()
         try:
             result = operation(selected_proxy)
         except EgressProxyTransportError as error:
             if selected_proxy is None:
                 raise
             self._proxy_service.record_proxy_failure(selected_proxy.id, error)
+            self._proxy_service.commit_open_transaction()
             replacement_proxy = self._proxy_service.resolve_for_mailbox(
                 mailbox_id,
                 excluded_proxy_ids={selected_proxy.id},
                 force_rebind=True,
             )
+            self._proxy_service.commit_open_transaction()
             result = operation(replacement_proxy)
             if replacement_proxy is not None:
                 self._proxy_service.record_proxy_success(replacement_proxy.id)
@@ -491,7 +545,6 @@ class MicrosoftOAuthClient:
         except ValueError as error:
             raise MicrosoftOAuthError("Microsoft Token 响应不是 JSON") from error
         return payload if isinstance(payload, dict) else {}
-
 
 class ProxyIMAP4SSL(imaplib.IMAP4_SSL):
     """IMAP4 SSL client that wraps a pre-connected direct or proxied socket."""
@@ -528,7 +581,6 @@ class ProxyIMAP4SSL(imaplib.IMAP4_SSL):
         if not isinstance(file_descriptor, property):
             self.file = makefile_stream
 
-
 class MicrosoftIMAPClient:
     """Open XOAUTH2 IMAP sessions through the same mailbox proxy resolver."""
 
@@ -539,17 +591,20 @@ class MicrosoftIMAPClient:
     def connect(self, mailbox: Mailbox, access_token: str) -> imaplib.IMAP4_SSL:
         """Connect and authenticate, failing over once only for proxy-chain errors."""
         selected_proxy = self._proxy_service.resolve_for_mailbox(mailbox.id)
+        self._proxy_service.commit_open_transaction()
         try:
             client = self._connect_once(mailbox.primary_email, access_token, selected_proxy)
         except EgressProxyTransportError as error:
             if selected_proxy is None:
                 raise
             self._proxy_service.record_proxy_failure(selected_proxy.id, error)
+            self._proxy_service.commit_open_transaction()
             replacement_proxy = self._proxy_service.resolve_for_mailbox(
                 mailbox.id,
                 excluded_proxy_ids={selected_proxy.id},
                 force_rebind=True,
             )
+            self._proxy_service.commit_open_transaction()
             client = self._connect_once(mailbox.primary_email, access_token, replacement_proxy)
             if replacement_proxy is not None:
                 self._proxy_service.record_proxy_success(replacement_proxy.id)

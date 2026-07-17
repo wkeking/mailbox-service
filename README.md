@@ -166,6 +166,10 @@ SPA / 某些 OTP 流程可能是 24 小时；个人 Outlook / Hotmail 常见为 
 基座镜像为 `python:3.14-slim-bookworm`，与本地开发版本对齐。  
 默认镜像名：**`registry.example.com/mailbox-service:latest`**；`./scripts/build-image.sh` **默认构建后自动推送**到该私有仓库。`docker-compose.yml` 默认 `image` 与此一致。
 
+**分层缓存（减小服务器 pull）：** runtime 先装第三方 Python 依赖，再拷贝业务代码 / migrations / 前端 dist。  
+仅改后端代码时，依赖层可复用，服务器通常只需拉取约 **几十～几百 KB** 的代码层，而不是整包依赖（此前约 27MB）。  
+依赖列表变更（`pyproject.toml`）或前端变更时，对应层才会失效。
+
 相关文件：
 
 | 路径 | 作用 |

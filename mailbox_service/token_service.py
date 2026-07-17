@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 import hashlib
@@ -13,14 +14,31 @@ from sqlalchemy.orm import Session
 
 from mailbox_service.access_token_scopes import extract_oauth_scopes_from_access_token
 from mailbox_service.capability_probe_service import (
+    MailboxCapabilityProbeService,
     MailboxCapabilityProberProtocol,
+    MicrosoftGraphMailProbeClient,
     apply_capability_probe_result,
 )
 from mailbox_service.config import Settings
-from mailbox_service.models import Lease, Mailbox, MailboxCapability, MailboxStatus, utc_now
-from mailbox_service.proxy_service import MicrosoftInvalidGrantError, MicrosoftOAuthError, MicrosoftTokenResponse
+from mailbox_service.database import SessionFactory
+from mailbox_service.models import (
+    EgressProxy,
+    EgressProxyStatus,
+    Lease,
+    Mailbox,
+    MailboxCapability,
+    MailboxStatus,
+    utc_now,
+)
+from mailbox_service.proxy_service import (
+    EgressProxyService,
+    MicrosoftIMAPClient,
+    MicrosoftInvalidGrantError,
+    MicrosoftOAuthClient,
+    MicrosoftOAuthError,
+    MicrosoftTokenResponse,
+)
 from mailbox_service.security import CredentialCipher, summarize_exception
-
 
 token_diagnostic_logger = logging.getLogger("uvicorn.error")
 
@@ -40,13 +58,11 @@ def build_token_diagnostic_summary(token: str | None) -> str:
         f"sha256={token_fingerprint}"
     )
 
-
 class MicrosoftOAuthClientProtocol(Protocol):
     """Minimal protocol shared by the real OAuth client and test doubles."""
 
     def refresh_access_token(self, mailbox: Mailbox, refresh_token: str) -> MicrosoftTokenResponse:
         """Return a Microsoft token response for one mailbox refresh token."""
-
 
 @dataclass(frozen=True)
 class MailboxAccessTokenResult:
@@ -60,7 +76,6 @@ class MailboxAccessTokenResult:
     refreshed: bool
     refresh_token_rotated: bool
 
-
 @dataclass(frozen=True)
 class MailboxAccessTokenRefreshItem:
     """One mailbox result in an administrative batch AT refresh operation."""
@@ -73,7 +88,6 @@ class MailboxAccessTokenRefreshItem:
     access_token_expires_at: datetime | None
     error_summary: str | None = None
 
-
 @dataclass(frozen=True)
 class MailboxAccessTokenRefreshResult:
     """Batch AT refresh result safe for admin UI display."""
@@ -81,7 +95,6 @@ class MailboxAccessTokenRefreshResult:
     successful: int
     failed: int
     results: list[MailboxAccessTokenRefreshItem]
-
 
 @dataclass(frozen=True)
 class MailboxUnprobedRefreshResult:
@@ -93,8 +106,8 @@ class MailboxUnprobedRefreshResult:
     failed: int
     remaining_candidates: int
     batch_size: int
+    worker_count: int
     results: list[MailboxAccessTokenRefreshItem]
-
 
 class MailboxAccessTokenService:
     """Provide cached access tokens and force-refresh batches without exposing RT values."""
@@ -106,12 +119,36 @@ class MailboxAccessTokenService:
         credential_cipher: CredentialCipher,
         oauth_client: MicrosoftOAuthClientProtocol,
         capability_prober: MailboxCapabilityProberProtocol | None = None,
+        session_factory=SessionFactory,
     ) -> None:
         self._session = session
         self._settings = settings
         self._credential_cipher = credential_cipher
         self._oauth_client = oauth_client
         self._capability_prober = capability_prober
+        # Worker threads must open independent sessions; injectable for unit tests.
+        self._session_factory = session_factory
+
+    def ensure_access_token_in_short_transaction(
+        self,
+        mailbox_id: str,
+        *,
+        force_refresh: bool = False,
+    ) -> MailboxAccessTokenResult:
+        """Force-refresh or return AT using a dedicated session that commits immediately.
+
+        Used by long-running verification-code polling so mailbox/proxy row locks are not
+        held across sleep intervals in the request-scoped transaction.
+        """
+        with self._session_factory() as session:
+            worker_service = self._build_worker_access_token_service(session)
+            try:
+                result = worker_service.ensure_access_token(mailbox_id, force_refresh=force_refresh)
+                session.commit()
+                return result
+            except Exception:
+                session.rollback()
+                raise
 
     def ensure_access_token(self, mailbox_id: str, *, force_refresh: bool = False) -> MailboxAccessTokenResult:
         """Return a usable AT, refreshing only when absent, stale, or explicitly forced."""
@@ -154,6 +191,8 @@ class MailboxAccessTokenService:
             token_response = self._oauth_client.refresh_access_token(mailbox, refresh_token)
         except MicrosoftInvalidGrantError:
             mailbox.status = MailboxStatus.INVALID
+            mailbox.updated_at = utc_now()
+            self._session.flush()
             raise
 
         effective_refresh_token = token_response.rotated_refresh_token or refresh_token
@@ -367,15 +406,52 @@ class MailboxAccessTokenService:
             )
         )
 
-    def refresh_unprobed_or_unknown_access_tokens(self, *, batch_size: int = 50) -> MailboxUnprobedRefreshResult:
+    def count_available_egress_proxies(self) -> int:
+        """Return how many egress proxies are currently eligible for outbound work.
+
+        Used to size concurrent unprobed recognition workers so concurrency tracks the
+        effective proxy pool instead of unbounded fan-out.
+        """
+        proxy_service = EgressProxyService(self._session, self._settings, self._credential_cipher)
+        policy = proxy_service.ensure_policy()
+        if not policy.enabled:
+            return 1
+
+        current_time = utc_now()
+        available_proxy_count = int(
+            self._session.scalar(
+                select(func.count(EgressProxy.id))
+                .where(EgressProxy.enabled.is_(True))
+                .where(EgressProxy.protocol.in_(policy.allowed_protocols))
+                .where(
+                    (EgressProxy.status != EgressProxyStatus.COOLDOWN)
+                    | (EgressProxy.cooldown_until.is_(None))
+                    | (EgressProxy.cooldown_until <= current_time)
+                )
+            )
+            or 0
+        )
+        if available_proxy_count > 0:
+            return available_proxy_count
+        # No healthy proxy members: keep a single worker for direct-routing or fail-fast paths.
+        return 1
+
+    def refresh_unprobed_or_unknown_access_tokens(self, *, batch_size: int = 1000) -> MailboxUnprobedRefreshResult:
         """Force-refresh one batch of unprobed/unknown mailboxes to classify usable vs invalid RT.
 
         Successful rows get a fresh AT and capability probe (imap/graph/unusable/unknown).
         ``invalid_grant`` failures mark the mailbox ``invalid`` inside ``ensure_access_token``.
+
+        Concurrency is sized to the number of currently available egress proxies so that
+        outbound Microsoft traffic roughly matches the healthy proxy pool. Each worker uses
+        an independent database session because SQLAlchemy sessions are not thread-safe.
         """
-        bounded_batch_size = max(1, min(batch_size, 200))
+        # Keep in sync with MailboxUnprobedRefreshRequest.batch_size (default 1000, max 5000).
+        bounded_batch_size = max(1, min(batch_size, 5000))
         candidate_total = self.count_unprobed_or_unknown_mailbox_ids()
         target_mailbox_ids = self.list_unprobed_or_unknown_mailbox_ids(batch_size=bounded_batch_size)
+        available_proxy_count = self.count_available_egress_proxies()
+        worker_count = max(1, min(available_proxy_count, len(target_mailbox_ids) or 1))
         if not target_mailbox_ids:
             return MailboxUnprobedRefreshResult(
                 candidate_total=candidate_total,
@@ -384,11 +460,31 @@ class MailboxAccessTokenService:
                 failed=0,
                 remaining_candidates=0,
                 batch_size=bounded_batch_size,
+                worker_count=worker_count,
                 results=[],
             )
 
-        batch_result = self.refresh_access_tokens(target_mailbox_ids)
+        # Flush pending request-local work before workers open independent sessions.
+        self._session.flush()
+        batch_result = self._refresh_access_tokens_with_worker_pool(
+            target_mailbox_ids,
+            max_workers=worker_count,
+        )
+        # Worker sessions commit independently; sync remaining counts from the database.
+        self._session.commit()
+        self._session.expire_all()
         remaining_candidates = self.count_unprobed_or_unknown_mailbox_ids()
+        self._log_unprobed_batch_failure_summary(
+            candidate_total=candidate_total,
+            processed=len(target_mailbox_ids),
+            successful=batch_result.successful,
+            failed=batch_result.failed,
+            remaining_candidates=remaining_candidates,
+            batch_size=bounded_batch_size,
+            worker_count=worker_count,
+            available_proxy_count=available_proxy_count,
+            results=batch_result.results,
+        )
         return MailboxUnprobedRefreshResult(
             candidate_total=candidate_total,
             processed=len(target_mailbox_ids),
@@ -396,7 +492,158 @@ class MailboxAccessTokenService:
             failed=batch_result.failed,
             remaining_candidates=remaining_candidates,
             batch_size=bounded_batch_size,
+            worker_count=worker_count,
             results=batch_result.results,
+        )
+
+    def _log_unprobed_batch_failure_summary(
+        self,
+        *,
+        candidate_total: int,
+        processed: int,
+        successful: int,
+        failed: int,
+        remaining_candidates: int,
+        batch_size: int,
+        worker_count: int,
+        available_proxy_count: int,
+        results: list[MailboxAccessTokenRefreshItem],
+    ) -> None:
+        """Emit an operator-visible failure breakdown; per-row errors are not logged by default."""
+        failure_reason_counts: dict[str, int] = {}
+        for item in results:
+            if item.successful:
+                continue
+            reason = (item.error_summary or "").strip() or "识别失败（无 error_summary）"
+            failure_reason_counts[reason] = failure_reason_counts.get(reason, 0) + 1
+
+        top_failure_reasons = sorted(
+            failure_reason_counts.items(),
+            key=lambda pair: pair[1],
+            reverse=True,
+        )[:10]
+        token_diagnostic_logger.info(
+            "mailbox.unprobed_refresh completed candidate_total=%s processed=%s successful=%s "
+            "failed=%s remaining=%s batch_size=%s worker_count=%s available_proxy_count=%s "
+            "top_failure_reasons=%s",
+            candidate_total,
+            processed,
+            successful,
+            failed,
+            remaining_candidates,
+            batch_size,
+            worker_count,
+            available_proxy_count,
+            top_failure_reasons,
+        )
+
+    def _refresh_access_tokens_with_worker_pool(
+        self,
+        mailbox_ids: list[str],
+        *,
+        max_workers: int,
+    ) -> MailboxAccessTokenRefreshResult:
+        """Refresh mailbox IDs with isolated worker sessions and a bounded thread pool.
+
+        Always use per-mailbox sessions (even when ``max_workers=1``). The request-scoped
+        session is unsafe for batch recognition because OAuth/IMAP now commit mid-flight to
+        release proxy locks; continuing on the same request session can leave later rows in a
+        half-committed / expired state and produce mass failures after the first success.
+        """
+        worker_count = max(1, max_workers)
+        results_by_mailbox_id: dict[str, MailboxAccessTokenRefreshItem] = {}
+
+        if worker_count == 1 or len(mailbox_ids) <= 1:
+            for mailbox_id in mailbox_ids:
+                results_by_mailbox_id[mailbox_id] = self._refresh_single_mailbox_in_worker_session(mailbox_id)
+        else:
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                future_by_mailbox_id = {
+                    executor.submit(self._refresh_single_mailbox_in_worker_session, mailbox_id): mailbox_id
+                    for mailbox_id in mailbox_ids
+                }
+                for future in as_completed(future_by_mailbox_id):
+                    mailbox_id = future_by_mailbox_id[future]
+                    try:
+                        results_by_mailbox_id[mailbox_id] = future.result()
+                    except Exception as error:  # noqa: BLE001 - keep batch robust against worker crashes.
+                        results_by_mailbox_id[mailbox_id] = MailboxAccessTokenRefreshItem(
+                            mailbox_id=mailbox_id,
+                            primary_email=None,
+                            successful=False,
+                            refreshed=False,
+                            refresh_token_rotated=False,
+                            access_token_expires_at=None,
+                            error_summary=self._safe_error_summary(error),
+                        )
+
+        ordered_results = [results_by_mailbox_id[mailbox_id] for mailbox_id in mailbox_ids]
+        successful_count = sum(1 for item in ordered_results if item.successful)
+        failed_count = len(ordered_results) - successful_count
+        return MailboxAccessTokenRefreshResult(
+            successful=successful_count,
+            failed=failed_count,
+            results=ordered_results,
+        )
+
+    def _refresh_single_mailbox_in_worker_session(self, mailbox_id: str) -> MailboxAccessTokenRefreshItem:
+        """Open a dedicated session, force-refresh one mailbox, and commit the worker transaction."""
+        with self._session_factory() as session:
+            worker_service = self._build_worker_access_token_service(session)
+            try:
+                access_token_result = worker_service.ensure_access_token(mailbox_id, force_refresh=True)
+                session.commit()
+                return MailboxAccessTokenRefreshItem(
+                    mailbox_id=access_token_result.mailbox_id,
+                    primary_email=access_token_result.primary_email,
+                    successful=True,
+                    refreshed=access_token_result.refreshed,
+                    refresh_token_rotated=access_token_result.refresh_token_rotated,
+                    access_token_expires_at=access_token_result.expires_at,
+                )
+            except Exception as error:  # noqa: BLE001 - per-mailbox isolation for the batch.
+                session.rollback()
+                mailbox = session.get(Mailbox, mailbox_id)
+                # Persist invalid_grant status after rollback (ensure_access_token only dirties the row).
+                if isinstance(error, MicrosoftInvalidGrantError) and mailbox is not None:
+                    mailbox.status = MailboxStatus.INVALID
+                    mailbox.updated_at = utc_now()
+                    session.commit()
+                return MailboxAccessTokenRefreshItem(
+                    mailbox_id=mailbox_id,
+                    primary_email=mailbox.primary_email if mailbox is not None else None,
+                    successful=False,
+                    refreshed=False,
+                    refresh_token_rotated=False,
+                    access_token_expires_at=None,
+                    error_summary=self._safe_error_summary(error),
+                )
+
+    def _build_worker_access_token_service(self, session: Session) -> MailboxAccessTokenService:
+        """Construct a request-local AT service stack bound to a worker session.
+
+        Production stacks rebuild OAuth/IMAP/Graph clients against the worker session so
+        sticky proxy resolution uses that session's locks/commits. Unit tests inject fake
+        OAuth/prober objects that must be reused instead of replaced by live Microsoft clients.
+        """
+        if isinstance(self._oauth_client, MicrosoftOAuthClient):
+            proxy_service = EgressProxyService(session, self._settings, self._credential_cipher)
+            capability_prober = MailboxCapabilityProbeService(
+                self._settings,
+                MicrosoftIMAPClient(proxy_service, self._settings),
+                MicrosoftGraphMailProbeClient(proxy_service, self._settings),
+            )
+            oauth_client: MicrosoftOAuthClientProtocol = MicrosoftOAuthClient(proxy_service, self._settings)
+        else:
+            oauth_client = self._oauth_client
+            capability_prober = self._capability_prober
+        return MailboxAccessTokenService(
+            session,
+            self._settings,
+            self._credential_cipher,
+            oauth_client,
+            capability_prober=capability_prober,
+            session_factory=self._session_factory,
         )
 
     def _has_usable_cached_access_token(self, mailbox: Mailbox) -> bool:

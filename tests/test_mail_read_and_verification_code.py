@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from base64 import urlsafe_b64encode
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 
 from sqlalchemy import create_engine
@@ -17,10 +17,13 @@ from mailbox_service.models import Lease, LeaseMode, Mailbox, MailboxCapability,
 from mailbox_service.security import CredentialCipher
 from mailbox_service.token_service import MailboxAccessTokenService
 from mailbox_service.verification_code_service import (
+    IMAP_FETCH_ITEMS,
     InboxMessageCandidate,
     VerificationCodeLookupOptions,
     VerificationCodeService,
+    expand_lookback_since_at,
     extract_verification_code,
+    is_within_lookback_window,
 )
 
 
@@ -32,37 +35,68 @@ class FakeMicrosoftOAuthClient:
 
 
 class FakeImapClient:
-    """IMAP double that returns one RFC822 message with a verification code."""
+    """IMAP double that returns RFC822 messages, optionally per folder."""
 
-    def __init__(self, raw_message: bytes) -> None:
-        self._raw_message = raw_message
+    def __init__(
+        self,
+        raw_message: bytes | None = None,
+        *,
+        internaldate: str | None = None,
+        folder_messages: dict[str, bytes] | None = None,
+    ) -> None:
+        self._folder_messages = dict(folder_messages or {})
+        if raw_message is not None:
+            # Default fixture puts the code mail in INBOX for backward-compatible tests.
+            self._folder_messages.setdefault("INBOX", raw_message)
+        self._internaldate = internaldate
         self.connect_calls = 0
 
     def connect(self, mailbox: Mailbox, access_token: str):
         self.connect_calls += 1
-        return FakeImapSession(self._raw_message)
+        return FakeImapSession(self._folder_messages, internaldate=self._internaldate)
 
 
 class FakeImapSession:
-    def __init__(self, raw_message: bytes) -> None:
-        self._raw_message = raw_message
+    def __init__(
+        self,
+        folder_messages: dict[str, bytes],
+        *,
+        internaldate: str | None = None,
+    ) -> None:
+        self._folder_messages = folder_messages
+        self._internaldate = internaldate or utc_now().strftime("%d-%b-%Y %H:%M:%S +0000")
+        self._selected_folder: str | None = None
         self.logged_out = False
         self.uid_commands: list[tuple[str, tuple]] = []
+        self.selected_folders: list[str] = []
 
     def select(self, mailbox_name: str, readonly: bool = False):
-        assert mailbox_name == "INBOX"
         assert readonly is True
-        return "OK", [b"1"]
+        self._selected_folder = mailbox_name
+        self.selected_folders.append(mailbox_name)
+        if mailbox_name in self._folder_messages:
+            return "OK", [b"1"]
+        # Optional folders such as Junk may be absent on some mailboxes.
+        if mailbox_name != "INBOX":
+            return "NO", [b"Mailbox does not exist"]
+        return "OK", [b"0"]
 
     def uid(self, command: str, *arguments):
         self.uid_commands.append((command.lower(), arguments))
+        selected_folder = self._selected_folder or "INBOX"
+        raw_message = self._folder_messages.get(selected_folder)
         if command.lower() == "search":
             assert arguments == (None, "ALL")
+            if raw_message is None:
+                return "OK", [b""]
             return "OK", [b"1"]
         if command.lower() == "fetch":
             assert arguments[0] == b"1"
-            assert arguments[1] == "(RFC822)"
-            return "OK", [(b"1 (RFC822)", self._raw_message)]
+            assert arguments[1] == IMAP_FETCH_ITEMS
+            if raw_message is None:
+                return "OK", []
+            metadata = f'1 (UID 1 INTERNALDATE "{self._internaldate}" RFC822 {{{len(raw_message)}}})'
+            return "OK", [(metadata.encode("utf-8"), raw_message)]
         return "BAD", [b"unknown command"]
 
     def search(self, charset, *criteria):
@@ -127,7 +161,8 @@ def build_rfc822_message(
     return message.as_bytes()
 
 
-def test_mail_read_acquire_returns_mailbox_without_tokens_and_skips_unusable() -> None:
+def test_mail_read_acquire_returns_mailbox_without_tokens_and_skips_unproven() -> None:
+    """mail_read should only select imap/graph rows, not unprobed/unknown/unusable."""
     session, credential_cipher, client_key_service, lease_service = create_mail_read_context()
     usable_mailbox = Mailbox(
         primary_email="usable@outlook.com",
@@ -143,7 +178,19 @@ def test_mail_read_acquire_returns_mailbox_without_tokens_and_skips_unusable() -
         refresh_token_ciphertext=credential_cipher.encrypt("refresh-token"),
         capability=MailboxCapability.UNUSABLE,
     )
-    session.add_all([unusable_mailbox, usable_mailbox])
+    unprobed_mailbox = Mailbox(
+        primary_email="unprobed@outlook.com",
+        client_id="client-id",
+        refresh_token_ciphertext=credential_cipher.encrypt("refresh-token"),
+        capability=None,
+    )
+    unknown_mailbox = Mailbox(
+        primary_email="unknown@outlook.com",
+        client_id="client-id",
+        refresh_token_ciphertext=credential_cipher.encrypt("refresh-token"),
+        capability=MailboxCapability.UNKNOWN,
+    )
+    session.add_all([unusable_mailbox, unprobed_mailbox, unknown_mailbox, usable_mailbox])
     session.flush()
 
     creation = client_key_service.create_client_key(
@@ -219,15 +266,29 @@ def test_mail_read_acquire_can_allocate_plus_alias() -> None:
     assert random_result.allocated_email != "second@outlook.com"
 
 
-def test_mail_read_acquire_requires_scope_and_rejects_all_unusable_pool() -> None:
+def test_mail_read_acquire_requires_scope_and_rejects_unproven_pool() -> None:
     session, credential_cipher, client_key_service, lease_service = create_mail_read_context()
-    session.add(
-        Mailbox(
-            primary_email="only-unusable@outlook.com",
-            client_id="client-id",
-            refresh_token_ciphertext=credential_cipher.encrypt("refresh-token"),
-            capability=MailboxCapability.UNUSABLE,
-        )
+    session.add_all(
+        [
+            Mailbox(
+                primary_email="only-unusable@outlook.com",
+                client_id="client-id",
+                refresh_token_ciphertext=credential_cipher.encrypt("refresh-token"),
+                capability=MailboxCapability.UNUSABLE,
+            ),
+            Mailbox(
+                primary_email="only-unprobed@outlook.com",
+                client_id="client-id",
+                refresh_token_ciphertext=credential_cipher.encrypt("refresh-token"),
+                capability=None,
+            ),
+            Mailbox(
+                primary_email="only-unknown@outlook.com",
+                client_id="client-id",
+                refresh_token_ciphertext=credential_cipher.encrypt("refresh-token"),
+                capability=MailboxCapability.UNKNOWN,
+            ),
+        ]
     )
     session.flush()
     missing_scope = client_key_service.create_client_key(
@@ -253,7 +314,7 @@ def test_mail_read_acquire_requires_scope_and_rejects_all_unusable_pool() -> Non
     except LeaseUnavailableError:
         pass
     else:
-        raise AssertionError("仅 unusable 邮箱时不应领取成功")
+        raise AssertionError("仅 unprobed/unknown/unusable 邮箱时不应领取成功")
 
 
 def test_extract_verification_code_prefers_xai_then_digits() -> None:
@@ -261,6 +322,44 @@ def test_extract_verification_code_prefers_xai_then_digits() -> None:
     assert extract_verification_code("Login", "Your verification code is DEF-456.") == "DEF-456"
     assert extract_verification_code("Your code", "请使用验证码 482917 完成登录") == "482917"
     assert extract_verification_code("Hi", "verification code: 112233") == "112233"
+
+
+def test_verification_code_reads_junk_folder_when_missing_from_inbox() -> None:
+    """Personal/consumer mail may land in Junk; mail_read must still extract the code."""
+    session, credential_cipher, client_key_service, lease_service = create_mail_read_context()
+    mailbox = Mailbox(
+        primary_email="code@outlook.com",
+        client_id="client-id",
+        refresh_token_ciphertext=credential_cipher.encrypt("refresh-token"),
+        capability=MailboxCapability.IMAP,
+        access_token_ciphertext=credential_cipher.encrypt("cached-access-token"),
+        access_token_expires_at=utc_now() + timedelta(minutes=30),
+    )
+    session.add(mailbox)
+    session.flush()
+
+    junk_message = build_rfc822_message(
+        subject="123",
+        body="验证码：666888",
+        from_address="sender@example.com",
+        to_address="code@outlook.com",
+    )
+    imap_client = FakeImapClient(folder_messages={"Junk": junk_message})
+    verification_service = VerificationCodeService(
+        lease_service._access_token_service,
+        imap_client,
+        FakeGraphReader(),
+        sleep_function=lambda _seconds: None,
+    )
+
+    result = verification_service.wait_for_verification_code(
+        mailbox,
+        VerificationCodeLookupOptions(timeout_seconds=0, since_seconds=180),
+    )
+
+    assert result.found is True
+    assert result.code == "666888"
+    assert result.channel == "imap"
 
 
 def test_verification_code_extracts_digits_from_imap_and_rejects_wrong_mode() -> None:
@@ -487,3 +586,59 @@ def test_verification_code_prefers_imap_then_graph_when_capability_missing() -> 
     assert result.code == "778899"
     assert result.channel == "graph"
     assert graph_reader.calls == 1
+
+
+def test_lookback_window_tolerates_clock_skew_and_missing_timestamps() -> None:
+    since_at = datetime(2026, 7, 17, 12, 0, 0, tzinfo=timezone.utc)
+    expanded_since_at = expand_lookback_since_at(since_at)
+    assert expanded_since_at == since_at - timedelta(minutes=15)
+
+    # Within requested window.
+    assert is_within_lookback_window(since_at + timedelta(minutes=1), since_at) is True
+    # Outside requested window but inside clock-skew buffer.
+    assert is_within_lookback_window(since_at - timedelta(minutes=10), since_at) is True
+    # Older than requested window + skew buffer.
+    assert is_within_lookback_window(since_at - timedelta(minutes=20), since_at) is False
+    # Missing timestamps should not be dropped by the time filter.
+    assert is_within_lookback_window(None, since_at) is True
+    # Naive timestamps are treated as UTC for comparison.
+    assert is_within_lookback_window(datetime(2026, 7, 17, 11, 55, 0), since_at) is True
+
+
+def test_verification_code_prefers_imap_internaldate_over_stale_date_header() -> None:
+    """A fresh INTERNALDATE should keep a message even if Date header looks old."""
+    session, credential_cipher, client_key_service, lease_service = create_mail_read_context()
+    mailbox = Mailbox(
+        primary_email="code@outlook.com",
+        client_id="client-id",
+        refresh_token_ciphertext=credential_cipher.encrypt("refresh-token"),
+        capability=MailboxCapability.IMAP,
+        access_token_ciphertext=credential_cipher.encrypt("cached-access-token"),
+        access_token_expires_at=utc_now() + timedelta(minutes=30),
+    )
+    session.add(mailbox)
+    session.flush()
+
+    message = EmailMessage()
+    message["From"] = "noreply@example.com"
+    message["To"] = "code@outlook.com"
+    message["Subject"] = "Your code"
+    # Intentionally stale / local-looking Date that would fail a strict 180s Date filter.
+    message["Date"] = (utc_now() - timedelta(hours=8)).strftime("%a, %d %b %Y %H:%M:%S")
+    message.set_content("请使用验证码 654321 完成登录")
+    raw_message = message.as_bytes()
+
+    fresh_internaldate = utc_now().strftime("%d-%b-%Y %H:%M:%S +0000")
+    verification_service = VerificationCodeService(
+        lease_service._access_token_service,
+        FakeImapClient(raw_message, internaldate=fresh_internaldate),
+        FakeGraphReader(),
+        sleep_function=lambda _seconds: None,
+    )
+    result = verification_service.wait_for_verification_code(
+        mailbox,
+        VerificationCodeLookupOptions(timeout_seconds=0, since_seconds=180),
+    )
+    assert result.found is True
+    assert result.code == "654321"
+    assert result.channel == "imap"

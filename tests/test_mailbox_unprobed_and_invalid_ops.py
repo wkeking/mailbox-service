@@ -8,16 +8,28 @@ from unittest.mock import MagicMock
 
 from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.pool import StaticPool
 
 from mailbox_service.capability_probe_service import CapabilityProbeResult, ProbeOutcomeKind, ChannelProbeOutcome
 from mailbox_service.config import Settings
 from mailbox_service.database import Base
 from mailbox_service.main import delete_invalid_mailboxes, refresh_unprobed_mailbox_access_tokens
-from mailbox_service.models import AuditLog, Lease, LeaseMode, Mailbox, MailboxCapability, MailboxStatus, utc_now
+from mailbox_service.models import (
+    AuditLog,
+    EgressProxy,
+    EgressProxyProtocol,
+    EgressProxyStatus,
+    Lease,
+    LeaseMode,
+    Mailbox,
+    MailboxCapability,
+    MailboxStatus,
+    utc_now,
+)
 from mailbox_service.proxy_service import MicrosoftInvalidGrantError, MicrosoftTokenResponse
 from mailbox_service.schemas import MailboxUnprobedRefreshRequest
 from mailbox_service.security import CredentialCipher
-from mailbox_service.token_service import MailboxAccessTokenService
+from mailbox_service.token_service import MailboxAccessTokenRefreshItem, MailboxAccessTokenService
 
 
 def create_service_context(
@@ -25,9 +37,16 @@ def create_service_context(
     with_capability_prober: bool = True,
 ) -> tuple[Session, Settings, CredentialCipher, MailboxAccessTokenService, MagicMock]:
     """Build an isolated SQLite session with a mocked OAuth client."""
-    database_engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    # StaticPool keeps one shared :memory: connection so worker sessions see the same rows.
+    database_engine = create_engine(
+        "sqlite+pysqlite:///:memory:",
+        future=True,
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
     Base.metadata.create_all(database_engine)
-    session = sessionmaker(bind=database_engine, expire_on_commit=False)()
+    session_factory = sessionmaker(bind=database_engine, expire_on_commit=False)
+    session = session_factory()
     encryption_key = urlsafe_b64encode(b"u" * 32).decode("ascii")
     settings = Settings(
         database_url="sqlite+pysqlite:///:memory:",
@@ -52,6 +71,7 @@ def create_service_context(
         cipher,
         oauth_client,
         capability_prober=capability_prober,
+        session_factory=session_factory,
     )
     return session, settings, cipher, access_token_service, oauth_client
 
@@ -73,7 +93,9 @@ def seed_mailbox(
         capability=capability,
     )
     session.add(mailbox)
-    session.flush()
+    # Commit so independent worker sessions (and SQLite StaticPool shared connections)
+    # do not lose seed rows when a worker rolls back a failed recognition.
+    session.commit()
     return mailbox
 
 
@@ -113,6 +135,7 @@ def test_refresh_unprobed_only_processes_null_and_unknown_in_batches() -> None:
     assert result.successful == 1
     assert result.failed == 0
     assert result.remaining_candidates == 1
+    assert result.worker_count == 1
     assert result.results[0].mailbox_id == unprobed_a.id
     assert unprobed_a.access_token_ciphertext is not None
     assert unprobed_a.capability == MailboxCapability.IMAP
@@ -124,6 +147,7 @@ def test_refresh_unprobed_marks_invalid_grant_as_failed_and_invalid_status() -> 
     """invalid_grant during recognition should mark the mailbox invalid and count as failed."""
     session, _settings, cipher, access_token_service, oauth_client = create_service_context()
     mailbox = seed_mailbox(session, cipher, primary_email="bad@outlook.com", capability=None)
+    mailbox_id = mailbox.id
     oauth_client.refresh_access_token.side_effect = MicrosoftInvalidGrantError("Microsoft 拒绝 refresh token")
 
     result = refresh_unprobed_mailbox_access_tokens(
@@ -136,12 +160,53 @@ def test_refresh_unprobed_marks_invalid_grant_as_failed_and_invalid_status() -> 
     assert result.processed == 1
     assert result.successful == 0
     assert result.failed == 1
-    assert mailbox.status == MailboxStatus.INVALID
+    # Worker sessions commit independently; re-load from DB after request session expire_all().
+    reloaded_mailbox = session.get(Mailbox, mailbox_id)
+    assert reloaded_mailbox is not None
+    assert reloaded_mailbox.status == MailboxStatus.INVALID
     assert result.remaining_candidates == 0
 
 
+def test_unprobed_refresh_worker_count_matches_available_proxy_pool() -> None:
+    """Concurrent recognition should size workers by currently available egress proxies."""
+    session, _settings, cipher, access_token_service, _oauth = create_service_context()
+    for index in range(3):
+        session.add(
+            EgressProxy(
+                name=f"proxy-{index}",
+                protocol=EgressProxyProtocol.SOCKS5,
+                host=f"proxy-{index}.example.test",
+                port=1080 + index,
+                status=EgressProxyStatus.HEALTHY,
+                enabled=True,
+                priority=10 + index,
+            )
+        )
+        seed_mailbox(session, cipher, primary_email=f"owner-{index}@outlook.com", capability=None)
+    session.flush()
+
+    def fake_worker(mailbox_id: str) -> MailboxAccessTokenRefreshItem:
+        # Intentionally avoid sharing the parent Session across worker threads.
+        return MailboxAccessTokenRefreshItem(
+            mailbox_id=mailbox_id,
+            primary_email=f"worker-{mailbox_id}@outlook.com",
+            successful=True,
+            refreshed=True,
+            refresh_token_rotated=False,
+            access_token_expires_at=utc_now() + timedelta(hours=1),
+        )
+
+    access_token_service._refresh_single_mailbox_in_worker_session = fake_worker  # type: ignore[method-assign]
+    result = access_token_service.refresh_unprobed_or_unknown_access_tokens(batch_size=100)
+
+    assert result.processed == 3
+    assert result.worker_count == 3
+    assert result.successful == 3
+    assert result.failed == 0
+
+
 def test_delete_invalid_mailboxes_removes_only_invalid_rows_and_leases() -> None:
-    """Invalid cleanup must not touch active mailboxes."""
+    """Invalid cleanup must not touch active mailboxes and should batch-commit deletions."""
     session, _settings, cipher, _service, _oauth = create_service_context()
     invalid_mailbox = seed_mailbox(
         session,
@@ -166,7 +231,7 @@ def test_delete_invalid_mailboxes_removes_only_invalid_rows_and_leases() -> None
             expires_at=utc_now() + timedelta(hours=1),
         )
     )
-    session.flush()
+    session.commit()
 
     result = delete_invalid_mailboxes(session, "test-admin")
     remaining_mailbox_ids = set(session.scalars(select(Mailbox.id)).all())

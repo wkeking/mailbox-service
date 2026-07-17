@@ -142,10 +142,9 @@ class LeaseService:
             ~active_lease_exists,
         )
         if mode == LeaseMode.MAIL_READ:
-            # mail_read needs a mail channel later; exclude known-unusable rows.
+            # Only hand out mailboxes with a proven mail channel; skip unprobed/unknown/unusable.
             mailbox_query = mailbox_query.where(
-                (Mailbox.capability.is_(None))
-                | (Mailbox.capability != MailboxCapability.UNUSABLE)
+                Mailbox.capability.in_((MailboxCapability.IMAP, MailboxCapability.GRAPH))
             )
         if preferred_email:
             mailbox_query = mailbox_query.where(Mailbox.primary_email == preferred_email.strip().lower())
@@ -250,9 +249,19 @@ class LeaseService:
         principal: ClientPrincipal,
         lease_id: str,
     ) -> tuple[Lease, Mailbox]:
-        """Return an owned active mail_read lease and its mailbox row."""
+        """Return an owned active mail_read lease and its mailbox row.
+
+        Intentionally loads without ``FOR UPDATE`` so verification-code polling can
+        release the request transaction before long waits and avoid blocking admin
+        cleanup (e.g. delete-invalid) for the whole timeout window.
+        """
         principal.require_scope("mail:verification-code:read")
-        lease = self._load_owned_lease(principal, lease_id, require_active=True)
+        lease = self._load_owned_lease(
+            principal,
+            lease_id,
+            require_active=True,
+            for_update=False,
+        )
         if lease.mode != LeaseMode.MAIL_READ:
             raise LeaseModeError("该租约不是 mail_read mode")
         mailbox = self._session.get(Mailbox, lease.mailbox_id)
@@ -325,12 +334,15 @@ class LeaseService:
         lease_id: str,
         *,
         require_active: bool,
+        for_update: bool = True,
     ) -> Lease:
-        lease = self._session.scalar(
-            select(Lease)
-            .where(Lease.id == lease_id, Lease.client_key_id == principal.client_key_id)
-            .with_for_update()
+        lease_query = select(Lease).where(
+            Lease.id == lease_id,
+            Lease.client_key_id == principal.client_key_id,
         )
+        if for_update:
+            lease_query = lease_query.with_for_update()
+        lease = self._session.scalar(lease_query)
         if lease is None:
             raise LeaseNotFoundError("租约不存在")
         if require_active and (lease.released_at is not None or self._is_expired(lease.expires_at)):

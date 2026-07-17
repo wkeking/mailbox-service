@@ -219,6 +219,7 @@ interface MailboxUnprobedRefreshResult {
   failed: number;
   remaining_candidates: number;
   batch_size: number;
+  worker_count: number;
   results: MailboxAccessTokenRefreshItem[];
 }
 
@@ -1493,8 +1494,8 @@ function App(): JSX.Element {
   async function probeUnprobedMailboxes(): Promise<void> {
     const shouldStart = window.confirm(
       "开始识别未探测 / 能力未知邮箱？\n\n" +
-        "将分批强制刷新 RT/AT（默认每批最多 50 个），成功则写入能力，invalid_grant 会标记为失效。\n" +
-        "若剩余数量较多，可多次点击继续处理下一批。",
+        "将分批强制刷新 RT/AT（默认每批最多 1000 个），并发 worker 数按当前可用出口代理数计算。\n" +
+        "成功则写入能力，invalid_grant 会标记为失效。若剩余较多，可多次点击继续下一批。",
     );
     if (!shouldStart) {
       return;
@@ -1508,21 +1509,35 @@ function App(): JSX.Element {
         "/api/v1/admin/mailboxes/access-tokens/refresh-unprobed",
         {
           method: "POST",
-          body: JSON.stringify({ batch_size: 50 }),
+          body: JSON.stringify({ batch_size: 1000 }),
         },
       );
       if (result.processed === 0) {
         setNotice("当前没有待识别的未探测 / 未知能力邮箱。");
       } else {
         setNotice(
-          `未探测识别完成：候选 ${result.candidate_total}，本批处理 ${result.processed}，成功 ${result.successful}，失败 ${result.failed}，剩余 ${result.remaining_candidates}。`,
+          `未探测识别完成：候选 ${result.candidate_total}，本批处理 ${result.processed}，并发 ${result.worker_count}，成功 ${result.successful}，失败 ${result.failed}，剩余 ${result.remaining_candidates}。`,
         );
         if (result.failed > 0) {
-          const failedSummaries = result.results
+          const failureReasonCounts = new Map<string, number>();
+          for (const item of result.results) {
+            if (item.successful) {
+              continue;
+            }
+            const reason = (item.error_summary ?? "").trim() || "识别失败（无 error_summary）";
+            failureReasonCounts.set(reason, (failureReasonCounts.get(reason) ?? 0) + 1);
+          }
+          const topFailureReasons = [...failureReasonCounts.entries()]
+            .sort((left, right) => right[1] - left[1])
+            .slice(0, 5)
+            .map(([reason, count]) => `${reason} ×${count}`);
+          const sampleFailures = result.results
             .filter((item) => !item.successful)
             .slice(0, 3)
             .map((item) => `${item.primary_email ?? item.mailbox_id}：${item.error_summary ?? "识别失败"}`);
-          setErrorMessage(`部分邮箱识别失败：${failedSummaries.join("；")}`);
+          setErrorMessage(
+            `部分邮箱识别失败（按原因汇总）：${topFailureReasons.join("；")}。示例：${sampleFailures.join("；")}`,
+          );
         }
       }
       await loadMailboxes();

@@ -65,6 +65,7 @@ class MicrosoftGraphMailProbeClient:
     def probe_messages_access(self, mailbox: Mailbox, access_token: str) -> ChannelProbeOutcome:
         """Return whether GET /me/messages succeeds with the provided access token."""
         selected_proxy = self._proxy_service.resolve_for_mailbox(mailbox.id)
+        self._proxy_service.commit_open_transaction()
         try:
             outcome = self._probe_once(access_token, selected_proxy)
         except EgressProxyTransportError as error:
@@ -75,11 +76,13 @@ class MicrosoftGraphMailProbeClient:
                     error_summary=str(error),
                 )
             self._proxy_service.record_proxy_failure(selected_proxy.id, error)
+            self._proxy_service.commit_open_transaction()
             replacement_proxy = self._proxy_service.resolve_for_mailbox(
                 mailbox.id,
                 excluded_proxy_ids={selected_proxy.id},
                 force_rebind=True,
             )
+            self._proxy_service.commit_open_transaction()
             try:
                 outcome = self._probe_once(access_token, replacement_proxy)
             except EgressProxyTransportError as retry_error:

@@ -257,10 +257,10 @@ class MailboxUnprobedRefreshRequest(BaseModel):
     """对未探测 / 能力未知邮箱分批刷新 RT/AT 的请求。"""
 
     batch_size: int = Field(
-        default=50,
+        default=1000,
         ge=1,
-        le=200,
-        description="本批最多处理的邮箱数量，默认 50，上限 200。",
+        le=5000,
+        description="本批最多处理的邮箱数量，默认 1000，上限 5000。",
     )
 
 
@@ -273,6 +273,7 @@ class MailboxUnprobedRefreshResponse(BaseModel):
     failed: int = Field(description="本批刷新失败数量。")
     remaining_candidates: int = Field(description="本批结束后仍待识别的邮箱数量。")
     batch_size: int = Field(description="本批请求使用的 batch_size。")
+    worker_count: int = Field(description="本批并发 worker 数，按当前可用出口代理数计算，至少 1。")
     results: list[MailboxAccessTokenRefreshItemResponse] = Field(description="本批逐邮箱结果列表。")
 
 
@@ -513,7 +514,11 @@ class LeaseVerificationCodeRequest(BaseModel):
         default=180,
         ge=30,
         le=3_600,
-        description="只查看最近 N 秒内的邮件，默认 180（3 分钟）。",
+        description=(
+            "只查看最近 N 秒内的邮件，默认 180（3 分钟）。"
+            "服务端会额外放宽约 15 分钟时钟偏差缓冲；"
+            "IMAP 优先使用服务器 INTERNALDATE，而不是不可靠的 Date 头。"
+        ),
     )
     poll_interval_seconds: int = Field(
         default=3,
