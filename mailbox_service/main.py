@@ -28,7 +28,8 @@ from mailbox_service.client_key_service import (
     ClientKeyScopeError,
     ClientPrincipal,
 )
-from mailbox_service.database import get_session
+from mailbox_service.database import database_engine, get_session
+from mailbox_service.migration_runner import run_pending_migrations
 from mailbox_service.lease_service import (
     LeaseInactiveError,
     LeaseModeError,
@@ -344,8 +345,9 @@ OPENAPI_SCHEMA_DESCRIPTIONS = {
 
 @asynccontextmanager
 async def application_lifespan(_: FastAPI):
-    """Run process-local background jobs for the selected single instance."""
+    """Run schema migrations, then process-local background jobs for this instance."""
     settings = get_settings()
+    run_pending_migrations(database_engine, settings)
     proxy_health_scheduler = start_proxy_health_scheduler(settings)
     refresh_token_keepalive_scheduler = start_refresh_token_keepalive_scheduler(settings)
     try:

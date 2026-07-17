@@ -1,5 +1,5 @@
 -- MySQL 8 migration for sticky global egress proxy routing.
--- Apply through the deployment migration runner before starting the API service.
+-- Applied automatically on API startup (schema_migrations) or manually before start.
 
 CREATE TABLE IF NOT EXISTS egress_proxies (
     id VARCHAR(36) NOT NULL,

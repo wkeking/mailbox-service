@@ -1,16 +1,22 @@
 #!/usr/bin/env bash
-# Build (and optionally export) the mailbox-service container image for ARM servers.
+# 构建 mailbox-service 镜像并默认推送到私有仓库 registry.example.com。
+#
+# 默认 push 流程：buildx --load 装入本机 Docker，再 docker push。
+# 不要用 buildx --push 直推：container 驱动会走 HTTPS 访问仓库，
+# 而 registry.example.com 多为 HTTP insecure registry，会报 Head "https://...": EOF。
+# 本机 docker push 会走 Docker daemon 的 insecure-registries 配置，与手动推送一致。
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT_DIR}"
 
+# 默认：registry.example.com/mailbox-service:latest，每次构建后自动 push。
+REGISTRY="${REGISTRY:-registry.example.com}"
 IMAGE_NAME="${IMAGE_NAME:-mailbox-service}"
-IMAGE_TAG="${IMAGE_TAG:-$(date +%Y%m%d)-$(git rev-parse --short HEAD 2>/dev/null || echo local)}"
-# Default target is ARM64 Linux for the production servers described in the README.
+IMAGE_TAG="${IMAGE_TAG:-latest}"
 PLATFORM="${PLATFORM:-linux/arm64}"
-OUTPUT="${OUTPUT:-load}"
-PUSH_REGISTRY="${PUSH_REGISTRY:-}"
+# push=构建后推送私有仓库（默认）；load=仅载入本机；tar=导出归档
+OUTPUT="${OUTPUT:-push}"
 BUILDER_NAME="${BUILDER_NAME:-mailbox-service-builder}"
 
 usage() {
@@ -18,31 +24,38 @@ usage() {
 用法:
   ./scripts/build-image.sh [选项]
 
+默认行为:
+  构建 linux/arm64 镜像 registry.example.com/mailbox-service:latest：
+  1) buildx --load 载入本机 Docker
+  2) docker push 推送到私有仓库
+  仓库无需 docker login；网络可达 registry.example.com 即可。
+  （Docker Desktop / daemon 需已把该地址加入 insecure-registries，与手动 push 相同。）
+
 选项:
   --platform <平台>     目标平台，默认 linux/arm64
-                        示例: linux/arm64 | linux/amd64 | linux/arm64,linux/amd64
-  --tag <标签>          镜像标签，默认 YYYYMMDD-<git-short-sha>
-  --name <名称>         镜像名，默认 mailbox-service
-  --output <方式>       load | tar | push（默认 load）
-                        load  : 载入本机 Docker（仅单平台）
-                        tar   : 导出 docker-archive 到 dist/
-                        push  : 推送到镜像仓库（需 --registry）
-  --registry <仓库前缀> 推送时使用，例如 registry.example.com/team
+                        示例: linux/arm64 | linux/amd64
+  --tag <标签>          镜像标签，默认 latest
+  --name <名称>         镜像仓库名，默认 mailbox-service
+  --registry <主机>     私有仓库主机，默认 registry.example.com
+  --output <方式>       push | load | tar（默认 push）
+                        push : 载入本机后 docker push
+                        load : 仅载入本机 Docker（不推送）
+                        tar  : 导出 docker-archive 到 dist/（不推送）
   --builder <名称>      buildx builder 名称，默认 mailbox-service-builder
   -h, --help            显示帮助
 
 环境变量（与选项等价，选项优先）:
-  IMAGE_NAME / IMAGE_TAG / PLATFORM / OUTPUT / PUSH_REGISTRY / BUILDER_NAME
+  REGISTRY / IMAGE_NAME / IMAGE_TAG / PLATFORM / OUTPUT / BUILDER_NAME
 
 示例:
-  # 本机（Apple Silicon / arm64）直接构建并载入 Docker
+  # 默认：构建并推送 registry.example.com/mailbox-service:latest
   ./scripts/build-image.sh
 
-  # 在 x86 开发机上交叉构建 arm64，并导出 tar 拷到 ARM 服务器
-  ./scripts/build-image.sh --platform linux/arm64 --output tar
+  # 仅本机调试，不推仓库
+  ./scripts/build-image.sh --output load
 
-  # 推送到私有仓库
-  ./scripts/build-image.sh --output push --registry registry.example.com/mailbox
+  # 额外打版本标签再推送
+  ./scripts/build-image.sh --tag 20260717-abc1234
 EOF
 }
 
@@ -60,12 +73,12 @@ while [[ $# -gt 0 ]]; do
       IMAGE_NAME="${2:?}"
       shift 2
       ;;
-    --output)
-      OUTPUT="${2:?}"
+    --registry)
+      REGISTRY="${2:?}"
       shift 2
       ;;
-    --registry)
-      PUSH_REGISTRY="${2:?}"
+    --output)
+      OUTPUT="${2:?}"
       shift 2
       ;;
     --builder)
@@ -94,7 +107,6 @@ if ! docker buildx version >/dev/null 2>&1; then
   exit 1
 fi
 
-# Ensure a builder that can cross-compile (especially amd64 host -> arm64 image).
 if ! docker buildx inspect "${BUILDER_NAME}" >/dev/null 2>&1; then
   echo "创建 buildx builder: ${BUILDER_NAME}"
   docker buildx create --name "${BUILDER_NAME}" --driver docker-container --use >/dev/null
@@ -103,10 +115,7 @@ else
 fi
 docker buildx inspect --bootstrap >/dev/null
 
-FULL_IMAGE_REF="${IMAGE_NAME}:${IMAGE_TAG}"
-if [[ -n "${PUSH_REGISTRY}" ]]; then
-  FULL_IMAGE_REF="${PUSH_REGISTRY%/}/${IMAGE_NAME}:${IMAGE_TAG}"
-fi
+FULL_IMAGE_REF="${REGISTRY%/}/${IMAGE_NAME}:${IMAGE_TAG}"
 
 echo "========================================"
 echo "镜像:     ${FULL_IMAGE_REF}"
@@ -123,20 +132,38 @@ COMMON_ARGS=(
   "${ROOT_DIR}"
 )
 
+build_and_load_local() {
+  if [[ "${PLATFORM}" == *","* ]]; then
+    echo "错误: 当前 push/load 流程仅支持单平台（需 --load 进本机 Docker）。" >&2
+    echo "请使用 --platform linux/arm64 或 linux/amd64。" >&2
+    exit 1
+  fi
+  docker buildx build --load "${COMMON_ARGS[@]}"
+  docker image inspect "${FULL_IMAGE_REF}" --format '架构={{.Architecture}} OS={{.Os}} 大小={{.Size}}'
+}
+
 case "${OUTPUT}" in
-  load)
-    if [[ "${PLATFORM}" == *","* ]]; then
-      echo "错误: --output load 仅支持单平台；多平台请使用 tar 或 push。" >&2
-      exit 1
-    fi
-    docker buildx build --load "${COMMON_ARGS[@]}"
+  push)
+    # 与手动 docker push 同一路径：先进入本机镜像列表，再由 daemon push。
+    # 避免 buildx --push 对 HTTP 私有仓强制 HTTPS 导致 EOF。
+    build_and_load_local
     echo
-    echo "已载入本机 Docker: ${FULL_IMAGE_REF}"
-    docker image inspect "${FULL_IMAGE_REF}" --format '架构={{.Architecture}} OS={{.Os}} 大小={{.Size}}'
+    echo "正在推送: ${FULL_IMAGE_REF}"
+    docker push "${FULL_IMAGE_REF}"
+    echo
+    echo "已推送: ${FULL_IMAGE_REF}"
+    echo "服务器拉取 / Compose 使用:"
+    echo "  docker pull ${FULL_IMAGE_REF}"
+    echo "  # docker-compose.yml 默认 image 已对齐该名称"
+    ;;
+  load)
+    build_and_load_local
+    echo
+    echo "已载入本机 Docker（未推送）: ${FULL_IMAGE_REF}"
     ;;
   tar)
     if [[ "${PLATFORM}" == *","* ]]; then
-      echo "错误: --output tar 仅支持单平台；多平台请使用 --output push。" >&2
+      echo "错误: --output tar 仅支持单平台。" >&2
       exit 1
     fi
     mkdir -p "${ROOT_DIR}/dist"
@@ -146,23 +173,13 @@ case "${OUTPUT}" in
     TAR_PATH="${ROOT_DIR}/dist/${IMAGE_NAME}-${SAFE_TAG}-${SAFE_PLATFORM}.tar"
     docker buildx build --output "type=docker,dest=${TAR_PATH}" "${COMMON_ARGS[@]}"
     echo
-    echo "已导出镜像包: ${TAR_PATH}"
+    echo "已导出镜像包（未推送）: ${TAR_PATH}"
     ls -lh "${TAR_PATH}"
     echo
-    echo "在 ARM 服务器上加载:"
-    echo "  docker load -i $(basename "${TAR_PATH}")"
-    ;;
-  push)
-    if [[ -z "${PUSH_REGISTRY}" ]]; then
-      echo "错误: --output push 需要同时指定 --registry <仓库前缀>" >&2
-      exit 1
-    fi
-    docker buildx build --push "${COMMON_ARGS[@]}"
-    echo
-    echo "已推送: ${FULL_IMAGE_REF}"
+    echo "加载示例: docker load -i $(basename "${TAR_PATH}")"
     ;;
   *)
-    echo "错误: 不支持的 --output=${OUTPUT}（可选: load | tar | push）" >&2
+    echo "错误: 不支持的 --output=${OUTPUT}（可选: push | load | tar）" >&2
     exit 1
     ;;
 esac

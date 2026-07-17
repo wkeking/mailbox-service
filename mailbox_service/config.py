@@ -16,6 +16,10 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     database_url: str = "mysql+pymysql://mailbox_service:mailbox_service@127.0.0.1:3306/mailbox_service"
+    # Apply pending migrations/*.sql on process startup (records versions in schema_migrations).
+    auto_migrate_on_startup: bool = True
+    # Optional absolute/relative path to the migrations directory; empty uses CWD or package root.
+    migrations_dir: str | None = None
     admin_api_token: str | None = None
     credential_encryption_key: str | None = None
     app_env: Literal["development", "test", "production"] = "production"
