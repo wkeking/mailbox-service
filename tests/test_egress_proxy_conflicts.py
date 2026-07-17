@@ -51,6 +51,99 @@ def create_admin_test_client() -> TestClient:
     return TestClient(app)
 
 
+def test_create_egress_proxy_returns_full_host_for_admin_copy() -> None:
+    """Admin list/create responses include full host so the console can prefill copy dialogs."""
+    client = create_admin_test_client()
+    headers = {"X-Admin-Token": "test-admin-token"}
+    create_response = client.post(
+        "/api/v1/admin/egress-proxies",
+        json={
+            "name": "source-proxy",
+            "protocol": "socks5",
+            "host": "proxy.example.com",
+            "port": 1080,
+            "username": "user",
+            "password": "secret",
+            "enabled": True,
+            "priority": 50,
+        },
+        headers=headers,
+    )
+    assert create_response.status_code == 201
+    created_body = create_response.json()
+    assert created_body["host"] == "proxy.example.com"
+    assert created_body["host_preview"] != "proxy.example.com"
+    assert created_body["has_credentials"] is True
+
+    list_response = client.get("/api/v1/admin/egress-proxies", headers=headers)
+    assert list_response.status_code == 200
+    assert list_response.json()[0]["host"] == "proxy.example.com"
+    app.dependency_overrides.clear()
+
+
+def test_create_egress_proxy_can_clone_encrypted_credentials_from_source() -> None:
+    """Copy flow decrypts source secrets once and re-encrypts; never double-encrypts ciphertext."""
+    from sqlalchemy import select
+
+    from mailbox_service.models import EgressProxy
+    from mailbox_service.security import CredentialCipher
+
+    client = create_admin_test_client()
+    headers = {"X-Admin-Token": "test-admin-token"}
+    encryption_key = urlsafe_b64encode(b"p" * 32).decode("ascii")
+    source_response = client.post(
+        "/api/v1/admin/egress-proxies",
+        json={
+            "name": "source-proxy",
+            "protocol": "socks5",
+            "host": "proxy.example.com",
+            "port": 1080,
+            "username": "user",
+            "password": "secret",
+            "enabled": True,
+            "priority": 50,
+        },
+        headers=headers,
+    )
+    assert source_response.status_code == 201
+    source_proxy_id = source_response.json()["id"]
+
+    clone_response = client.post(
+        "/api/v1/admin/egress-proxies",
+        json={
+            "name": "source-proxy-copy",
+            "protocol": "socks5",
+            "host": "proxy-copy.example.com",
+            "port": 1081,
+            "enabled": True,
+            "priority": 50,
+            "copy_credentials_from_proxy_id": source_proxy_id,
+        },
+        headers=headers,
+    )
+    assert clone_response.status_code == 201
+    assert clone_response.json()["has_credentials"] is True
+    assert clone_response.json()["host"] == "proxy-copy.example.com"
+
+    # Resolve the same session factory used by the overridden dependency via a fresh engine query
+    # is not available; re-open through the app override by probing decrypt via create+session.
+    # The clone must decrypt back to the original plaintext password.
+    with next(app.dependency_overrides[get_session]()) as session:
+        cloned_proxy = session.scalar(
+            select(EgressProxy).where(EgressProxy.id == clone_response.json()["id"])
+        )
+        source_proxy = session.scalar(select(EgressProxy).where(EgressProxy.id == source_proxy_id))
+        assert cloned_proxy is not None
+        assert source_proxy is not None
+        cipher = CredentialCipher(encryption_key)
+        assert cipher.decrypt(cloned_proxy.password_ciphertext) == "secret"
+        assert cipher.decrypt(cloned_proxy.username_ciphertext) == "user"
+        # Ciphertext blobs may differ due to random nonce, but both must decrypt to the same secret.
+        assert cipher.decrypt(source_proxy.password_ciphertext) == "secret"
+
+    app.dependency_overrides.clear()
+
+
 def test_create_egress_proxy_allows_same_endpoint_with_different_credentials() -> None:
     """Proxy-pool nodes that share host/port but differ by username/password must both save."""
     client = create_admin_test_client()

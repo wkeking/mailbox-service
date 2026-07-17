@@ -5,6 +5,7 @@ import {
   CircleAlert,
   CircleOff,
   Copy,
+  Download,
   KeyRound,
   LogOut,
   Network,
@@ -87,6 +88,7 @@ interface EgressProxy {
   id: string;
   name: string;
   protocol: ProxyProtocol;
+  host: string;
   host_preview: string;
   port: number;
   enabled: boolean;
@@ -99,6 +101,17 @@ interface EgressProxy {
   last_failure_at: string | null;
   last_error_summary: string | null;
   bound_mailbox_count: number;
+}
+
+interface ProxyDialogDraft {
+  sourceProxyId: string | null;
+  name: string;
+  protocol: ProxyProtocol;
+  host: string;
+  port: number;
+  priority: number;
+  enabled: boolean;
+  hasSourceCredentials: boolean;
 }
 
 interface ProxyPolicy {
@@ -185,6 +198,28 @@ interface MailboxImportResult {
   skipped: number;
   failed: number;
   errors: MailboxImportLineError[];
+}
+
+interface MailboxBatchDeleteResult {
+  deleted: number;
+  deleted_mailbox_ids: string[];
+  missing_mailbox_ids: string[];
+}
+
+interface MailboxDeleteInvalidResult {
+  deleted: number;
+  deleted_mailbox_ids: string[];
+  deleted_primary_emails: string[];
+}
+
+interface MailboxUnprobedRefreshResult {
+  candidate_total: number;
+  processed: number;
+  successful: number;
+  failed: number;
+  remaining_candidates: number;
+  batch_size: number;
+  results: MailboxAccessTokenRefreshItem[];
 }
 
 interface MailboxAccessTokenRefreshItem {
@@ -289,6 +324,42 @@ async function requestApi<ResponsePayload>(
     throw new Error(getErrorMessage(payload));
   }
   return payload as ResponsePayload;
+}
+
+async function requestApiText(
+  adminToken: string,
+  path: string,
+  options: RequestInit = {},
+): Promise<string> {
+  const headers = new Headers(options.headers);
+  headers.set("X-Admin-Token", adminToken);
+  if (options.body) {
+    headers.set("Content-Type", "application/json");
+  }
+
+  const response = await fetch(`${apiBaseUrl}${path}`, { ...options, headers });
+  if (!response.ok) {
+    const payload: unknown = await response.json().catch(() => null);
+    throw new Error(getErrorMessage(payload));
+  }
+  return response.text();
+}
+
+function downloadTextFile(filename: string, content: string): void {
+  const textBlob = new Blob([content], { type: "text/plain;charset=utf-8" });
+  const objectUrl = URL.createObjectURL(textBlob);
+  const downloadAnchor = document.createElement("a");
+  downloadAnchor.href = objectUrl;
+  downloadAnchor.download = filename;
+  document.body.appendChild(downloadAnchor);
+  downloadAnchor.click();
+  document.body.removeChild(downloadAnchor);
+  URL.revokeObjectURL(objectUrl);
+}
+
+function buildMailboxExportFilename(): string {
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+  return `mailboxes-export-${timestamp}.txt`;
 }
 
 function StatusBadge({ proxy }: { proxy: EgressProxy }): JSX.Element {
@@ -459,10 +530,18 @@ function MailboxesPage({
   totalPages,
   selectedMailboxIds,
   isRefreshingAccessTokens,
+  isProbingUnprobedMailboxes,
+  isExportingSelectedMailboxes,
+  isDeletingSelectedMailboxes,
+  isDeletingInvalidMailboxes,
   onPageChange,
   onOpenImport,
   onRefreshAllAccessTokens,
   onRefreshSelectedAccessTokens,
+  onProbeUnprobedMailboxes,
+  onExportSelectedMailboxes,
+  onDeleteSelectedMailboxes,
+  onDeleteInvalidMailboxes,
   onToggleAllMailboxSelection,
   onToggleMailboxSelection,
 }: {
@@ -473,16 +552,30 @@ function MailboxesPage({
   totalPages: number;
   selectedMailboxIds: Set<string>;
   isRefreshingAccessTokens: boolean;
+  isProbingUnprobedMailboxes: boolean;
+  isExportingSelectedMailboxes: boolean;
+  isDeletingSelectedMailboxes: boolean;
+  isDeletingInvalidMailboxes: boolean;
   onPageChange: (page: number) => void;
   onOpenImport: () => void;
   onRefreshAllAccessTokens: () => void;
   onRefreshSelectedAccessTokens: () => void;
+  onProbeUnprobedMailboxes: () => void;
+  onExportSelectedMailboxes: () => void;
+  onDeleteSelectedMailboxes: () => void;
+  onDeleteInvalidMailboxes: () => void;
   onToggleAllMailboxSelection: (isSelected: boolean) => void;
   onToggleMailboxSelection: (mailboxId: string, isSelected: boolean) => void;
 }): JSX.Element {
   const selectedMailboxCount = selectedMailboxIds.size;
   const areAllMailboxesSelected = mailboxes.length > 0 && mailboxes.every((mailbox) => selectedMailboxIds.has(mailbox.id));
   const normalizedTotalPages = Math.max(totalPages, 1);
+  const isSelectionBusy =
+    isRefreshingAccessTokens ||
+    isProbingUnprobedMailboxes ||
+    isExportingSelectedMailboxes ||
+    isDeletingSelectedMailboxes ||
+    isDeletingInvalidMailboxes;
 
   return (
     <>
@@ -505,8 +598,42 @@ function MailboxesPage({
             <button
               className="button"
               type="button"
+              onClick={onProbeUnprobedMailboxes}
+              disabled={isSelectionBusy}
+              title="对未探测 / 能力未知的邮箱分批强制刷新 RT/AT，识别可用与失效"
+            >
+              <RefreshCw size={14} /> {isProbingUnprobedMailboxes ? "识别中" : "识别未探测"}
+            </button>
+            <button
+              className="button button-danger"
+              type="button"
+              onClick={onDeleteInvalidMailboxes}
+              disabled={isSelectionBusy}
+              title="删除全部 status=invalid 的失效邮箱"
+            >
+              <Trash2 size={14} /> {isDeletingInvalidMailboxes ? "清理中" : "删除失效邮箱"}
+            </button>
+            <button
+              className="button"
+              type="button"
+              onClick={onExportSelectedMailboxes}
+              disabled={isSelectionBusy || selectedMailboxCount === 0}
+            >
+              <Download size={14} /> {isExportingSelectedMailboxes ? "导出中" : "导出选中"}
+            </button>
+            <button
+              className="button button-danger"
+              type="button"
+              onClick={onDeleteSelectedMailboxes}
+              disabled={isSelectionBusy || selectedMailboxCount === 0}
+            >
+              <Trash2 size={14} /> {isDeletingSelectedMailboxes ? "删除中" : "删除选中"}
+            </button>
+            <button
+              className="button"
+              type="button"
               onClick={onRefreshSelectedAccessTokens}
-              disabled={isRefreshingAccessTokens || selectedMailboxCount === 0}
+              disabled={isSelectionBusy || selectedMailboxCount === 0}
             >
               <RefreshCw size={14} /> 刷新选中 RT/AT
             </button>
@@ -514,7 +641,7 @@ function MailboxesPage({
               className="button"
               type="button"
               onClick={onRefreshAllAccessTokens}
-              disabled={isRefreshingAccessTokens || mailboxes.length === 0}
+              disabled={isSelectionBusy || mailboxes.length === 0}
             >
               <RefreshCw size={14} /> 刷新全部 RT/AT
             </button>
@@ -1039,12 +1166,17 @@ function App(): JSX.Element {
   const [createdClientApiKey, setCreatedClientApiKey] = useState<string | null>(null);
   const [filterText, setFilterText] = useState("");
   const [isLoading, setIsLoading] = useState(false);
-  const [isCreateDialogOpen, setIsCreateDialogOpen] = useState(false);
+  const [isProxyDialogOpen, setIsProxyDialogOpen] = useState(false);
+  const [proxyDialogDraft, setProxyDialogDraft] = useState<ProxyDialogDraft | null>(null);
   const [isImportDialogOpen, setIsImportDialogOpen] = useState(false);
   const [isImportingMailboxes, setIsImportingMailboxes] = useState(false);
   const [mailboxImportResult, setMailboxImportResult] = useState<MailboxImportResult | null>(null);
   const [selectedMailboxIds, setSelectedMailboxIds] = useState<Set<string>>(() => new Set());
   const [isRefreshingAccessTokens, setIsRefreshingAccessTokens] = useState(false);
+  const [isProbingUnprobedMailboxes, setIsProbingUnprobedMailboxes] = useState(false);
+  const [isExportingSelectedMailboxes, setIsExportingSelectedMailboxes] = useState(false);
+  const [isDeletingSelectedMailboxes, setIsDeletingSelectedMailboxes] = useState(false);
+  const [isDeletingInvalidMailboxes, setIsDeletingInvalidMailboxes] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
@@ -1294,7 +1426,8 @@ function App(): JSX.Element {
     setClientKeyFilterText("");
     setIsClientKeyCreateDialogOpen(false);
     setCreatedClientApiKey(null);
-    setIsCreateDialogOpen(false);
+    setIsProxyDialogOpen(false);
+    setProxyDialogDraft(null);
     setIsImportDialogOpen(false);
     setMailboxImportResult(null);
     setSelectedMailboxIds(new Set());
@@ -1355,6 +1488,148 @@ function App(): JSX.Element {
 
   async function refreshAllAccessTokens(): Promise<void> {
     await refreshAccessTokens(null);
+  }
+
+  async function probeUnprobedMailboxes(): Promise<void> {
+    const shouldStart = window.confirm(
+      "开始识别未探测 / 能力未知邮箱？\n\n" +
+        "将分批强制刷新 RT/AT（默认每批最多 50 个），成功则写入能力，invalid_grant 会标记为失效。\n" +
+        "若剩余数量较多，可多次点击继续处理下一批。",
+    );
+    if (!shouldStart) {
+      return;
+    }
+
+    setIsProbingUnprobedMailboxes(true);
+    setErrorMessage(null);
+    try {
+      const result = await requestApi<MailboxUnprobedRefreshResult>(
+        adminToken,
+        "/api/v1/admin/mailboxes/access-tokens/refresh-unprobed",
+        {
+          method: "POST",
+          body: JSON.stringify({ batch_size: 50 }),
+        },
+      );
+      if (result.processed === 0) {
+        setNotice("当前没有待识别的未探测 / 未知能力邮箱。");
+      } else {
+        setNotice(
+          `未探测识别完成：候选 ${result.candidate_total}，本批处理 ${result.processed}，成功 ${result.successful}，失败 ${result.failed}，剩余 ${result.remaining_candidates}。`,
+        );
+        if (result.failed > 0) {
+          const failedSummaries = result.results
+            .filter((item) => !item.successful)
+            .slice(0, 3)
+            .map((item) => `${item.primary_email ?? item.mailbox_id}：${item.error_summary ?? "识别失败"}`);
+          setErrorMessage(`部分邮箱识别失败：${failedSummaries.join("；")}`);
+        }
+      }
+      await loadMailboxes();
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : "识别未探测邮箱失败。");
+    } finally {
+      setIsProbingUnprobedMailboxes(false);
+    }
+  }
+
+  async function deleteInvalidMailboxes(): Promise<void> {
+    const shouldDelete = window.confirm(
+      "确认删除全部失效邮箱（status=invalid）？\n\n关联租约会一并删除，且操作不可恢复。",
+    );
+    if (!shouldDelete) {
+      return;
+    }
+
+    setIsDeletingInvalidMailboxes(true);
+    setErrorMessage(null);
+    try {
+      const result = await requestApi<MailboxDeleteInvalidResult>(
+        adminToken,
+        "/api/v1/admin/mailboxes/delete-invalid",
+        { method: "POST" },
+      );
+      setNotice(
+        result.deleted > 0
+          ? `已删除 ${result.deleted} 个失效邮箱。`
+          : "当前没有可删除的失效邮箱。",
+      );
+      setSelectedMailboxIds(new Set());
+      await loadMailboxes();
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : "删除失效邮箱失败。");
+    } finally {
+      setIsDeletingInvalidMailboxes(false);
+    }
+  }
+
+  async function exportSelectedMailboxes(): Promise<void> {
+    const mailboxIds = [...selectedMailboxIds];
+    if (mailboxIds.length === 0) {
+      setErrorMessage("请先选择需要导出的邮箱。");
+      return;
+    }
+
+    setIsExportingSelectedMailboxes(true);
+    setErrorMessage(null);
+    try {
+      const exportContent = await requestApiText(adminToken, "/api/v1/admin/mailboxes/export", {
+        method: "POST",
+        body: JSON.stringify({ mailbox_ids: mailboxIds }),
+      });
+      downloadTextFile(buildMailboxExportFilename(), exportContent);
+      setNotice(`已导出 ${mailboxIds.length} 个邮箱为 txt 文件（格式：邮箱----密码----ClientID----RefreshToken）。`);
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : "导出选中邮箱失败。");
+    } finally {
+      setIsExportingSelectedMailboxes(false);
+    }
+  }
+
+  async function deleteSelectedMailboxes(): Promise<void> {
+    const mailboxIds = [...selectedMailboxIds];
+    if (mailboxIds.length === 0) {
+      setErrorMessage("请先选择需要删除的邮箱。");
+      return;
+    }
+
+    const selectedEmails = mailboxes
+      .filter((mailbox) => selectedMailboxIds.has(mailbox.id))
+      .map((mailbox) => mailbox.primary_email);
+    const previewEmails = selectedEmails.slice(0, 5).join("、");
+    const remainingCount = Math.max(selectedEmails.length - 5, 0);
+    const previewSuffix = remainingCount > 0 ? ` 等 ${selectedEmails.length} 个` : "";
+    const shouldDelete = window.confirm(
+      `确认删除选中的 ${mailboxIds.length} 个邮箱？\n${previewEmails}${previewSuffix}\n\n关联租约会一并删除，且操作不可恢复。`,
+    );
+    if (!shouldDelete) {
+      return;
+    }
+
+    setIsDeletingSelectedMailboxes(true);
+    setErrorMessage(null);
+    try {
+      const result = await requestApi<MailboxBatchDeleteResult>(
+        adminToken,
+        "/api/v1/admin/mailboxes/delete",
+        {
+          method: "POST",
+          body: JSON.stringify({ mailbox_ids: mailboxIds }),
+        },
+      );
+      const missingCount = result.missing_mailbox_ids.length;
+      setNotice(
+        missingCount > 0
+          ? `已删除 ${result.deleted} 个邮箱；另有 ${missingCount} 个 ID 不存在或已删除。`
+          : `已删除 ${result.deleted} 个邮箱。`,
+      );
+      setSelectedMailboxIds(new Set());
+      await loadMailboxes();
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : "删除选中邮箱失败。");
+    } finally {
+      setIsDeletingSelectedMailboxes(false);
+    }
   }
 
   async function changeMailboxPage(nextPage: number): Promise<void> {
@@ -1432,31 +1707,83 @@ function App(): JSX.Element {
     }
   }
 
+  function openCreateProxyDialog(): void {
+    setErrorMessage(null);
+    setProxyDialogDraft({
+      sourceProxyId: null,
+      name: "",
+      protocol: "socks5",
+      host: "",
+      port: 1080,
+      priority: 100,
+      enabled: true,
+      hasSourceCredentials: false,
+    });
+    setIsProxyDialogOpen(true);
+  }
+
+  function openCopyProxyDialog(proxy: EgressProxy): void {
+    setErrorMessage(null);
+    setProxyDialogDraft({
+      sourceProxyId: proxy.id,
+      name: `${proxy.name}-copy`,
+      protocol: proxy.protocol,
+      host: proxy.host || proxy.host_preview,
+      port: proxy.port,
+      priority: proxy.priority,
+      enabled: proxy.enabled,
+      hasSourceCredentials: proxy.has_credentials,
+    });
+    setIsProxyDialogOpen(true);
+  }
+
+  function closeProxyDialog(): void {
+    setIsProxyDialogOpen(false);
+    setProxyDialogDraft(null);
+  }
+
   async function createProxy(event: FormEvent<HTMLFormElement>): Promise<void> {
     event.preventDefault();
     const formData = new FormData(event.currentTarget);
-    const username = String(formData.get("username") ?? "").trim();
+    // Do not trim passwords; only treat truly empty fields as omitted.
+    const username = String(formData.get("username") ?? "");
     const password = String(formData.get("password") ?? "");
-    const payload = {
+    const hasExplicitUsername = username.length > 0;
+    const hasExplicitPassword = password.length > 0;
+    const payload: Record<string, unknown> = {
       name: String(formData.get("name") ?? "").trim(),
       protocol: String(formData.get("protocol") ?? "socks5") as ProxyProtocol,
       host: String(formData.get("host") ?? "").trim(),
       port: Number(formData.get("port")),
       priority: Number(formData.get("priority")),
-      username: username || undefined,
-      password: password || undefined,
       enabled: formData.get("enabled") === "on",
     };
+    if (hasExplicitUsername) {
+      payload.username = username.trim();
+    }
+    if (hasExplicitPassword) {
+      payload.password = password;
+    }
+    // Always tell the server the source id when copying, so blank auth fields clone source secrets.
+    if (proxyDialogDraft?.sourceProxyId) {
+      payload.copy_credentials_from_proxy_id = proxyDialogDraft.sourceProxyId;
+    }
 
     try {
       await requestApi<EgressProxy>(adminToken, "/api/v1/admin/egress-proxies", {
         method: "POST",
         body: JSON.stringify(payload),
       });
-      setIsCreateDialogOpen(false);
-      setNotice("出口代理已创建。认证信息不会再次显示。");
+      closeProxyDialog();
       await loadEgressProxies();
+      setErrorMessage(null);
+      setNotice(
+        proxyDialogDraft?.sourceProxyId
+          ? "已根据源代理创建副本。未填写的认证凭证已从源代理解密后重新加密保存。"
+          : "出口代理已创建。认证信息不会再次显示。",
+      );
     } catch (error) {
+      setNotice(null);
       setErrorMessage(error instanceof Error ? error.message : "无法创建出口代理。");
     }
   }
@@ -1498,19 +1825,34 @@ function App(): JSX.Element {
   }
 
   async function testProxy(proxy: EgressProxy): Promise<void> {
+    setNotice(null);
+    setErrorMessage(null);
     try {
       const result = await requestApi<ConnectivityResult>(
         adminToken,
         `/api/v1/admin/egress-proxies/${proxy.id}/test`,
         { method: "POST" },
       );
+      // Reload may clear messages; re-apply result after refresh so the user always sees feedback.
+      await loadEgressProxies();
       if (result.successful) {
+        setErrorMessage(null);
         setNotice(`代理 ${proxy.name} 连接测试成功。`);
       } else {
-        setErrorMessage(result.error_summary ?? "代理连接测试失败。");
+        setNotice(null);
+        setErrorMessage(
+          result.error_summary
+            ? `代理 ${proxy.name} 连接测试失败：${result.error_summary}`
+            : `代理 ${proxy.name} 连接测试失败。`,
+        );
       }
-      await loadEgressProxies();
     } catch (error) {
+      try {
+        await loadEgressProxies();
+      } catch {
+        // Keep the original test error even if list refresh fails.
+      }
+      setNotice(null);
       setErrorMessage(error instanceof Error ? error.message : "代理连接测试失败。");
     }
   }
@@ -1772,10 +2114,18 @@ function App(): JSX.Element {
             totalPages={mailboxPagination.totalPages}
             selectedMailboxIds={selectedMailboxIds}
             isRefreshingAccessTokens={isRefreshingAccessTokens}
+            isProbingUnprobedMailboxes={isProbingUnprobedMailboxes}
+            isExportingSelectedMailboxes={isExportingSelectedMailboxes}
+            isDeletingSelectedMailboxes={isDeletingSelectedMailboxes}
+            isDeletingInvalidMailboxes={isDeletingInvalidMailboxes}
             onPageChange={(nextPage) => void changeMailboxPage(nextPage)}
             onOpenImport={openMailboxImportDialog}
             onRefreshAllAccessTokens={() => void refreshAllAccessTokens()}
             onRefreshSelectedAccessTokens={() => void refreshSelectedAccessTokens()}
+            onProbeUnprobedMailboxes={() => void probeUnprobedMailboxes()}
+            onExportSelectedMailboxes={() => void exportSelectedMailboxes()}
+            onDeleteSelectedMailboxes={() => void deleteSelectedMailboxes()}
+            onDeleteInvalidMailboxes={() => void deleteInvalidMailboxes()}
             onToggleAllMailboxSelection={toggleAllMailboxSelection}
             onToggleMailboxSelection={toggleMailboxSelection}
           />
@@ -1813,7 +2163,7 @@ function App(): JSX.Element {
             <h1 className="page-title">出口代理</h1>
             <p className="page-subtitle">按邮箱粘性路由 Microsoft OAuth 与 XOAUTH2 IMAP 流量。</p>
           </div>
-          <button className="button button-primary" type="button" onClick={() => setIsCreateDialogOpen(true)} disabled={!adminToken}>
+          <button className="button button-primary" type="button" onClick={openCreateProxyDialog} disabled={!adminToken}>
             <Plus size={15} /> 添加代理
           </button>
         </header>
@@ -1879,7 +2229,7 @@ function App(): JSX.Element {
                       <strong>{proxy.name}</strong>
                       <div className="muted-copy">{proxy.has_credentials ? "已配置认证" : "无认证"}</div>
                     </td>
-                    <td>{proxy.protocol === "socks5" ? "SOCKS5" : "HTTP CONNECT"}<div className="muted-copy">{proxy.host_preview}:{proxy.port}</div></td>
+                    <td>{proxy.protocol === "socks5" ? "SOCKS5" : "HTTP CONNECT"}<div className="muted-copy">{proxy.host}:{proxy.port}</div></td>
                     <td><StatusBadge proxy={proxy} /></td>
                     <td>{proxy.priority}</td>
                     <td>{proxy.bound_mailbox_count}</td>
@@ -1889,6 +2239,9 @@ function App(): JSX.Element {
                         <button className="button" type="button" onClick={() => void testProxy(proxy)}>测试</button>
                         {proxy.status === "cooldown" && <button className="button" type="button" onClick={() => void recoverProxy(proxy)}>恢复</button>}
                         <button className="button" type="button" onClick={() => void toggleProxy(proxy)}>{proxy.enabled ? "停用" : "启用"}</button>
+                        <button className="button" type="button" onClick={() => openCopyProxyDialog(proxy)}>
+                          <Copy size={14} /> 复制
+                        </button>
                         <button className="button button-danger icon-button" type="button" aria-label={`删除 ${proxy.name}`} onClick={() => void deleteProxy(proxy)}><Trash2 size={14} /></button>
                       </div>
                     </td>
@@ -1903,28 +2256,86 @@ function App(): JSX.Element {
         )}
       </section>
 
-      {activeNavigationSection === "egress-proxies" && isCreateDialogOpen && (
+      {activeNavigationSection === "egress-proxies" && isProxyDialogOpen && proxyDialogDraft && (
         <div className="dialog-backdrop" role="presentation">
-          <form className="dialog" onSubmit={(event) => void createProxy(event)}>
+          <form className="dialog" key={proxyDialogDraft.sourceProxyId ?? "create"} onSubmit={(event) => void createProxy(event)}>
             <div className="section-header">
               <div>
-                <h2 className="section-title">添加出口代理</h2>
-                <p className="page-subtitle">认证凭证仅会加密写入，无法从列表读取。</p>
+                <h2 className="section-title">
+                  {proxyDialogDraft.sourceProxyId ? "复制出口代理" : "添加出口代理"}
+                </h2>
+                <p className="page-subtitle">
+                  {proxyDialogDraft.sourceProxyId
+                    ? "已预填源代理配置，可修改后保存为新代理。未填写用户名/密码时，将从源代理加密复制认证凭证。"
+                    : "认证凭证仅会加密写入，无法从列表读取。"}
+                </p>
               </div>
             </div>
             <div className="form-grid">
-              <label className="form-field">名称<input className="input" name="name" required placeholder="hk-socks-01" /></label>
-              <label className="form-field">协议<select className="select" name="protocol" defaultValue="socks5"><option value="socks5">SOCKS5</option><option value="http_connect">HTTP CONNECT</option></select></label>
-              <label className="form-field">主机<input className="input" name="host" required placeholder="proxy.example.com" /></label>
-              <label className="form-field">端口<input className="input" name="port" type="number" min="1" max="65535" defaultValue="1080" required /></label>
-              <label className="form-field">用户名（可选）<input className="input" name="username" autoComplete="off" /></label>
-              <label className="form-field">密码（可选）<input className="input" name="password" type="password" autoComplete="new-password" /></label>
-              <label className="form-field">优先级<input className="input" name="priority" type="number" min="0" defaultValue="100" required /></label>
-              <label className="checkbox-label" style={{ alignSelf: "end", minHeight: 34 }}><input type="checkbox" name="enabled" defaultChecked /> 创建后立即启用</label>
+              <label className="form-field">
+                名称
+                <input className="input" name="name" required placeholder="hk-socks-01" defaultValue={proxyDialogDraft.name} />
+              </label>
+              <label className="form-field">
+                协议
+                <select className="select" name="protocol" defaultValue={proxyDialogDraft.protocol}>
+                  <option value="socks5">SOCKS5</option>
+                  <option value="http_connect">HTTP CONNECT</option>
+                </select>
+              </label>
+              <label className="form-field">
+                主机
+                <input className="input" name="host" required placeholder="proxy.example.com" defaultValue={proxyDialogDraft.host} />
+              </label>
+              <label className="form-field">
+                端口
+                <input className="input" name="port" type="number" min="1" max="65535" defaultValue={proxyDialogDraft.port} required />
+              </label>
+              <label className="form-field">
+                用户名（可选）
+                <input
+                  className="input"
+                  name="username"
+                  autoComplete="off"
+                  placeholder={
+                    proxyDialogDraft.sourceProxyId && proxyDialogDraft.hasSourceCredentials
+                      ? "留空则沿用源代理用户名"
+                      : undefined
+                  }
+                />
+              </label>
+              <label className="form-field">
+                密码（可选）
+                <input
+                  className="input"
+                  name="password"
+                  type="password"
+                  autoComplete="new-password"
+                  placeholder={
+                    proxyDialogDraft.sourceProxyId && proxyDialogDraft.hasSourceCredentials
+                      ? "留空则沿用源代理密码"
+                      : undefined
+                  }
+                />
+              </label>
+              <label className="form-field">
+                优先级
+                <input className="input" name="priority" type="number" min="0" defaultValue={proxyDialogDraft.priority} required />
+              </label>
+              <label className="checkbox-label" style={{ alignSelf: "end", minHeight: 34 }}>
+                <input type="checkbox" name="enabled" defaultChecked={proxyDialogDraft.enabled} /> 创建后立即启用
+              </label>
             </div>
+            {proxyDialogDraft.sourceProxyId && proxyDialogDraft.hasSourceCredentials && (
+              <p className="muted-copy" style={{ marginTop: 12 }}>
+                源代理已配置认证。若用户名与密码都留空，将自动复制源代理的加密凭证；若填写任一字段，则以本次输入为准。
+              </p>
+            )}
             <div className="dialog-actions">
-              <button className="button" type="button" onClick={() => setIsCreateDialogOpen(false)}>取消</button>
-              <button className="button button-primary" type="submit">安全保存</button>
+              <button className="button" type="button" onClick={closeProxyDialog}>取消</button>
+              <button className="button button-primary" type="submit">
+                {proxyDialogDraft.sourceProxyId ? "创建副本" : "安全保存"}
+              </button>
             </div>
           </form>
         </div>

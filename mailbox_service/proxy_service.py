@@ -510,13 +510,23 @@ class ProxyIMAP4SSL(imaplib.IMAP4_SSL):
     def open(self, host: str, port: int, timeout: float | None = None) -> None:
         """Use the prepared socket instead of opening a direct TCP connection.
 
-        Python 3.12+ exposes ``file`` as a read-only property backed by ``_file``.
-        Assign the makefile handle to ``_file`` so IMAP commands can read responses.
+        CPython versions differ on the makefile handle attribute:
+
+        - Python <= 3.13: ``imaplib`` reads/writes ``self.file``
+        - Python 3.14+: ``file`` is a read-only property backed by ``self._file``
+
+        Always populate ``_file``. Also set ``file`` when it is a plain attribute so
+        production images on 3.12 do not fall through IMAP4.__getattr__ and raise
+        ``Unknown IMAP4 command: 'file'`` during AUTHENTICATE.
         """
         ssl_context = ssl.create_default_context()
         self.sock = ssl_context.wrap_socket(self._connected_socket, server_hostname=self._server_hostname)
         self.sock.settimeout(timeout or self._timeout_seconds)
-        self._file = self.sock.makefile("rb")
+        makefile_stream = self.sock.makefile("rb")
+        self._file = makefile_stream
+        file_descriptor = getattr(type(self), "file", None)
+        if not isinstance(file_descriptor, property):
+            self.file = makefile_stream
 
 
 class MicrosoftIMAPClient:

@@ -17,7 +17,7 @@ from mailbox_service.capability_probe_service import (
     apply_capability_probe_result,
 )
 from mailbox_service.config import Settings
-from mailbox_service.models import Lease, Mailbox, MailboxStatus, utc_now
+from mailbox_service.models import Lease, Mailbox, MailboxCapability, MailboxStatus, utc_now
 from mailbox_service.proxy_service import MicrosoftInvalidGrantError, MicrosoftOAuthError, MicrosoftTokenResponse
 from mailbox_service.security import CredentialCipher, summarize_exception
 
@@ -80,6 +80,19 @@ class MailboxAccessTokenRefreshResult:
 
     successful: int
     failed: int
+    results: list[MailboxAccessTokenRefreshItem]
+
+
+@dataclass(frozen=True)
+class MailboxUnprobedRefreshResult:
+    """Batch result for probing mailboxes that still lack a known usable capability."""
+
+    candidate_total: int
+    processed: int
+    successful: int
+    failed: int
+    remaining_candidates: int
+    batch_size: int
     results: list[MailboxAccessTokenRefreshItem]
 
 
@@ -319,6 +332,72 @@ class MailboxAccessTokenService:
         if not due_mailbox_ids:
             return MailboxAccessTokenRefreshResult(successful=0, failed=0, results=[])
         return self.refresh_access_tokens(due_mailbox_ids)
+
+    def _unprobed_or_unknown_capability_filter(self):
+        """Select active mailboxes that still need RT validation / capability probing.
+
+        Targets freshly imported rows (capability IS NULL) and previous probe outcomes that
+        stayed at ``unknown`` because transport mixed with auth failures. Requires client_id
+        and refresh_token so the force-refresh path can actually call Microsoft.
+        """
+        return (
+            Mailbox.status == MailboxStatus.ACTIVE,
+            Mailbox.client_id.is_not(None),
+            Mailbox.refresh_token_ciphertext.is_not(None),
+            (Mailbox.capability.is_(None)) | (Mailbox.capability == MailboxCapability.UNKNOWN),
+        )
+
+    def count_unprobed_or_unknown_mailbox_ids(self) -> int:
+        """Return how many active mailboxes still need capability/RT recognition."""
+        return int(
+            self._session.scalar(
+                select(func.count(Mailbox.id)).where(*self._unprobed_or_unknown_capability_filter())
+            )
+            or 0
+        )
+
+    def list_unprobed_or_unknown_mailbox_ids(self, *, batch_size: int) -> list[str]:
+        """Return one batch of unprobed/unknown active mailbox IDs for administrative probing."""
+        return list(
+            self._session.scalars(
+                select(Mailbox.id)
+                .where(*self._unprobed_or_unknown_capability_filter())
+                .order_by(Mailbox.created_at.asc(), Mailbox.primary_email.asc())
+                .limit(batch_size)
+            )
+        )
+
+    def refresh_unprobed_or_unknown_access_tokens(self, *, batch_size: int = 50) -> MailboxUnprobedRefreshResult:
+        """Force-refresh one batch of unprobed/unknown mailboxes to classify usable vs invalid RT.
+
+        Successful rows get a fresh AT and capability probe (imap/graph/unusable/unknown).
+        ``invalid_grant`` failures mark the mailbox ``invalid`` inside ``ensure_access_token``.
+        """
+        bounded_batch_size = max(1, min(batch_size, 200))
+        candidate_total = self.count_unprobed_or_unknown_mailbox_ids()
+        target_mailbox_ids = self.list_unprobed_or_unknown_mailbox_ids(batch_size=bounded_batch_size)
+        if not target_mailbox_ids:
+            return MailboxUnprobedRefreshResult(
+                candidate_total=candidate_total,
+                processed=0,
+                successful=0,
+                failed=0,
+                remaining_candidates=0,
+                batch_size=bounded_batch_size,
+                results=[],
+            )
+
+        batch_result = self.refresh_access_tokens(target_mailbox_ids)
+        remaining_candidates = self.count_unprobed_or_unknown_mailbox_ids()
+        return MailboxUnprobedRefreshResult(
+            candidate_total=candidate_total,
+            processed=len(target_mailbox_ids),
+            successful=batch_result.successful,
+            failed=batch_result.failed,
+            remaining_candidates=remaining_candidates,
+            batch_size=bounded_batch_size,
+            results=batch_result.results,
+        )
 
     def _has_usable_cached_access_token(self, mailbox: Mailbox) -> bool:
         if not mailbox.access_token_ciphertext or mailbox.access_token_expires_at is None:

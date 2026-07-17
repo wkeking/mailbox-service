@@ -21,6 +21,12 @@ class EgressProxyCreate(BaseModel):
     password: str | None = Field(default=None, max_length=4096, description="代理认证密码；可选，不会在列表中回显。")
     enabled: bool = Field(default=True, description="创建后是否立即启用。")
     priority: int = Field(default=100, ge=0, le=1_000_000, description="选择优先级，数值越小越优先。")
+    # When set and username/password are both omitted, encrypted credentials are cloned server-side.
+    copy_credentials_from_proxy_id: str | None = Field(
+        default=None,
+        max_length=36,
+        description="从已有代理复制已加密凭证；未填写 username/password 时生效，明文不会返回前端。",
+    )
 
     @field_validator("name", "host")
     @classmethod
@@ -63,7 +69,8 @@ class EgressProxyResponse(BaseModel):
     id: str = Field(description="代理唯一 ID。")
     name: str = Field(description="代理显示名称。")
     protocol: EgressProxyProtocol = Field(description="代理协议。")
-    host_preview: str = Field(description="脱敏后的主机预览，不暴露完整地址。")
+    host: str = Field(description="代理主机名或 IP（管理接口完整返回，便于复制编辑）。")
+    host_preview: str = Field(description="脱敏后的主机预览，用于列表展示。")
     port: int = Field(description="代理端口。")
     enabled: bool = Field(description="是否启用。")
     priority: int = Field(description="选择优先级，数值越小越优先。")
@@ -164,6 +171,50 @@ class MailboxImportResponse(BaseModel):
     errors: list[MailboxImportLineError] = Field(description="失败行明细。")
 
 
+class MailboxBatchIdsRequest(BaseModel):
+    """按邮箱 ID 批量操作的请求体。"""
+
+    mailbox_ids: list[str] = Field(
+        min_length=1,
+        max_length=500,
+        description="待操作邮箱 ID 列表；会自动去重，最多 500 个。",
+    )
+
+    @field_validator("mailbox_ids")
+    @classmethod
+    def normalize_mailbox_ids(cls, mailbox_ids: list[str]) -> list[str]:
+        """Strip, drop blanks, and de-duplicate while preserving first-seen order."""
+        ordered_unique_mailbox_ids: list[str] = []
+        seen_mailbox_ids: set[str] = set()
+        for raw_mailbox_id in mailbox_ids:
+            normalized_mailbox_id = raw_mailbox_id.strip()
+            if not normalized_mailbox_id or normalized_mailbox_id in seen_mailbox_ids:
+                continue
+            seen_mailbox_ids.add(normalized_mailbox_id)
+            ordered_unique_mailbox_ids.append(normalized_mailbox_id)
+        if not ordered_unique_mailbox_ids:
+            raise ValueError("至少需要提供一个有效的邮箱 ID")
+        if len(ordered_unique_mailbox_ids) > 500:
+            raise ValueError("单次最多处理 500 个邮箱 ID")
+        return ordered_unique_mailbox_ids
+
+
+class MailboxBatchDeleteResponse(BaseModel):
+    """选中邮箱批量删除结果。"""
+
+    deleted: int = Field(description="实际删除的邮箱数量。")
+    deleted_mailbox_ids: list[str] = Field(description="已删除的邮箱 ID 列表。")
+    missing_mailbox_ids: list[str] = Field(description="请求中不存在的邮箱 ID 列表。")
+
+
+class MailboxDeleteInvalidResponse(BaseModel):
+    """删除全部失效邮箱的结果。"""
+
+    deleted: int = Field(description="实际删除的失效邮箱数量。")
+    deleted_mailbox_ids: list[str] = Field(description="已删除的邮箱 ID 列表。")
+    deleted_primary_emails: list[str] = Field(description="已删除的主邮箱地址列表。")
+
+
 class MailboxAccessTokenResponse(BaseModel):
     """受保护接口返回的可用 Access Token。"""
 
@@ -200,6 +251,29 @@ class MailboxAccessTokenRefreshResponse(BaseModel):
     successful: int = Field(description="成功数量。")
     failed: int = Field(description="失败数量。")
     results: list[MailboxAccessTokenRefreshItemResponse] = Field(description="逐邮箱结果列表。")
+
+
+class MailboxUnprobedRefreshRequest(BaseModel):
+    """对未探测 / 能力未知邮箱分批刷新 RT/AT 的请求。"""
+
+    batch_size: int = Field(
+        default=50,
+        ge=1,
+        le=200,
+        description="本批最多处理的邮箱数量，默认 50，上限 200。",
+    )
+
+
+class MailboxUnprobedRefreshResponse(BaseModel):
+    """未探测 / 未知能力邮箱分批刷新结果。"""
+
+    candidate_total: int = Field(description="操作前仍待识别的邮箱总数（未探测或 capability=unknown）。")
+    processed: int = Field(description="本批实际处理数量。")
+    successful: int = Field(description="本批刷新成功数量。")
+    failed: int = Field(description="本批刷新失败数量。")
+    remaining_candidates: int = Field(description="本批结束后仍待识别的邮箱数量。")
+    batch_size: int = Field(description="本批请求使用的 batch_size。")
+    results: list[MailboxAccessTokenRefreshItemResponse] = Field(description="本批逐邮箱结果列表。")
 
 
 class DashboardSummaryResponse(BaseModel):

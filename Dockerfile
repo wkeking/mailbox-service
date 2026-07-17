@@ -3,7 +3,8 @@
 # Frontend is baked into the image and served by FastAPI on the same origin.
 
 ARG NODE_IMAGE=node:22-bookworm-slim
-ARG PYTHON_IMAGE=python:3.12-slim-bookworm
+# Keep the image runtime aligned with local development (Python 3.14).
+ARG PYTHON_IMAGE=python:3.14-slim-bookworm
 
 # ---------------------------------------------------------------------------
 # Stage 1: build the React admin UI

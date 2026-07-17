@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from base64 import urlsafe_b64encode
+from unittest.mock import MagicMock, patch
 
 import pytest
 from sqlalchemy import create_engine
@@ -11,7 +12,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from mailbox_service.config import Settings
 from mailbox_service.database import Base
 from mailbox_service.models import EgressProxy, EgressProxyProtocol, EgressProxyStatus, Mailbox
-from mailbox_service.proxy_service import EgressProxyService, NoHealthyEgressProxyError
+from mailbox_service.proxy_service import EgressProxyService, NoHealthyEgressProxyError, ProxyIMAP4SSL
 from mailbox_service.security import CredentialCipher
 
 
@@ -125,3 +126,35 @@ def test_proxy_credentials_are_encrypted_and_hidden_from_representation() -> Non
 def test_orm_enum_values_match_the_mysql_migration_contract() -> None:
     """Avoid storing Python enum names that MySQL ENUM columns do not accept."""
     assert EgressProxy.__table__.c.protocol.type.enums == ["http_connect", "socks5"]
+
+
+def test_proxy_imap_open_exposes_makefile_stream_for_current_python() -> None:
+    """ProxyIMAP4SSL must wire the makefile stream so AUTHENTICATE can read responses.
+
+    Production images currently run Python 3.12 where imaplib expects ``self.file``.
+    Local/dev may already be on 3.14 where ``file`` is a read-only property over ``_file``.
+    Either shape must expose a readable stream without falling through IMAP4.__getattr__.
+    """
+
+    class FakeSocket:
+        def makefile(self, mode: str) -> object:
+            assert mode == "rb"
+            return object()
+
+        def settimeout(self, timeout_seconds: float | None) -> None:
+            return None
+
+    client = ProxyIMAP4SSL.__new__(ProxyIMAP4SSL)
+    client._connected_socket = FakeSocket()
+    client._server_hostname = "outlook.office365.com"
+    client._timeout_seconds = 5.0
+
+    with patch("mailbox_service.proxy_service.ssl.create_default_context") as create_default_context:
+        ssl_context = MagicMock()
+        ssl_context.wrap_socket.return_value = FakeSocket()
+        create_default_context.return_value = ssl_context
+        ProxyIMAP4SSL.open(client, "outlook.office365.com", 993, 5.0)
+
+    assert getattr(client, "_file", None) is not None
+    # Accessing .file must resolve to the makefile stream, never IMAP4.__getattr__.
+    assert client.file is client._file

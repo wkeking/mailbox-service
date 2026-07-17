@@ -14,6 +14,8 @@
 
 ## 本地启动
 
+运行时统一为 **Python 3.14**（与 Docker 镜像、`.python-version` 一致）。请使用 3.14 创建虚拟环境，避免与生产 stdlib 行为不一致。
+
 1. 创建 MySQL 数据库（schema 迁移可交给服务启动时自动执行）：
 
    ```bash
@@ -35,10 +37,11 @@
    python -c "import base64, os; print(base64.urlsafe_b64encode(os.urandom(32)).decode())"
    ```
 
-3. 使用虚拟环境安装并运行后端：
+3. 使用虚拟环境安装并运行后端（需 Python 3.14）：
 
    ```bash
-   python -m venv .venv
+   python3.14 -m venv .venv
+   .venv/bin/python -V   # 应输出 Python 3.14.x
    .venv/bin/python -m pip install -e ".[dev]"
    .venv/bin/python -m uvicorn mailbox_service.main:app --reload
    ```
@@ -159,7 +162,8 @@ SPA / 某些 OTP 流程可能是 24 小时；个人 Outlook / Hotmail 常见为 
 
 ## Docker 镜像打包与 ARM 服务器部署
 
-镜像为多阶段构建：Node 编译管理台 + Python 运行 FastAPI，**默认目标平台 `linux/arm64`**。  
+镜像为多阶段构建：Node 编译管理台 + **Python 3.14** 运行 FastAPI，**默认目标平台 `linux/arm64`**。  
+基座镜像为 `python:3.14-slim-bookworm`，与本地开发版本对齐。  
 默认镜像名：**`registry.example.com/mailbox-service:latest`**；`./scripts/build-image.sh` **默认构建后自动推送**到该私有仓库。`docker-compose.yml` 默认 `image` 与此一致。
 
 相关文件：

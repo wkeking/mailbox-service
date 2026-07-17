@@ -12,12 +12,12 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
 from fastapi.openapi.utils import get_openapi
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.routing import APIRoute
 from fastapi.security import APIKeyHeader
 from fastapi.staticfiles import StaticFiles
 from email_validator import EmailNotValidError, validate_email
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -83,11 +83,16 @@ from mailbox_service.schemas import (
     MailboxAccessTokenRefreshRequest,
     MailboxAccessTokenRefreshResponse,
     MailboxAccessTokenResponse,
+    MailboxBatchDeleteResponse,
+    MailboxBatchIdsRequest,
+    MailboxDeleteInvalidResponse,
     MailboxImportLineError,
     MailboxImportRequest,
     MailboxImportResponse,
     MailboxListItemResponse,
     MailboxListResponse,
+    MailboxUnprobedRefreshRequest,
+    MailboxUnprobedRefreshResponse,
     ProxyBindingUpdate,
     ProxyBoundMailboxResponse,
     ProxyConnectivityTestResponse,
@@ -197,6 +202,16 @@ OPENAPI_OPERATION_DOCUMENTATION: dict[tuple[str, str], tuple[str, str, str]] = {
         "按照四段文本格式批量导入邮箱凭证，密码和 Refresh Token 加密保存。",
         "邮箱管理",
     ),
+    ("POST", "/api/v1/admin/mailboxes/export"): (
+        "导出选中邮箱",
+        "按导入相同的四段文本格式导出选中邮箱凭证明文，响应为 text/plain 的 txt 内容。",
+        "邮箱管理",
+    ),
+    ("POST", "/api/v1/admin/mailboxes/delete"): (
+        "删除选中邮箱",
+        "按邮箱 ID 批量删除选中邮箱；关联租约会一并删除，操作不可恢复。",
+        "邮箱管理",
+    ),
     ("POST", "/api/v1/admin/mailboxes/{mailbox_id}/access-token"): (
         "获取可用 Access Token",
         "缓存未过期时返回现有 Access Token；缓存过期或不存在时刷新并更新数据库。",
@@ -205,6 +220,16 @@ OPENAPI_OPERATION_DOCUMENTATION: dict[tuple[str, str], tuple[str, str, str]] = {
     ("POST", "/api/v1/admin/mailboxes/access-tokens/refresh"): (
         "批量刷新 RT/AT",
         "强制刷新选中邮箱或全部可用邮箱的 Token；Microsoft 返回新 Refresh Token 时同步保存。",
+        "邮箱管理",
+    ),
+    ("POST", "/api/v1/admin/mailboxes/access-tokens/refresh-unprobed"): (
+        "分批识别未探测邮箱",
+        "对 capability 为空或 unknown 的 active 邮箱分批强制刷新 RT/AT，识别可用与失效凭证。",
+        "邮箱管理",
+    ),
+    ("POST", "/api/v1/admin/mailboxes/delete-invalid"): (
+        "删除全部失效邮箱",
+        "删除 status=invalid 的全部邮箱及其关联租约，操作不可恢复。",
         "邮箱管理",
     ),
     ("GET", "/api/v1/admin/leases"): (
@@ -328,12 +353,17 @@ OPENAPI_SCHEMA_DESCRIPTIONS = {
     "MailboxAccessTokenRefreshRequest": "批量刷新请求；邮箱 ID 为空时刷新全部可用邮箱。",
     "MailboxAccessTokenRefreshResponse": "批量刷新汇总响应，不返回 Token 明文。",
     "MailboxAccessTokenResponse": "受保护接口返回的可用 Access Token。",
+    "MailboxBatchDeleteResponse": "选中邮箱批量删除结果。",
+    "MailboxBatchIdsRequest": "按邮箱 ID 批量操作的请求体。",
+    "MailboxDeleteInvalidResponse": "删除全部失效邮箱的结果。",
     "MailboxImportLineError": "邮箱导入内容中的单行错误。",
     "MailboxImportRequest": "四段文本格式的邮箱批量导入请求。",
     "MailboxImportResponse": "邮箱批量导入结果汇总。",
     "MailboxListItemResponse": "邮箱管理列表项，不包含敏感凭证明文。",
     "MailboxListResponse": "邮箱分页查询响应。",
     "MailboxStatus": "邮箱健康状态，与当前是否存在租约相互独立。",
+    "MailboxUnprobedRefreshRequest": "对未探测 / 能力未知邮箱分批刷新 RT/AT 的请求。",
+    "MailboxUnprobedRefreshResponse": "未探测 / 未知能力邮箱分批刷新结果。",
     "ProxyBindingUpdate": "邮箱出口代理绑定更新请求；空值表示请求直连。",
     "ProxyBoundMailboxResponse": "出口代理影响范围中的邮箱信息。",
     "ProxyConnectivityTestResponse": "出口代理连通性测试结果。",
@@ -783,6 +813,7 @@ def serialize_proxy(proxy: EgressProxy, bound_mailbox_count: int = 0) -> EgressP
         id=proxy.id,
         name=proxy.name,
         protocol=proxy.protocol,
+        host=proxy.host,
         host_preview=redact_proxy_host(proxy.host),
         port=proxy.port,
         enabled=proxy.enabled,
@@ -872,6 +903,16 @@ def resolve_proxy_credential_fingerprint(
         password,
         hmac_key=cipher.hmac_key if cipher is not None else None,
     )
+
+
+def _normalize_optional_proxy_secret(value: str | None) -> str | None:
+    """Treat missing/blank form values as omitted so copy dialogs can clone credentials."""
+    if value is None:
+        return None
+    # Passwords may intentionally contain only spaces; only pure empty means omitted.
+    if value == "":
+        return None
+    return value
 
 
 def read_proxy_plaintext_credentials(
@@ -1452,6 +1493,155 @@ def import_mailboxes(
     )
 
 
+def format_mailbox_import_line(
+    primary_email: str,
+    mail_password: str,
+    client_id: str,
+    refresh_token: str,
+) -> str:
+    """Serialize one mailbox into the same four-segment text format used by import."""
+    return f"{primary_email}----{mail_password}----{client_id}----{refresh_token}"
+
+
+def load_mailboxes_by_ids(session: Session, mailbox_ids: list[str]) -> tuple[list[Mailbox], list[str]]:
+    """Load mailboxes for the requested IDs, preserving request order and reporting missing IDs."""
+    if not mailbox_ids:
+        return [], []
+
+    mailboxes = list(session.scalars(select(Mailbox).where(Mailbox.id.in_(mailbox_ids))).all())
+    mailbox_by_id = {mailbox.id: mailbox for mailbox in mailboxes}
+    ordered_mailboxes = [mailbox_by_id[mailbox_id] for mailbox_id in mailbox_ids if mailbox_id in mailbox_by_id]
+    missing_mailbox_ids = [mailbox_id for mailbox_id in mailbox_ids if mailbox_id not in mailbox_by_id]
+    return ordered_mailboxes, missing_mailbox_ids
+
+
+@app.post("/api/v1/admin/mailboxes/export")
+def export_mailboxes(
+    payload: MailboxBatchIdsRequest,
+    session: SessionDependency,
+    settings: SettingsDependency,
+    admin_id: AdminDependency,
+) -> PlainTextResponse:
+    """Export selected mailbox credentials using the import four-segment text format."""
+    cipher = get_credential_cipher(settings)
+    if cipher is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "CREDENTIAL_ENCRYPTION_NOT_CONFIGURED", "message": "未配置凭证加密密钥"},
+        )
+
+    mailboxes, missing_mailbox_ids = load_mailboxes_by_ids(session, payload.mailbox_ids)
+    if missing_mailbox_ids:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "code": "MAILBOX_NOT_FOUND",
+                "message": f"有 {len(missing_mailbox_ids)} 个邮箱不存在，无法导出",
+                "missing_mailbox_ids": missing_mailbox_ids,
+            },
+        )
+
+    incomplete_mailbox_emails: list[str] = []
+    export_lines: list[str] = []
+    for mailbox in mailboxes:
+        if (
+            not mailbox.primary_email
+            or not mailbox.client_id
+            or not mailbox.mail_password_ciphertext
+            or not mailbox.refresh_token_ciphertext
+        ):
+            incomplete_mailbox_emails.append(mailbox.primary_email)
+            continue
+        try:
+            mail_password = cipher.decrypt(mailbox.mail_password_ciphertext)
+            refresh_token = cipher.decrypt(mailbox.refresh_token_ciphertext)
+        except Exception as error:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail={
+                    "code": "MAILBOX_CREDENTIAL_DECRYPT_FAILED",
+                    "message": f"邮箱 {mailbox.primary_email} 凭证解密失败：{summarize_exception(error)}",
+                },
+            ) from error
+        if not mail_password or not refresh_token:
+            incomplete_mailbox_emails.append(mailbox.primary_email)
+            continue
+        export_lines.append(
+            format_mailbox_import_line(
+                mailbox.primary_email,
+                mail_password,
+                mailbox.client_id,
+                refresh_token,
+            )
+        )
+
+    if incomplete_mailbox_emails:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "MAILBOX_CREDENTIALS_INCOMPLETE",
+                "message": f"有 {len(incomplete_mailbox_emails)} 个邮箱缺少可导出凭证，无法生成完整导入格式",
+                "incomplete_primary_emails": incomplete_mailbox_emails,
+            },
+        )
+
+    create_audit_log(
+        session,
+        admin_id,
+        "mailbox.exported",
+        "mailbox",
+        None,
+        {"exported": len(export_lines), "mailbox_ids": payload.mailbox_ids},
+    )
+    export_content = "\n".join(export_lines)
+    if export_content:
+        export_content += "\n"
+    return PlainTextResponse(
+        content=export_content,
+        media_type="text/plain; charset=utf-8",
+        headers={
+            "Content-Disposition": 'attachment; filename="mailboxes-export.txt"',
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+@app.post("/api/v1/admin/mailboxes/delete", response_model=MailboxBatchDeleteResponse)
+def delete_mailboxes(
+    payload: MailboxBatchIdsRequest,
+    session: SessionDependency,
+    admin_id: AdminDependency,
+) -> MailboxBatchDeleteResponse:
+    """Delete selected mailboxes and cascade-related leases; missing IDs are reported, not fatal."""
+    mailboxes, missing_mailbox_ids = load_mailboxes_by_ids(session, payload.mailbox_ids)
+    deleted_mailbox_ids = [mailbox.id for mailbox in mailboxes]
+    deleted_primary_emails = [mailbox.primary_email for mailbox in mailboxes]
+
+    if deleted_mailbox_ids:
+        session.execute(delete(Lease).where(Lease.mailbox_id.in_(deleted_mailbox_ids)))
+        session.execute(delete(Mailbox).where(Mailbox.id.in_(deleted_mailbox_ids)))
+        session.flush()
+        create_audit_log(
+            session,
+            admin_id,
+            "mailbox.deleted",
+            "mailbox",
+            None,
+            {
+                "deleted": len(deleted_mailbox_ids),
+                "deleted_mailbox_ids": deleted_mailbox_ids,
+                "deleted_primary_emails": deleted_primary_emails,
+                "missing_mailbox_ids": missing_mailbox_ids,
+            },
+        )
+
+    return MailboxBatchDeleteResponse(
+        deleted=len(deleted_mailbox_ids),
+        deleted_mailbox_ids=deleted_mailbox_ids,
+        missing_mailbox_ids=missing_mailbox_ids,
+    )
+
+
 @app.post("/api/v1/admin/mailboxes/{mailbox_id}/access-token", response_model=MailboxAccessTokenResponse)
 def get_mailbox_access_token(
     mailbox_id: str,
@@ -1510,6 +1700,95 @@ def refresh_mailbox_access_tokens(
             }
             for item in result.results
         ],
+    )
+
+
+@app.post(
+    "/api/v1/admin/mailboxes/access-tokens/refresh-unprobed",
+    response_model=MailboxUnprobedRefreshResponse,
+)
+def refresh_unprobed_mailbox_access_tokens(
+    payload: MailboxUnprobedRefreshRequest,
+    access_token_service: AccessTokenServiceDependency,
+    session: SessionDependency,
+    admin_id: AdminDependency,
+) -> MailboxUnprobedRefreshResponse:
+    """Force-refresh one batch of unprobed/unknown mailboxes to classify usable vs invalid RT."""
+    result = access_token_service.refresh_unprobed_or_unknown_access_tokens(batch_size=payload.batch_size)
+    create_audit_log(
+        session,
+        admin_id,
+        "mailbox.unprobed_refreshed",
+        "mailbox",
+        None,
+        {
+            "candidate_total": result.candidate_total,
+            "processed": result.processed,
+            "successful": result.successful,
+            "failed": result.failed,
+            "remaining_candidates": result.remaining_candidates,
+            "batch_size": result.batch_size,
+        },
+    )
+    return MailboxUnprobedRefreshResponse(
+        candidate_total=result.candidate_total,
+        processed=result.processed,
+        successful=result.successful,
+        failed=result.failed,
+        remaining_candidates=result.remaining_candidates,
+        batch_size=result.batch_size,
+        results=[
+            {
+                "mailbox_id": item.mailbox_id,
+                "primary_email": item.primary_email,
+                "successful": item.successful,
+                "refreshed": item.refreshed,
+                "refresh_token_rotated": item.refresh_token_rotated,
+                "access_token_expires_at": item.access_token_expires_at,
+                "error_summary": item.error_summary,
+            }
+            for item in result.results
+        ],
+    )
+
+
+@app.post("/api/v1/admin/mailboxes/delete-invalid", response_model=MailboxDeleteInvalidResponse)
+def delete_invalid_mailboxes(
+    session: SessionDependency,
+    admin_id: AdminDependency,
+) -> MailboxDeleteInvalidResponse:
+    """Delete every mailbox currently marked invalid and cascade-related leases."""
+    invalid_mailboxes = list(
+        session.scalars(
+            select(Mailbox)
+            .where(Mailbox.status == MailboxStatus.INVALID)
+            .order_by(Mailbox.primary_email.asc())
+        ).all()
+    )
+    deleted_mailbox_ids = [mailbox.id for mailbox in invalid_mailboxes]
+    deleted_primary_emails = [mailbox.primary_email for mailbox in invalid_mailboxes]
+
+    if deleted_mailbox_ids:
+        session.execute(delete(Lease).where(Lease.mailbox_id.in_(deleted_mailbox_ids)))
+        session.execute(delete(Mailbox).where(Mailbox.id.in_(deleted_mailbox_ids)))
+        session.flush()
+        create_audit_log(
+            session,
+            admin_id,
+            "mailbox.invalid_deleted",
+            "mailbox",
+            None,
+            {
+                "deleted": len(deleted_mailbox_ids),
+                "deleted_mailbox_ids": deleted_mailbox_ids,
+                "deleted_primary_emails": deleted_primary_emails,
+            },
+        )
+
+    return MailboxDeleteInvalidResponse(
+        deleted=len(deleted_mailbox_ids),
+        deleted_mailbox_ids=deleted_mailbox_ids,
+        deleted_primary_emails=deleted_primary_emails,
     )
 
 
@@ -1596,20 +1875,67 @@ def create_egress_proxy(
 ) -> EgressProxyResponse:
     """Register an egress proxy and encrypt any supplied authentication material."""
     cipher = get_credential_cipher(settings)
-    if (payload.username is not None or payload.password is not None) and cipher is None:
+    # Empty strings mean "not provided" so copy dialogs can leave fields blank.
+    provided_username = _normalize_optional_proxy_secret(payload.username)
+    provided_password = _normalize_optional_proxy_secret(payload.password)
+    source_username: str | None = None
+    source_password: str | None = None
+
+    if payload.copy_credentials_from_proxy_id:
+        source_proxy = get_proxy_or_404(session, payload.copy_credentials_from_proxy_id)
+        if cipher is None and (
+            source_proxy.username_ciphertext is not None or source_proxy.password_ciphertext is not None
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={
+                    "code": "CREDENTIAL_ENCRYPTION_NOT_CONFIGURED",
+                    "message": "未配置凭证加密密钥，无法从源代理复制认证凭证",
+                },
+            )
+        try:
+            source_username, source_password = read_proxy_plaintext_credentials(source_proxy, cipher)
+        except Exception as error:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "code": "EGRESS_PROXY_CREDENTIAL_COPY_FAILED",
+                    "message": "无法解密源代理认证凭证，请手动填写用户名和密码",
+                },
+            ) from error
+
+    # Prefer explicit form values; otherwise fall back to decrypted source secrets.
+    final_username = provided_username if provided_username is not None else source_username
+    final_password = provided_password if provided_password is not None else source_password
+    needs_encryption = final_username is not None or final_password is not None
+    if needs_encryption and cipher is None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail={"code": "CREDENTIAL_ENCRYPTION_NOT_CONFIGURED", "message": "未配置凭证加密密钥"},
         )
+
+    # Always encrypt plaintext once. Never store ciphertext copied from another row
+    # without decrypt, so we never double-encrypt or persist unusable blobs.
+    username_ciphertext = (
+        cipher.encrypt(final_username) if final_username is not None and cipher is not None else None
+    )
+    password_ciphertext = (
+        cipher.encrypt(final_password) if final_password is not None and cipher is not None else None
+    )
+    credential_fingerprint = resolve_proxy_credential_fingerprint(
+        final_username,
+        final_password,
+        cipher,
+    )
 
     proxy = EgressProxy(
         name=payload.name,
         protocol=payload.protocol,
         host=payload.host,
         port=payload.port,
-        username_ciphertext=cipher.encrypt(payload.username) if payload.username is not None and cipher else None,
-        password_ciphertext=cipher.encrypt(payload.password) if payload.password is not None and cipher else None,
-        credential_fingerprint=resolve_proxy_credential_fingerprint(payload.username, payload.password, cipher),
+        username_ciphertext=username_ciphertext,
+        password_ciphertext=password_ciphertext,
+        credential_fingerprint=credential_fingerprint,
         enabled=payload.enabled,
         priority=payload.priority,
     )
@@ -1779,7 +2105,7 @@ def test_egress_proxy(
         return ProxyConnectivityTestResponse(
             successful=False,
             error_code="PROXY_CONNECTIVITY_TEST_FAILED",
-            error_summary="代理连接测试失败。",
+            error_summary=str(error) or "代理连接测试失败。",
         )
     except Exception as error:
         return ProxyConnectivityTestResponse(
