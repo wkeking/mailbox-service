@@ -9,10 +9,8 @@ from email.header import decode_header, make_header
 from email.message import Message
 from email.utils import getaddresses, parsedate_to_datetime
 import imaplib
-import json
 import re
 import time
-from pathlib import Path
 from typing import Literal
 from urllib.parse import quote
 
@@ -61,40 +59,6 @@ RECIPIENT_HEADER_NAMES = (
     "X-Original-To",
     "X-Envelope-To",
 )
-# region agent log
-_DEBUG_LOG_PATHS = (
-    Path("/path/to/mailbox-service/.cursor/debug-f3384b.log"),
-    Path("/tmp/debug-f3384b.log"),
-)
-
-
-def _agent_debug_log(
-    *,
-    location: str,
-    message: str,
-    hypothesis_id: str,
-    data: dict[str, object],
-) -> None:
-    """Append one NDJSON debug line for runtime hypothesis verification."""
-    payload = {
-        "sessionId": "f3384b",
-        "timestamp": int(time.time() * 1000),
-        "location": location,
-        "message": message,
-        "hypothesisId": hypothesis_id,
-        "data": data,
-    }
-    line = json.dumps(payload, ensure_ascii=False, default=str) + "\n"
-    for log_path in _DEBUG_LOG_PATHS:
-        try:
-            log_path.parent.mkdir(parents=True, exist_ok=True)
-            with log_path.open("a", encoding="utf-8") as log_file:
-                log_file.write(line)
-        except Exception:  # noqa: BLE001 - debug logging must never break mail reads.
-            continue
-
-
-# endregion
 
 MailReadChannel = Literal["imap", "graph"]
 
@@ -280,14 +244,6 @@ class MicrosoftGraphMailReader:
                 folder_count += 1
             folder_scan_summary[folder_name] = folder_count
 
-        # region agent log
-        _agent_debug_log(
-            location="verification_code_service.py:graph_list",
-            message="graph folder scan summary",
-            hypothesis_id="H1_junk_folder",
-            data={"folder_scan_summary": folder_scan_summary, "candidate_count": len(candidates)},
-        )
-        # endregion
         return candidates
 
 
@@ -334,6 +290,10 @@ class VerificationCodeService:
         )
         attempts = 0
         last_error: Exception | None = None
+        # Track whether any channel scan ever completed. Distinguishes "inbox reachable but no
+        # matching code" from "every scan failed", so persistent transport errors are not
+        # silently reported as an empty result.
+        any_scan_succeeded = False
 
         while True:
             attempts += 1
@@ -356,25 +316,7 @@ class VerificationCodeService:
                 except Exception as error:  # noqa: BLE001 - continue alternate channel / retry.
                     last_error = error
                     continue
-                # region agent log
-                _agent_debug_log(
-                    location="verification_code_service.py:wait_loop",
-                    message="channel scan result before match",
-                    hypothesis_id="H1_junk_folder",
-                    data={
-                        "attempt": attempts,
-                        "channel": channel,
-                        "message_count": len(messages),
-                        "recipient_filter": recipient_filter,
-                        "require_recipient_match": options.require_recipient_match,
-                        "sample_recipients": [
-                            sorted(message.recipient_addresses)[:3] for message in messages[:5]
-                        ],
-                        "sample_subjects": [message.subject for message in messages[:5]],
-                        "sample_body_snips": [message.body_text[:80] for message in messages[:5]],
-                    },
-                )
-                # endregion
+                any_scan_succeeded = True
                 match = self._find_code_in_messages(
                     messages,
                     options,
@@ -382,20 +324,6 @@ class VerificationCodeService:
                     recipient_filter=recipient_filter,
                 )
                 if match is not None:
-                    # region agent log
-                    _agent_debug_log(
-                        location="verification_code_service.py:wait_loop",
-                        message="verification code matched",
-                        hypothesis_id="H1_junk_folder",
-                        data={
-                            "attempt": attempts,
-                            "channel": match.channel,
-                            "code": match.code,
-                            "matched_from": match.matched_from,
-                            "matched_subject": match.matched_subject,
-                        },
-                    )
-                    # endregion
                     return VerificationCodeLookupResult(
                         found=True,
                         code=match.code,
@@ -414,19 +342,9 @@ class VerificationCodeService:
                 break
             self._sleep(sleep_seconds)
 
-        # region agent log
-        _agent_debug_log(
-            location="verification_code_service.py:wait_loop",
-            message="verification code not found before timeout",
-            hypothesis_id="H1_junk_folder",
-            data={
-                "attempts": attempts,
-                "last_error": summarize_exception(last_error) if last_error is not None else None,
-                "recipient_filter": recipient_filter,
-            },
-        )
-        # endregion
-        if last_error is not None and attempts == 1:
+        # If no scan ever completed, every attempt hit a transport/auth failure. Surface it as an
+        # error instead of masking a persistently unreachable inbox as an empty result.
+        if not any_scan_succeeded and last_error is not None:
             raise VerificationCodeReadError(summarize_exception(last_error)) from last_error
         return VerificationCodeLookupResult(found=False, attempts=attempts)
 
@@ -562,19 +480,6 @@ class VerificationCodeService:
             if not inbox_select_succeeded and not candidates:
                 raise VerificationCodeReadError("无法选择 IMAP 收件箱")
 
-            # region agent log
-            _agent_debug_log(
-                location="verification_code_service.py:imap_list",
-                message="imap folder scan summary",
-                hypothesis_id="H1_junk_folder",
-                data={
-                    "mailbox_id": mailbox.id,
-                    "folder_scan_summary": folder_scan_summary,
-                    "candidate_count": len(candidates),
-                    "since_at": since_at.isoformat(),
-                },
-            )
-            # endregion
             return candidates
         except imaplib.IMAP4.error as error:
             raise VerificationCodeReadError(summarize_exception(error)) from error
@@ -661,7 +566,13 @@ def extract_verification_code(
     *,
     custom_code_pattern: re.Pattern[str] | None = None,
 ) -> str | None:
-    """Prefer xAI-style codes (ABC-123), then custom regex / digit fallbacks."""
+    """Extract a code with priority: xAI subject > explicit custom regex > xAI body > digit fallbacks.
+
+    An xAI subject like ``ABC-123 xAI`` is an unambiguous signal and stays first. A
+    caller-supplied ``custom_code_pattern`` expresses explicit intent, so it is tried before
+    the broad xAI body heuristic (which would otherwise match any ``ABC-123``-shaped token in
+    unrelated mail). When a custom pattern is provided, only it is used after the subject check.
+    """
     subject_value = subject or ""
     body_value = body_text or ""
 
@@ -670,15 +581,16 @@ def extract_verification_code(
         return subject_match.group(1)
 
     searchable_text = "\n".join(part for part in [subject_value, body_value] if part)
-    body_xai_match = XAI_BODY_CODE_REGEX.search(searchable_text)
-    if body_xai_match is not None:
-        return body_xai_match.group(1)
 
     if custom_code_pattern is not None:
         custom_match = custom_code_pattern.search(searchable_text)
         if custom_match is not None:
             return custom_match.group(1) if custom_match.lastindex else custom_match.group(0)
         return None
+
+    body_xai_match = XAI_BODY_CODE_REGEX.search(searchable_text)
+    if body_xai_match is not None:
+        return body_xai_match.group(1)
 
     for keyword_pattern in DIGIT_KEYWORD_CODE_PATTERNS:
         keyword_match = keyword_pattern.search(searchable_text)

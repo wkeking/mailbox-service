@@ -369,7 +369,12 @@ class LeaseService:
                 raise ValueError("alias_suffix 仅允许小写字母与数字")
             if len(normalized_suffix) > 32:
                 raise ValueError("alias_suffix 最长 32 个字符")
-            return f"{base_local_part}+{normalized_suffix}@{domain_part.lower()}"
+            candidate_email = f"{base_local_part}+{normalized_suffix}@{domain_part.lower()}"
+            # Explicit suffixes must honor the same uniqueness guard as random ones so two
+            # concurrent leases cannot claim the same allocated address.
+            if self._is_allocated_email_in_use(candidate_email):
+                raise LeaseUnavailableError("该 plus alias 地址已被占用")
+            return candidate_email
 
         for _attempt in range(MAX_PLUS_ALIAS_GENERATION_ATTEMPTS):
             random_suffix = "".join(
