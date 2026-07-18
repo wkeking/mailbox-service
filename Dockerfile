@@ -4,10 +4,13 @@
 #
 # Layer strategy (runtime stage):
 #   1) OS packages + appuser          — rare changes
-#   2) third-party Python deps        — only when pyproject.toml deps change
+#   2) third-party Python deps        — only when pyproject.toml dependencies change
 #   3) application code + migrations  — frequent, small
 #   4) frontend dist                  — only when frontend changes
 # This keeps docker pull small when only business code is updated.
+#
+# Important: do NOT copy README or application sources into the dependency layer.
+# README edits previously invalidated the ~27MB site-packages layer on every push.
 
 ARG NODE_IMAGE=node:22-bookworm-slim
 # Keep the image runtime aligned with local development (Python 3.14).
@@ -50,24 +53,19 @@ RUN apt-get update \
 # Create non-root user early so later COPY --chown does not need chown -R.
 RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin appuser
 
-# Metadata only — dependency list lives here; keep this layer above application sources.
-COPY --chown=appuser:appuser pyproject.toml README.md ./
+# Dependency lock input only — must not include README or application sources.
+COPY pyproject.toml ./
 
-# Install third-party dependencies without baking application sources into this layer.
-# Placeholder package satisfies setuptools package discovery; the local project is
-# uninstalled afterwards so only site-packages third-party wheels remain.
+# Install third-party packages listed in pyproject.toml [project].dependencies.
+# Application code is loaded later via PYTHONPATH=/app (not pip-installed).
 RUN --mount=type=cache,target=/root/.cache/pip \
-    mkdir -p mailbox_service \
-    && printf '# placeholder for dependency install\n' > mailbox_service/__init__.py \
-    && pip install --upgrade pip \
-    && pip install . \
-    && (pip uninstall -y mailbox-service || true) \
-    && rm -rf mailbox_service build dist *.egg-info
+    pip install --upgrade pip \
+    && python -c "import subprocess, tomllib; from pathlib import Path; deps = tomllib.loads(Path('pyproject.toml').read_text(encoding='utf-8'))['project']['dependencies']; assert deps, 'pyproject.toml has no [project].dependencies'; subprocess.check_call(['pip', 'install', '--no-cache-dir', *deps])"
 
 # Application sources (small, frequently changing layers).
-# Loaded via PYTHONPATH=/app — avoids reinstalling the local package on every code change.
 COPY --chown=appuser:appuser mailbox_service ./mailbox_service
 COPY --chown=appuser:appuser migrations ./migrations
+COPY --chown=appuser:appuser README.md ./README.md
 
 # Admin SPA assets (vite outDir defaults to dist/)
 COPY --from=frontend-builder --chown=appuser:appuser /frontend/dist ./frontend_dist
