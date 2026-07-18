@@ -48,6 +48,18 @@ class TokenVersionConflictError(Exception):
     """Raised when a Refresh Token CAS update uses a stale version."""
 
 
+class LeaseEmailNotFoundError(Exception):
+    """Raised when reacquire cannot resolve email ownership for the caller.
+
+    Used for unknown addresses, other clients' history, and unresolvable plus
+    aliases. Callers should map this to a uniform 404 without leaking existence.
+    """
+
+
+class LeaseMailboxBusyError(Exception):
+    """Raised when the target mailbox already has an active lease that blocks reacquire."""
+
+
 @dataclass(frozen=True)
 class LeaseAcquireResult:
     """Lease metadata plus the credential selected by its mode."""
@@ -60,6 +72,8 @@ class LeaseAcquireResult:
     created_at: datetime
     # Business address for this lease (primary or plus alias). mail_read only.
     allocated_email: str | None = None
+    # primary | plus_alias when the lease has a business recipient address.
+    address_kind: str | None = None
     access_token: str | None = None
     access_token_expires_at: datetime | None = None
     access_token_refreshed: bool | None = None
@@ -178,11 +192,16 @@ class LeaseService:
         self._session.add(lease)
         self._session.flush()
 
+        address_kind = self._classify_address_kind(
+            primary_email=mailbox.primary_email,
+            allocated_email=allocated_email,
+        )
         result_arguments = {
             "lease_id": lease.id,
             "mailbox_id": mailbox.id,
             "primary_email": mailbox.primary_email,
             "allocated_email": allocated_email,
+            "address_kind": address_kind,
             "mode": lease.mode,
             "expires_at": lease.expires_at,
             "created_at": lease.created_at,
@@ -215,10 +234,148 @@ class LeaseService:
                 "mailbox_id": mailbox.id,
                 "mode": lease.mode.value,
                 "allocated_email": allocated_email,
+                "address_kind": address_kind,
                 "expires_at": lease.expires_at.isoformat(),
             },
         )
         return result
+
+    def reacquire_lease_by_email(
+        self,
+        principal: ClientPrincipal,
+        *,
+        email: str,
+        ttl_seconds: int,
+        client_tag: str | None = None,
+        purpose: str | None = None,
+    ) -> LeaseAcquireResult:
+        """Re-open a mail_read lease for a historically owned primary or plus-alias address.
+
+        The caller supplies the business recipient saved from a previous acquire
+        (``allocated_email``). This method resolves primary vs plus alias, checks that
+        the same Client Key previously held a mail_read lease for the exact address,
+        then creates a new lease (or renews an identical active one) without issuing tokens.
+        """
+        principal.require_scope("mailboxes:reacquire")
+        normalized_email = email.strip().lower()
+        if not normalized_email:
+            raise ValueError("email 不能为空")
+
+        resolved_mailbox_id, allocated_email, address_kind = self._resolve_reacquire_email(normalized_email)
+        if not self._client_has_mail_read_history(
+            principal.client_key_id,
+            allocated_email=allocated_email,
+        ):
+            # Uniform not-found: do not reveal whether the mailbox or history exists.
+            raise LeaseEmailNotFoundError("邮箱地址不可用或不属于当前调用方")
+
+        current_time = utc_now()
+        sql_current_time = current_time.replace(tzinfo=None)
+        mailbox = self._session.scalar(
+            select(Mailbox)
+            .where(Mailbox.id == resolved_mailbox_id)
+            .with_for_update(skip_locked=True)
+        )
+        if mailbox is None:
+            # skip_locked returns None when another transaction holds the row lock.
+            existing_mailbox = self._session.get(Mailbox, resolved_mailbox_id)
+            if existing_mailbox is None:
+                raise LeaseEmailNotFoundError("邮箱地址不可用或不属于当前调用方")
+            raise LeaseMailboxBusyError("目标邮箱当前被其他租约占用")
+        if mailbox.status != MailboxStatus.ACTIVE:
+            raise LeaseUnavailableError("目标邮箱当前不可用")
+        if mailbox.capability not in (MailboxCapability.IMAP, MailboxCapability.GRAPH):
+            raise LeaseUnavailableError("目标邮箱尚无可用的邮件读取通道")
+        if mailbox.client_id is None or not mailbox.refresh_token_ciphertext:
+            raise LeaseUnavailableError("目标邮箱凭证不完整")
+
+        active_leases = list(
+            self._session.scalars(
+                select(Lease)
+                .where(
+                    Lease.mailbox_id == mailbox.id,
+                    Lease.released_at.is_(None),
+                    Lease.expires_at > sql_current_time,
+                )
+                .with_for_update()
+            )
+        )
+        matching_owned_lease: Lease | None = None
+        for active_lease in active_leases:
+            same_owner = active_lease.client_key_id == principal.client_key_id
+            same_mode = active_lease.mode == LeaseMode.MAIL_READ
+            same_allocated = (active_lease.allocated_email or "").strip().lower() == allocated_email
+            if same_owner and same_mode and same_allocated:
+                matching_owned_lease = active_lease
+                continue
+            raise LeaseMailboxBusyError("目标邮箱当前被其他租约占用")
+
+        if matching_owned_lease is not None:
+            matching_owned_lease.expires_at = current_time + timedelta(seconds=ttl_seconds)
+            if client_tag is not None:
+                matching_owned_lease.client_tag = client_tag
+            if purpose is not None:
+                matching_owned_lease.purpose = purpose
+            self._session.flush()
+            self._write_audit_log(
+                principal,
+                "lease.reacquired",
+                matching_owned_lease.id,
+                {
+                    "mailbox_id": mailbox.id,
+                    "mode": matching_owned_lease.mode.value,
+                    "allocated_email": allocated_email,
+                    "address_kind": address_kind,
+                    "renewed": True,
+                    "expires_at": matching_owned_lease.expires_at.isoformat(),
+                },
+            )
+            return LeaseAcquireResult(
+                lease_id=matching_owned_lease.id,
+                mailbox_id=mailbox.id,
+                primary_email=mailbox.primary_email,
+                allocated_email=allocated_email,
+                address_kind=address_kind,
+                mode=LeaseMode.MAIL_READ,
+                expires_at=matching_owned_lease.expires_at,
+                created_at=matching_owned_lease.created_at,
+            )
+
+        lease = Lease(
+            mailbox_id=mailbox.id,
+            client_key_id=principal.client_key_id,
+            client_tag=client_tag,
+            purpose=purpose,
+            allocated_email=allocated_email,
+            mode=LeaseMode.MAIL_READ,
+            expires_at=current_time + timedelta(seconds=ttl_seconds),
+            created_at=current_time,
+        )
+        self._session.add(lease)
+        self._session.flush()
+        self._write_audit_log(
+            principal,
+            "lease.reacquired",
+            lease.id,
+            {
+                "mailbox_id": mailbox.id,
+                "mode": lease.mode.value,
+                "allocated_email": allocated_email,
+                "address_kind": address_kind,
+                "renewed": False,
+                "expires_at": lease.expires_at.isoformat(),
+            },
+        )
+        return LeaseAcquireResult(
+            lease_id=lease.id,
+            mailbox_id=mailbox.id,
+            primary_email=mailbox.primary_email,
+            allocated_email=allocated_email,
+            address_kind=address_kind,
+            mode=LeaseMode.MAIL_READ,
+            expires_at=lease.expires_at,
+            created_at=lease.created_at,
+        )
 
     def release_lease(self, principal: ClientPrincipal, lease_id: str) -> LeaseReleaseResult:
         """Release an owned lease idempotently without deleting its audit trail."""
@@ -348,6 +505,77 @@ class LeaseService:
         if require_active and (lease.released_at is not None or self._is_expired(lease.expires_at)):
             raise LeaseInactiveError("租约已释放或已过期")
         return lease
+
+    def _resolve_reacquire_email(self, normalized_email: str) -> tuple[str, str, str]:
+        """Map a business email to mailbox id, allocated address, and address kind.
+
+        Resolution order:
+        1. Exact match on ``Mailbox.primary_email`` → primary
+        2. Plus-alias form ``local+suffix@domain`` → strip suffix and match primary
+        """
+        local_part, separator, domain_part = normalized_email.partition("@")
+        if not separator or not local_part or not domain_part:
+            raise ValueError(f"邮箱地址格式无效：{normalized_email}")
+        if " " in normalized_email:
+            raise ValueError(f"邮箱地址格式无效：{normalized_email}")
+
+        primary_mailbox = self._session.scalar(
+            select(Mailbox).where(Mailbox.primary_email == normalized_email)
+        )
+        if primary_mailbox is not None:
+            return primary_mailbox.id, normalized_email, "primary"
+
+        if "+" not in local_part:
+            raise LeaseEmailNotFoundError("邮箱地址不可用或不属于当前调用方")
+
+        base_local_part, _plus_marker, alias_suffix = local_part.partition("+")
+        if not base_local_part or not alias_suffix:
+            raise LeaseEmailNotFoundError("邮箱地址不可用或不属于当前调用方")
+        if not all(character in PLUS_ALIAS_SUFFIX_ALPHABET for character in alias_suffix):
+            raise ValueError("plus alias 后缀仅允许小写字母与数字")
+        if len(alias_suffix) > 32:
+            raise ValueError("plus alias 后缀最长 32 个字符")
+
+        base_primary_email = f"{base_local_part}@{domain_part}"
+        alias_mailbox = self._session.scalar(
+            select(Mailbox).where(Mailbox.primary_email == base_primary_email)
+        )
+        if alias_mailbox is None:
+            raise LeaseEmailNotFoundError("邮箱地址不可用或不属于当前调用方")
+        return alias_mailbox.id, normalized_email, "plus_alias"
+
+    def _client_has_mail_read_history(
+        self,
+        client_key_id: str,
+        *,
+        allocated_email: str,
+    ) -> bool:
+        """Return whether this Client Key previously held a mail_read lease for the address."""
+        historical_lease_id = self._session.scalar(
+            select(Lease.id)
+            .where(
+                Lease.client_key_id == client_key_id,
+                Lease.allocated_email == allocated_email,
+                Lease.mode == LeaseMode.MAIL_READ,
+            )
+            .limit(1)
+        )
+        return historical_lease_id is not None
+
+    @staticmethod
+    def _classify_address_kind(
+        *,
+        primary_email: str,
+        allocated_email: str | None,
+    ) -> str | None:
+        """Classify allocated business address relative to the mailbox primary identity."""
+        if allocated_email is None:
+            return None
+        normalized_allocated = allocated_email.strip().lower()
+        normalized_primary = primary_email.strip().lower()
+        if normalized_allocated == normalized_primary:
+            return "primary"
+        return "plus_alias"
 
     def _allocate_plus_alias(
         self,

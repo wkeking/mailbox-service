@@ -90,6 +90,7 @@ curl -X POST http://localhost:8000/api/v1/admin/client-keys \
       "tokens:refresh:read",
       "tokens:refresh:write",
       "mailboxes:acquire",
+      "mailboxes:reacquire",
       "mail:verification-code:read"
     ]
   }'
@@ -103,6 +104,7 @@ curl -X POST http://localhost:8000/api/v1/admin/client-keys \
 - `tokens:refresh:read`：领取 RT mode 租约并读取当前 RT
 - `tokens:refresh:write`：在 RT mode 租约内 CAS 回写新 RT
 - `mailboxes:acquire`：领取可用邮箱账号（mail_read 租约，不返回 Token）
+- `mailboxes:reacquire`：按历史主邮箱或 plus 别名重新领取 mail_read 租约
 - `mail:verification-code:read`：在 mail_read 租约下读取收件箱验证码
 
 ## 外部服务 API
@@ -116,7 +118,36 @@ curl -X POST http://localhost:8000/api/v1/admin/client-keys \
 | `POST` | `/api/v1/leases/{lease_id}/access-token` | 获取未过期缓存 AT，过期时自动刷新 |
 | `POST` | `/api/v1/leases/{lease_id}/refresh-token` | 按 `expected_token_version` CAS 回写 RT |
 | `POST` | `/api/v1/mailboxes/acquire` | 领取可用邮箱账号（mail_read，只返回邮箱与租约） |
+| `POST` | `/api/v1/mailboxes/reacquire` | 按历史业务地址（主邮箱或 plus 别名）重新领取 mail_read 租约 |
 | `POST` | `/api/v1/leases/{lease_id}/verification-code` | 在 mail_read 租约下提取收件箱验证码 |
+
+### 按历史地址重新领取（reacquire）
+
+业务侧应持久化首次 `acquire` 返回的 `allocated_email`（主邮箱或 plus 别名均可）。租约过期或释放后，如需再次取验证码：
+
+1. `POST /api/v1/mailboxes/reacquire`，body：`{"email": "<allocated_email>", "lease_ttl_seconds": 300}`
+2. 服务端自动判定主邮箱 / plus 别名；仅当**同一 Client Key 曾对该完整地址持有过 mail_read 租约**时允许
+3. 使用返回的 `lease_id` 调用 `verification-code`，用毕后 `release`
+
+请求示例：
+
+```bash
+curl -X POST http://localhost:8000/api/v1/mailboxes/reacquire \
+  -H 'Content-Type: application/json' \
+  -H 'X-API-Key: <CLIENT_API_KEY>' \
+  -d '{
+    "email": "owner+reg01@outlook.com",
+    "lease_ttl_seconds": 300,
+    "purpose": "resend_verification"
+  }'
+```
+
+错误码摘要：
+
+- `404 EMAIL_NOT_FOUND`：地址无法解析、无历史归属、或不属于当前 Client Key（统一文案）
+- `409 MAILBOX_BUSY`：目标主邮箱已被其他租约占用
+- `409 NO_AVAILABLE_MAILBOX`：邮箱不可用或无读信通道
+- `403 CLIENT_SCOPE_REQUIRED`：缺少 `mailboxes:reacquire`
 
 ## 管理 API
 
@@ -166,9 +197,10 @@ SPA / 某些 OTP 流程可能是 24 小时；个人 Outlook / Hotmail 常见为 
 基座镜像为 `python:3.14-slim-bookworm`，与本地开发版本对齐。  
 默认镜像名：**`registry.example.com/mailbox-service:latest`**；`./scripts/build-image.sh` **默认构建后自动推送**到该私有仓库。`docker-compose.yml` 默认 `image` 与此一致。
 
-**分层缓存（减小服务器 pull）：** runtime 先装第三方 Python 依赖，再拷贝业务代码 / migrations / 前端 dist。  
-仅改后端代码时，依赖层可复用，服务器通常只需拉取约 **几十～几百 KB** 的代码层，而不是整包依赖（此前约 27MB）。  
-依赖列表变更（`pyproject.toml`）或前端变更时，对应层才会失效。
+**分层缓存（减小服务器 pull）：** runtime **只根据 `pyproject.toml` 的依赖列表**安装第三方包，再分别拷贝业务代码、migrations、README、前端 dist。  
+仅改后端代码时，依赖层可复用，服务器通常只需拉取约 **几十～几百 KB** 的代码层，而不是整包依赖（约 27MB）。  
+只有改 `pyproject.toml` 依赖、或前端构建产物变化时，对应大层才会失效。  
+注意：不要把 README / 业务源码放进依赖安装层之前，否则文档或代码一改仍会重拉 ~27MB。
 
 相关文件：
 

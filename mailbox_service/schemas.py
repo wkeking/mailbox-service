@@ -375,7 +375,7 @@ class ClientKeyCreateRequest(BaseModel):
             "权限列表，可选："
             "leases:acquire、leases:release、tokens:access:read、"
             "tokens:refresh:read、tokens:refresh:write、"
-            "mailboxes:acquire、mail:verification-code:read。"
+            "mailboxes:acquire、mailboxes:reacquire、mail:verification-code:read。"
         ),
     )
     expires_at: datetime | None = Field(default=None, description="过期时间（UTC）；为空表示不过期。")
@@ -493,12 +493,53 @@ class MailboxAcquireResponse(BaseModel):
     allocated_email: str = Field(
         description="本租约分配的业务收件地址：主邮箱或 plus alias，用于注册与验证码匹配。",
     )
+    address_kind: Literal["primary", "plus_alias"] | None = Field(
+        default=None,
+        description="业务地址类型：primary 表示主邮箱，plus_alias 表示 plus 别名；可能为空。",
+    )
     mode: Literal[LeaseMode.MAIL_READ] = Field(
         default=LeaseMode.MAIL_READ,
         description="固定为 mail_read，不返回 access_token / refresh_token。",
     )
     expires_at: datetime = Field(description="租约到期时间。")
     created_at: datetime = Field(description="租约创建时间。")
+
+
+class MailboxReacquireRequest(BaseModel):
+    """按历史业务地址（主邮箱或 plus 别名）重新领取 mail_read 租约。"""
+
+    email: str = Field(
+        min_length=3,
+        max_length=320,
+        description=(
+            "业务侧保存的收件地址：可为首次领取返回的 allocated_email。"
+            "服务端自动判断主邮箱或 plus 别名；须为本 Client Key 历史 mail_read 租约用过的完整地址。"
+        ),
+    )
+    lease_ttl_seconds: int = Field(
+        default=600,
+        ge=60,
+        le=86_400,
+        description="mail_read 租约有效期（秒），默认 600，范围 60–86400。",
+    )
+    client_tag: str | None = Field(default=None, max_length=100, description="调用方自定义标签，便于排查。")
+    purpose: str | None = Field(default=None, max_length=100, description="领取用途说明。")
+
+    @field_validator("email")
+    @classmethod
+    def normalize_reacquire_email(cls, value: str) -> str:
+        normalized_value = value.strip().lower()
+        if not normalized_value:
+            raise ValueError("email 不能为空")
+        return normalized_value
+
+    @field_validator("client_tag", "purpose")
+    @classmethod
+    def normalize_optional_reacquire_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized_value = value.strip()
+        return normalized_value or None
 
 
 class LeaseVerificationCodeRequest(BaseModel):

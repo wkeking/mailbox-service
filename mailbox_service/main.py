@@ -32,7 +32,9 @@ from mailbox_service.client_key_service import (
 from mailbox_service.database import database_engine, get_session
 from mailbox_service.migration_runner import run_pending_migrations
 from mailbox_service.lease_service import (
+    LeaseEmailNotFoundError,
     LeaseInactiveError,
+    LeaseMailboxBusyError,
     LeaseModeError,
     LeaseNotFoundError,
     LeaseService,
@@ -81,6 +83,7 @@ from mailbox_service.schemas import (
     LeaseVerificationCodeResponse,
     MailboxAcquireRequest,
     MailboxAcquireResponse,
+    MailboxReacquireRequest,
     MailboxAccessTokenRefreshRequest,
     MailboxAccessTokenRefreshResponse,
     MailboxAccessTokenResponse,
@@ -180,6 +183,13 @@ OPENAPI_OPERATION_DOCUMENTATION: dict[tuple[str, str], tuple[str, str, str]] = {
         "领取可用邮箱账号",
         "领取一个 status=active 且 capability 为 imap/graph 的邮箱并创建 mail_read 租约；"
         "可选择生成 plus alias 作为 allocated_email，只返回邮箱地址与租约信息，不返回 Token。",
+        "外部邮箱",
+    ),
+    ("POST", "/api/v1/mailboxes/reacquire"): (
+        "按历史地址重新领取邮箱",
+        "传入业务侧保存的主邮箱或 plus 别名（首次领取的 allocated_email）；"
+        "服务端自动判定地址类型，仅允许本 Client Key 历史 mail_read 租约用过的地址，"
+        "创建或续期 mail_read 租约，不返回 Token。",
         "外部邮箱",
     ),
     ("POST", "/api/v1/leases/{lease_id}/verification-code"): (
@@ -350,6 +360,7 @@ OPENAPI_SCHEMA_DESCRIPTIONS = {
     "LeaseVerificationCodeResponse": "验证码提取结果。",
     "MailboxAcquireRequest": "领取可用邮箱账号（mail_read 租约）的请求。",
     "MailboxAcquireResponse": "可用邮箱账号领取结果，不返回 Token。",
+    "MailboxReacquireRequest": "按历史主邮箱或 plus 别名重新领取 mail_read 租约的请求。",
     "MailboxAccessTokenRefreshItemResponse": "单个邮箱的 Token 刷新结果。",
     "MailboxAccessTokenRefreshRequest": "批量刷新请求；邮箱 ID 为空时刷新全部可用邮箱。",
     "MailboxAccessTokenRefreshResponse": "批量刷新汇总响应，不返回 Token 明文。",
@@ -735,6 +746,16 @@ def to_external_http_exception(error: Exception) -> HTTPException:
             status_code=status.HTTP_404_NOT_FOUND,
             detail={"code": "LEASE_NOT_FOUND", "message": str(error)},
         )
+    if isinstance(error, LeaseEmailNotFoundError):
+        return HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "EMAIL_NOT_FOUND", "message": str(error)},
+        )
+    if isinstance(error, LeaseMailboxBusyError):
+        return HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "MAILBOX_BUSY", "message": str(error)},
+        )
     if isinstance(error, LeaseUnavailableError):
         return HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -987,6 +1008,40 @@ def acquire_mailbox_account(
         mailbox_id=result.mailbox_id,
         primary_email=result.primary_email,
         allocated_email=result.allocated_email or result.primary_email,
+        address_kind=result.address_kind,
+        mode=LeaseMode.MAIL_READ,
+        expires_at=result.expires_at,
+        created_at=result.created_at,
+    )
+
+
+@app.post(
+    "/api/v1/mailboxes/reacquire",
+    response_model=MailboxAcquireResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def reacquire_mailbox_account(
+    payload: MailboxReacquireRequest,
+    principal: ClientPrincipalDependency,
+    lease_service: LeaseServiceDependency,
+) -> MailboxAcquireResponse:
+    """Re-open a mail_read lease for a historically owned primary or plus-alias address."""
+    try:
+        result = lease_service.reacquire_lease_by_email(
+            principal,
+            email=payload.email,
+            ttl_seconds=payload.lease_ttl_seconds,
+            client_tag=payload.client_tag,
+            purpose=payload.purpose,
+        )
+    except Exception as error:
+        raise to_external_http_exception(error) from error
+    return MailboxAcquireResponse(
+        lease_id=result.lease_id,
+        mailbox_id=result.mailbox_id,
+        primary_email=result.primary_email,
+        allocated_email=result.allocated_email or result.primary_email,
+        address_kind=result.address_kind,
         mode=LeaseMode.MAIL_READ,
         expires_at=result.expires_at,
         created_at=result.created_at,

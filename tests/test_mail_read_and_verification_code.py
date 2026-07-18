@@ -6,14 +6,20 @@ from base64 import urlsafe_b64encode
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from mailbox_service.client_key_service import ClientKeyService
+from mailbox_service.client_key_service import ClientKeyScopeError, ClientKeyService
 from mailbox_service.config import Settings
 from mailbox_service.database import Base
-from mailbox_service.lease_service import LeaseModeError, LeaseService, LeaseUnavailableError
-from mailbox_service.models import Lease, LeaseMode, Mailbox, MailboxCapability, utc_now
+from mailbox_service.lease_service import (
+    LeaseEmailNotFoundError,
+    LeaseMailboxBusyError,
+    LeaseModeError,
+    LeaseService,
+    LeaseUnavailableError,
+)
+from mailbox_service.models import AuditLog, Lease, LeaseMode, Mailbox, MailboxCapability, utc_now
 from mailbox_service.security import CredentialCipher
 from mailbox_service.token_service import MailboxAccessTokenService
 from mailbox_service.verification_code_service import (
@@ -315,6 +321,225 @@ def test_mail_read_acquire_requires_scope_and_rejects_unproven_pool() -> None:
         pass
     else:
         raise AssertionError("仅 unprobed/unknown/unusable 邮箱时不应领取成功")
+
+
+def _seed_usable_mailbox(
+    session: Session,
+    credential_cipher,
+    *,
+    primary_email: str = "owner@outlook.com",
+) -> Mailbox:
+    mailbox = Mailbox(
+        primary_email=primary_email,
+        client_id="client-id",
+        refresh_token_ciphertext=credential_cipher.encrypt("refresh-token"),
+        capability=MailboxCapability.IMAP,
+        access_token_ciphertext=credential_cipher.encrypt("cached-access-token"),
+        access_token_expires_at=utc_now() + timedelta(minutes=30),
+    )
+    session.add(mailbox)
+    session.flush()
+    return mailbox
+
+
+def test_reacquire_primary_email_after_release() -> None:
+    """After releasing a primary allocated_email lease, reacquire should open a new mail_read lease."""
+    session, credential_cipher, client_key_service, lease_service = create_mail_read_context()
+    _seed_usable_mailbox(session, credential_cipher)
+    creation = client_key_service.create_client_key(
+        name="reacquire-primary",
+        scopes=["mailboxes:acquire", "mailboxes:reacquire", "leases:release"],
+    )
+    principal = client_key_service.authenticate(creation.api_key)
+
+    first = lease_service.acquire_lease(principal, mode=LeaseMode.MAIL_READ, ttl_seconds=600)
+    assert first.address_kind == "primary"
+    assert first.allocated_email == "owner@outlook.com"
+    lease_service.release_lease(principal, first.lease_id)
+
+    second = lease_service.reacquire_lease_by_email(
+        principal,
+        email="owner@outlook.com",
+        ttl_seconds=300,
+        purpose="resend_code",
+    )
+    assert second.lease_id != first.lease_id
+    assert second.primary_email == "owner@outlook.com"
+    assert second.allocated_email == "owner@outlook.com"
+    assert second.address_kind == "primary"
+    assert second.mode == LeaseMode.MAIL_READ
+    assert second.access_token is None
+    assert second.refresh_token is None
+
+    audit_events = list(
+        session.scalars(select(AuditLog.event_type).order_by(AuditLog.created_at.asc()))
+    )
+    assert "lease.reacquired" in audit_events
+
+
+def test_reacquire_plus_alias_after_release() -> None:
+    """Plus alias should resolve to the primary mailbox and keep the full allocated address."""
+    session, credential_cipher, client_key_service, lease_service = create_mail_read_context()
+    _seed_usable_mailbox(session, credential_cipher)
+    creation = client_key_service.create_client_key(
+        name="reacquire-alias",
+        scopes=["mailboxes:acquire", "mailboxes:reacquire", "leases:release"],
+    )
+    principal = client_key_service.authenticate(creation.api_key)
+
+    first = lease_service.acquire_lease(
+        principal,
+        mode=LeaseMode.MAIL_READ,
+        ttl_seconds=600,
+        use_plus_alias=True,
+        preferred_alias_suffix="reg01",
+    )
+    assert first.allocated_email == "owner+reg01@outlook.com"
+    assert first.address_kind == "plus_alias"
+    lease_service.release_lease(principal, first.lease_id)
+
+    second = lease_service.reacquire_lease_by_email(
+        principal,
+        email="Owner+Reg01@outlook.com",
+        ttl_seconds=300,
+    )
+    assert second.primary_email == "owner@outlook.com"
+    assert second.allocated_email == "owner+reg01@outlook.com"
+    assert second.address_kind == "plus_alias"
+
+
+def test_reacquire_renews_matching_active_lease() -> None:
+    """Same client + same allocated address with an active lease should renew instead of conflict."""
+    session, credential_cipher, client_key_service, lease_service = create_mail_read_context()
+    _seed_usable_mailbox(session, credential_cipher)
+    creation = client_key_service.create_client_key(
+        name="reacquire-renew",
+        scopes=["mailboxes:acquire", "mailboxes:reacquire"],
+    )
+    principal = client_key_service.authenticate(creation.api_key)
+
+    first = lease_service.acquire_lease(principal, mode=LeaseMode.MAIL_READ, ttl_seconds=120)
+    renewed = lease_service.reacquire_lease_by_email(
+        principal,
+        email=first.allocated_email or first.primary_email,
+        ttl_seconds=600,
+        client_tag="renewed",
+    )
+    assert renewed.lease_id == first.lease_id
+    lease = session.get(Lease, first.lease_id)
+    assert lease is not None
+    assert lease.client_tag == "renewed"
+    # Renewed TTL is longer; compare naive UTC seconds to avoid tz-aware vs naive mismatch.
+    assert (lease.expires_at.replace(tzinfo=None) - first.created_at.replace(tzinfo=None)).total_seconds() >= 500
+
+
+def test_reacquire_rejects_other_client_and_unknown_history() -> None:
+    session, credential_cipher, client_key_service, lease_service = create_mail_read_context()
+    _seed_usable_mailbox(session, credential_cipher)
+    owner = client_key_service.create_client_key(
+        name="history-owner",
+        scopes=["mailboxes:acquire", "mailboxes:reacquire", "leases:release"],
+    )
+    stranger = client_key_service.create_client_key(
+        name="stranger",
+        scopes=["mailboxes:reacquire"],
+    )
+    owner_principal = client_key_service.authenticate(owner.api_key)
+    stranger_principal = client_key_service.authenticate(stranger.api_key)
+
+    first = lease_service.acquire_lease(
+        owner_principal,
+        mode=LeaseMode.MAIL_READ,
+        ttl_seconds=600,
+        use_plus_alias=True,
+        preferred_alias_suffix="hist01",
+    )
+    lease_service.release_lease(owner_principal, first.lease_id)
+
+    try:
+        lease_service.reacquire_lease_by_email(
+            stranger_principal,
+            email="owner+hist01@outlook.com",
+            ttl_seconds=300,
+        )
+    except LeaseEmailNotFoundError:
+        pass
+    else:
+        raise AssertionError("其他 Client Key 不应 reacquire 历史别名")
+
+    try:
+        lease_service.reacquire_lease_by_email(
+            owner_principal,
+            email="never-used@outlook.com",
+            ttl_seconds=300,
+        )
+    except LeaseEmailNotFoundError:
+        pass
+    else:
+        raise AssertionError("无历史记录的地址应返回 not found")
+
+
+def test_reacquire_requires_scope() -> None:
+    session, credential_cipher, client_key_service, lease_service = create_mail_read_context()
+    _seed_usable_mailbox(session, credential_cipher)
+    acquire_only = client_key_service.create_client_key(
+        name="acquire-only",
+        scopes=["mailboxes:acquire", "leases:release"],
+    )
+    principal = client_key_service.authenticate(acquire_only.api_key)
+    first = lease_service.acquire_lease(principal, mode=LeaseMode.MAIL_READ, ttl_seconds=600)
+    lease_service.release_lease(principal, first.lease_id)
+
+    try:
+        lease_service.reacquire_lease_by_email(
+            principal,
+            email=first.allocated_email or first.primary_email,
+            ttl_seconds=300,
+        )
+    except ClientKeyScopeError as error:
+        assert "mailboxes:reacquire" in str(error)
+    else:
+        raise AssertionError("缺少 mailboxes:reacquire 应被拒绝")
+
+
+def test_reacquire_rejects_when_mailbox_busy() -> None:
+    session, credential_cipher, client_key_service, lease_service = create_mail_read_context()
+    mailbox = _seed_usable_mailbox(session, credential_cipher, primary_email="busy@outlook.com")
+    owner = client_key_service.create_client_key(
+        name="busy-owner",
+        scopes=["mailboxes:acquire", "mailboxes:reacquire", "leases:release"],
+    )
+    blocker = client_key_service.create_client_key(
+        name="busy-blocker",
+        scopes=["leases:acquire", "tokens:access:read"],
+    )
+    owner_principal = client_key_service.authenticate(owner.api_key)
+    blocker_principal = client_key_service.authenticate(blocker.api_key)
+
+    history = lease_service.acquire_lease(
+        owner_principal,
+        mode=LeaseMode.MAIL_READ,
+        ttl_seconds=600,
+        preferred_email=mailbox.primary_email,
+    )
+    lease_service.release_lease(owner_principal, history.lease_id)
+    lease_service.acquire_lease(
+        blocker_principal,
+        mode=LeaseMode.ACCESS_TOKEN,
+        ttl_seconds=600,
+        preferred_email=mailbox.primary_email,
+    )
+
+    try:
+        lease_service.reacquire_lease_by_email(
+            owner_principal,
+            email=mailbox.primary_email,
+            ttl_seconds=300,
+        )
+    except LeaseMailboxBusyError:
+        pass
+    else:
+        raise AssertionError("主邮箱被其他租约占用时应返回 MAILBOX_BUSY")
 
 
 def test_extract_verification_code_prefers_xai_then_digits() -> None:

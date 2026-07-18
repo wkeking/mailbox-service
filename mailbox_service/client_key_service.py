@@ -23,6 +23,7 @@ ALLOWED_CLIENT_KEY_SCOPES = frozenset(
         "tokens:refresh:read",
         "tokens:refresh:write",
         "mailboxes:acquire",
+        "mailboxes:reacquire",
         "mail:verification-code:read",
     }
 )
