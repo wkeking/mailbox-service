@@ -8,6 +8,9 @@ from typing import Any, Literal
 
 MailAccessChannel = Literal["imap", "graph"]
 
+# Graph resource token used for Graph mail read / capability re-audience.
+GRAPH_MAIL_READ_SCOPE = "https://graph.microsoft.com/Mail.Read offline_access"
+
 IMAP_SCOPE_MARKERS = (
     "imap.accessasuser",
     "outlook.office.com",
@@ -20,6 +23,15 @@ GRAPH_SCOPE_MARKERS = (
     "mail.readwrite",
     "mail.readbasic",
     "https://graph.microsoft.com/",
+)
+GRAPH_AUDIENCE_MARKERS = (
+    "graph.microsoft.com",
+    "https://graph.microsoft.com/",
+)
+OUTLOOK_AUDIENCE_MARKERS = (
+    "outlook.office.com",
+    "outlook.office365.com",
+    "https://outlook.office.com/",
 )
 
 
@@ -84,3 +96,33 @@ def infer_mail_access_channel_preference(scope: str | None) -> list[MailAccessCh
     if hints_graph and not hints_imap:
         return ["graph", "imap"]
     return ["imap", "graph"]
+
+
+def resolve_oauth_refresh_scope_for_channel(channel: MailAccessChannel | None) -> str | None:
+    """Return the OAuth refresh ``scope`` for a mail channel, or None for RT default scopes.
+
+    Graph mail read requires a Graph-audience access token. IMAP XOAUTH2 works with the
+    RT's default outlook.office.com family scopes, so IMAP refreshes omit an explicit scope.
+    """
+    if channel == "graph":
+        return GRAPH_MAIL_READ_SCOPE
+    return None
+
+
+def cached_token_matches_mail_channel(scope: str | None, channel: MailAccessChannel) -> bool:
+    """Return whether a cached token's stored scope looks usable for the target channel.
+
+    Microsoft personal tokens are often opaque (non-JWT); the service therefore trusts the
+    last ``mailbox.scope`` string written from the token endpoint or probe re-audience path.
+    """
+    normalized_scope = (scope or "").casefold()
+    has_graph_audience = any(marker in normalized_scope for marker in GRAPH_AUDIENCE_MARKERS)
+    has_outlook_audience = any(marker in normalized_scope for marker in OUTLOOK_AUDIENCE_MARKERS)
+
+    if channel == "graph":
+        return has_graph_audience
+
+    # IMAP: pure Graph-audience tokens usually fail XOAUTH2; outlook/default scopes are fine.
+    if has_graph_audience and not has_outlook_audience:
+        return False
+    return True

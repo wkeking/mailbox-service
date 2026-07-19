@@ -29,17 +29,22 @@ from mailbox_service.client_key_service import (
     ClientKeyScopeError,
     ClientPrincipal,
 )
-from mailbox_service.database import database_engine, get_session
+from mailbox_service.database import SessionFactory, database_engine, get_session
 from mailbox_service.migration_runner import run_pending_migrations
 from mailbox_service.lease_service import (
     LeaseEmailNotFoundError,
+    LeaseEmailSiteConflictError,
     LeaseInactiveError,
     LeaseMailboxBusyError,
     LeaseModeError,
     LeaseNotFoundError,
     LeaseService,
     LeaseUnavailableError,
+    LeaseUsageSiteError,
     TokenVersionConflictError,
+    UsageSiteConflictError,
+    UsageSiteInUseError,
+    UsageSiteNotFoundError,
 )
 from mailbox_service.models import (
     AuditLog,
@@ -81,9 +86,16 @@ from mailbox_service.schemas import (
     LeaseReleaseResponse,
     LeaseVerificationCodeRequest,
     LeaseVerificationCodeResponse,
+    EmailSiteUsageItemResponse,
+    EmailSiteUsageListResponse,
+    EmailSiteUsageRevokeResponse,
     MailboxAcquireRequest,
     MailboxAcquireResponse,
     MailboxReacquireRequest,
+    UsageSiteCreateRequest,
+    UsageSiteItemResponse,
+    UsageSiteListResponse,
+    UsageSiteUpdateRequest,
     MailboxAccessTokenRefreshRequest,
     MailboxAccessTokenRefreshResponse,
     MailboxAccessTokenResponse,
@@ -114,12 +126,24 @@ from mailbox_service.capability_probe_service import (
     MailboxCapabilityProbeService,
     MicrosoftGraphMailProbeClient,
 )
-from mailbox_service.token_service import MailboxAccessTokenService
+from mailbox_service.token_service import MailboxAccessTokenService, stamp_refresh_token_lifetime
 from mailbox_service.proxy_service import (
     MicrosoftIMAPClient,
     MicrosoftOAuthClient,
     MicrosoftInvalidGrantError,
     MicrosoftOAuthError,
+)
+from mailbox_service.mailbox_admin_service import (
+    ActiveLeaseClaimConflictError,
+    MailboxAdminService,
+)
+from mailbox_service.verification_authorization import (
+    VerificationAuthorizationError,
+    revalidate_verification_authorization,
+)
+from mailbox_service.verification_poll_capacity import (
+    VerificationPollCapacityExceededError,
+    acquire_verification_poll_slot,
 )
 from mailbox_service.verification_code_service import (
     MicrosoftGraphMailReader,
@@ -182,14 +206,20 @@ OPENAPI_OPERATION_DOCUMENTATION: dict[tuple[str, str], tuple[str, str, str]] = {
     ("POST", "/api/v1/mailboxes/acquire"): (
         "领取可用邮箱账号",
         "领取一个 status=active 且 capability 为 imap/graph 的邮箱并创建 mail_read 租约；"
-        "可选择生成 plus alias 作为 allocated_email，只返回邮箱地址与租约信息，不返回 Token。",
+        "可选择生成 plus alias 作为 allocated_email；主邮箱路径必须声明 usage_site，"
+        "用于全局排除已在该站登记的业务地址；只返回邮箱地址与租约信息，不返回 Token。",
+        "外部邮箱",
+    ),
+    ("GET", "/api/v1/usage-sites"): (
+        "查询可用注册站点",
+        "返回当前启用的注册站点白名单（code 与展示名），供 mail_read 领取时填写 usage_site。",
         "外部邮箱",
     ),
     ("POST", "/api/v1/mailboxes/reacquire"): (
         "按历史地址重新领取邮箱",
         "传入业务侧保存的主邮箱或 plus 别名（首次领取的 allocated_email）；"
         "服务端自动判定地址类型，仅允许本 Client Key 历史 mail_read 租约用过的地址，"
-        "创建或续期 mail_read 租约，不返回 Token。",
+        "创建或续期 mail_read 租约，不返回 Token，不新增站点占用记录。",
         "外部邮箱",
     ),
     ("POST", "/api/v1/leases/{lease_id}/verification-code"): (
@@ -242,6 +272,36 @@ OPENAPI_OPERATION_DOCUMENTATION: dict[tuple[str, str], tuple[str, str, str]] = {
         "删除全部失效邮箱",
         "删除 status=invalid 的全部邮箱及其关联租约，操作不可恢复。",
         "邮箱管理",
+    ),
+    ("GET", "/api/v1/admin/usage-sites"): (
+        "查询注册站点白名单",
+        "返回全部注册站点（含已禁用），供管理端查看与配置。",
+        "租约管理",
+    ),
+    ("POST", "/api/v1/admin/usage-sites"): (
+        "创建注册站点",
+        "新增 usage_site 白名单 code；code 创建后不可修改，可禁用以阻止新声明。",
+        "租约管理",
+    ),
+    ("PATCH", "/api/v1/admin/usage-sites/{code}"): (
+        "更新注册站点",
+        "更新站点展示名或启用状态；禁用后历史占用仍参与排除，但禁止新声明。",
+        "租约管理",
+    ),
+    ("DELETE", "/api/v1/admin/usage-sites/{code}"): (
+        "删除注册站点",
+        "仅当该站点无未撤销占用时可删除；已撤销占用会一并清理。",
+        "租约管理",
+    ),
+    ("GET", "/api/v1/admin/email-site-usages"): (
+        "分页查询邮箱站点占用",
+        "按业务地址、站点、是否已撤销筛选占用记录，用于排查为何无法再分配到某站。",
+        "租约管理",
+    ),
+    ("POST", "/api/v1/admin/email-site-usages/{usage_id}/revoke"): (
+        "撤销邮箱站点占用",
+        "软删除占用记录（写 revoked_at），之后同一业务地址可再次声明该站点；幂等。",
+        "租约管理",
     ),
     ("GET", "/api/v1/admin/leases"): (
         "分页查询租约",
@@ -361,6 +421,13 @@ OPENAPI_SCHEMA_DESCRIPTIONS = {
     "MailboxAcquireRequest": "领取可用邮箱账号（mail_read 租约）的请求。",
     "MailboxAcquireResponse": "可用邮箱账号领取结果，不返回 Token。",
     "MailboxReacquireRequest": "按历史主邮箱或 plus 别名重新领取 mail_read 租约的请求。",
+    "UsageSiteItemResponse": "注册站点白名单条目。",
+    "UsageSiteListResponse": "注册站点白名单列表。",
+    "UsageSiteCreateRequest": "管理员创建注册站点白名单的请求。",
+    "UsageSiteUpdateRequest": "管理员更新注册站点展示名或启用状态的请求。",
+    "EmailSiteUsageItemResponse": "邮箱在某站点的占用记录。",
+    "EmailSiteUsageListResponse": "邮箱站点占用分页查询响应。",
+    "EmailSiteUsageRevokeResponse": "撤销邮箱站点占用的结果。",
     "MailboxAccessTokenRefreshItemResponse": "单个邮箱的 Token 刷新结果。",
     "MailboxAccessTokenRefreshRequest": "批量刷新请求；邮箱 ID 为空时刷新全部可用邮箱。",
     "MailboxAccessTokenRefreshResponse": "批量刷新汇总响应，不返回 Token 明文。",
@@ -416,12 +483,35 @@ app = FastAPI(
 
 
 @app.middleware("http")
-async def prevent_api_response_caching(request: Request, call_next):
-    """Prevent all API success and error responses from being retained by caches."""
+async def apply_security_and_cache_headers(request: Request, call_next):
+    """Attach security headers and prevent API responses from being cached."""
     response = await call_next(request)
     if request.url.path.startswith("/api/v1/"):
         response.headers["Cache-Control"] = "no-store"
         response.headers["Pragma"] = "no-cache"
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault(
+        "Permissions-Policy",
+        "camera=(), microphone=(), geolocation=(), payment=()",
+    )
+    # SPA CSP: no remote script, no framing; styles allow Vite-injected inline rules.
+    if not request.url.path.startswith("/api/v1/") and "Content-Security-Policy" not in response.headers:
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+            "img-src 'self' data:; font-src 'self'; connect-src 'self'; "
+            "object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+        )
+    settings = get_settings()
+    if settings.enable_hsts and settings.app_env == "production":
+        # Only emit HSTS when the request is already known to be HTTPS (proxy-terminated).
+        forwarded_proto = request.headers.get("x-forwarded-proto", "").split(",")[0].strip().lower()
+        if request.url.scheme == "https" or forwarded_proto == "https":
+            response.headers.setdefault(
+                "Strict-Transport-Security",
+                f"max-age={settings.hsts_max_age_seconds}; includeSubDomains",
+            )
     return response
 
 
@@ -497,6 +587,7 @@ def get_public_openapi_routes() -> list[APIRoute]:
             route.path == "/health"
             or route.path.startswith("/api/v1/leases")
             or route.path.startswith("/api/v1/mailboxes")
+            or route.path == "/api/v1/usage-sites"
         )
     ]
 
@@ -618,26 +709,37 @@ ProxyServiceDependency = Annotated[EgressProxyService, Depends(get_proxy_service
 def get_access_token_service(
     session: SessionDependency,
     settings: SettingsDependency,
-    proxy_service: ProxyServiceDependency,
 ) -> MailboxAccessTokenService:
-    """Provide request-local AT cache services backed by encrypted storage."""
+    """Provide request-local AT cache services backed by encrypted storage.
+
+    OAuth/IMAP/Graph transports use an independent proxy Unit of Work so network
+    I/O never commits or holds the request-scoped session.
+    """
     cipher = get_credential_cipher(settings)
     if cipher is None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail={"code": "CREDENTIAL_ENCRYPTION_NOT_CONFIGURED", "message": "未配置凭证加密密钥"},
         )
+    transport_proxy_service = EgressProxyService(
+        session_factory=SessionFactory,
+        settings=settings,
+        credential_cipher=cipher,
+    )
+    oauth_client = MicrosoftOAuthClient(transport_proxy_service, settings)
     capability_prober = MailboxCapabilityProbeService(
         settings,
-        MicrosoftIMAPClient(proxy_service, settings),
-        MicrosoftGraphMailProbeClient(proxy_service, settings),
+        MicrosoftIMAPClient(transport_proxy_service, settings),
+        MicrosoftGraphMailProbeClient(transport_proxy_service, settings),
+        oauth_client=oauth_client,
     )
     return MailboxAccessTokenService(
         session,
         settings,
         cipher,
-        MicrosoftOAuthClient(proxy_service, settings),
+        oauth_client,
         capability_prober=capability_prober,
+        session_factory=SessionFactory,
     )
 
 
@@ -736,6 +838,7 @@ def configure_no_store(response: Response) -> None:
 
 def to_external_http_exception(error: Exception) -> HTTPException:
     """Map domain failures to stable external API error contracts."""
+    external_api_logger = logging.getLogger("uvicorn.error")
     if isinstance(error, ClientKeyScopeError):
         return HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -755,6 +858,16 @@ def to_external_http_exception(error: Exception) -> HTTPException:
         return HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail={"code": "MAILBOX_BUSY", "message": str(error)},
+        )
+    if isinstance(error, LeaseUsageSiteError):
+        return HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "INVALID_USAGE_SITE", "message": str(error)},
+        )
+    if isinstance(error, LeaseEmailSiteConflictError):
+        return HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "EMAIL_SITE_IN_USE", "message": str(error)},
         )
     if isinstance(error, LeaseUnavailableError):
         return HTTPException(
@@ -777,16 +890,28 @@ def to_external_http_exception(error: Exception) -> HTTPException:
             detail={"code": "TOKEN_VERSION_CONFLICT", "message": str(error)},
         )
     if isinstance(error, MicrosoftInvalidGrantError):
+        external_api_logger.warning(
+            "external_api_error code=MICROSOFT_REFRESH_TOKEN_INVALID status=409 message=%s",
+            summarize_exception(error),
+        )
         return HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail={"code": "MICROSOFT_REFRESH_TOKEN_INVALID", "message": str(error)},
         )
     if isinstance(error, MicrosoftOAuthError):
+        external_api_logger.warning(
+            "external_api_error code=MICROSOFT_TOKEN_REFRESH_FAILED status=502 message=%s",
+            summarize_exception(error),
+        )
         return HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail={"code": "MICROSOFT_TOKEN_REFRESH_FAILED", "message": str(error)},
         )
     if isinstance(error, VerificationCodeReadError):
+        external_api_logger.warning(
+            "external_api_error code=MAILBOX_INBOX_READ_FAILED status=502 message=%s",
+            summarize_exception(error),
+        )
         return HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail={"code": "MAILBOX_INBOX_READ_FAILED", "message": str(error)},
@@ -796,6 +921,10 @@ def to_external_http_exception(error: Exception) -> HTTPException:
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail={"code": "INVALID_REQUEST", "message": str(error)},
         )
+    external_api_logger.error(
+        "external_api_error code=EXTERNAL_API_ERROR status=500 message=%s",
+        summarize_exception(error),
+    )
     return HTTPException(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         detail={"code": "EXTERNAL_API_ERROR", "message": "外部服务请求处理失败"},
@@ -809,17 +938,21 @@ def create_audit_log(
     target_type: str,
     target_id: str | None,
     metadata: dict[str, Any],
+    *,
+    operation_id: str | None = None,
 ) -> None:
     """Persist an Admin audit event after callers have already removed secret values."""
-    session.add(
-        AuditLog(
-            actor_type="admin",
-            actor_id=actor_id,
-            event_type=event_type,
-            target_type=target_type,
-            target_id=target_id,
-            metadata_json=metadata,
-        )
+    from mailbox_service.audit_service import write_audit_event
+
+    write_audit_event(
+        session,
+        actor_type="admin",
+        actor_id=actor_id,
+        event_type=event_type,
+        target_type=target_type,
+        target_id=target_id,
+        metadata=metadata,
+        operation_id=operation_id,
     )
 
 
@@ -975,8 +1108,29 @@ def parse_mailbox_import_line(line_number: int, raw_line: str) -> tuple[str, str
 
 @app.get("/health")
 def get_health() -> dict[str, str]:
-    """Return a side-effect-free readiness response for local deployment checks."""
+    """Return a side-effect-free liveness-compatible response for local deployment checks."""
     return {"status": "ok"}
+
+
+@app.get("/live")
+def get_liveness() -> dict[str, str]:
+    """Process liveness probe: does not touch the database."""
+    return {"status": "alive"}
+
+
+@app.get("/ready")
+def get_readiness(session: SessionDependency) -> dict[str, str]:
+    """Readiness probe: verifies the database accepts a trivial query."""
+    from sqlalchemy import text as sql_text
+
+    try:
+        session.execute(sql_text("SELECT 1"))
+    except Exception as error:  # noqa: BLE001 - map any connectivity failure to 503.
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "DATABASE_NOT_READY", "message": "数据库尚未就绪"},
+        ) from error
+    return {"status": "ready"}
 
 
 @app.post(
@@ -1000,6 +1154,7 @@ def acquire_mailbox_account(
             purpose=payload.purpose,
             use_plus_alias=payload.use_plus_alias,
             preferred_alias_suffix=payload.alias_suffix,
+            usage_site=payload.usage_site,
         )
     except Exception as error:
         raise to_external_http_exception(error) from error
@@ -1009,9 +1164,32 @@ def acquire_mailbox_account(
         primary_email=result.primary_email,
         allocated_email=result.allocated_email or result.primary_email,
         address_kind=result.address_kind,
+        usage_site=result.usage_site,
         mode=LeaseMode.MAIL_READ,
         expires_at=result.expires_at,
         created_at=result.created_at,
+    )
+
+
+@app.get("/api/v1/usage-sites", response_model=UsageSiteListResponse)
+def list_enabled_usage_sites(
+    principal: ClientPrincipalDependency,
+    lease_service: LeaseServiceDependency,
+) -> UsageSiteListResponse:
+    """List enabled registration sites for mail_read acquire clients."""
+    try:
+        sites = lease_service.list_enabled_usage_sites(principal)
+    except Exception as error:
+        raise to_external_http_exception(error) from error
+    return UsageSiteListResponse(
+        items=[
+            UsageSiteItemResponse(
+                code=site.code,
+                display_name=site.display_name,
+                enabled=site.enabled,
+            )
+            for site in sites
+        ]
     )
 
 
@@ -1042,6 +1220,7 @@ def reacquire_mailbox_account(
         primary_email=result.primary_email,
         allocated_email=result.allocated_email or result.primary_email,
         address_kind=result.address_kind,
+        usage_site=None,
         mode=LeaseMode.MAIL_READ,
         expires_at=result.expires_at,
         created_at=result.created_at,
@@ -1052,41 +1231,91 @@ def reacquire_mailbox_account(
     "/api/v1/leases/{lease_id}/verification-code",
     response_model=LeaseVerificationCodeResponse,
 )
-def get_lease_verification_code(
+async def get_lease_verification_code(
     lease_id: str,
     payload: LeaseVerificationCodeRequest,
     principal: ClientPrincipalDependency,
     lease_service: LeaseServiceDependency,
     verification_code_service: VerificationCodeServiceDependency,
     session: SessionDependency,
+    settings: SettingsDependency,
 ) -> LeaseVerificationCodeResponse:
     """Extract a verification code from recent inbox mail for an owned mail_read lease."""
+    verification_code_logger = logging.getLogger("uvicorn.error")
+    response_mailbox_id: str | None = None
+    response_primary_email: str | None = None
     try:
+        # Initial authorization checkpoint (also enforces scope).
+        auth_snapshot = revalidate_verification_authorization(
+            session, principal=principal, lease_id=lease_id
+        )
         lease, mailbox = lease_service.load_active_mail_read_lease(principal, lease_id)
-        # Snapshot identity fields, then end the request transaction before long polling so
-        # lease/mailbox locks are not held for the entire timeout window.
         response_lease_id = lease.id
         response_mailbox_id = mailbox.id
         response_primary_email = mailbox.primary_email
         response_allocated_email = lease.allocated_email or mailbox.primary_email
         default_recipient = payload.recipient or response_allocated_email
+        # End request transaction before long polling so locks are not held across waits.
         session.commit()
 
-        lookup_result = verification_code_service.wait_for_verification_code(
-            mailbox,
-            VerificationCodeLookupOptions(
-                timeout_seconds=payload.timeout_seconds,
-                since_seconds=payload.since_seconds,
-                poll_interval_seconds=payload.poll_interval_seconds,
-                from_address=payload.from_address,
-                subject_contains=payload.subject_contains,
-                body_contains=payload.body_contains,
-                code_regex=payload.code_regex,
-                recipient=default_recipient,
-                require_recipient_match=payload.require_recipient_match,
-            ),
-        )
+        def _checkpoint() -> None:
+            with SessionFactory() as checkpoint_session:
+                try:
+                    revalidate_verification_authorization(
+                        checkpoint_session,
+                        principal=principal,
+                        lease_id=lease_id,
+                    )
+                    checkpoint_session.commit()
+                except Exception:
+                    checkpoint_session.rollback()
+                    raise
+
+        with acquire_verification_poll_slot(
+            settings,
+            client_key_id=principal.client_key_id,
+            lease_id=response_lease_id,
+        ):
+            lookup_result = await verification_code_service.wait_for_verification_code(
+                mailbox,
+                VerificationCodeLookupOptions(
+                    timeout_seconds=payload.timeout_seconds,
+                    since_seconds=payload.since_seconds,
+                    poll_interval_seconds=payload.poll_interval_seconds,
+                    from_address=payload.from_address,
+                    subject_contains=payload.subject_contains,
+                    body_contains=payload.body_contains,
+                    code_regex=payload.code_regex,
+                    recipient=default_recipient,
+                    require_recipient_match=payload.require_recipient_match,
+                ),
+                authorization_checkpoint=_checkpoint,
+            )
+    except VerificationPollCapacityExceededError as error:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail={
+                "code": "VERIFICATION_POLL_CAPACITY_EXCEEDED",
+                "message": "验证码轮询并发已达上限，请稍后重试",
+                "scope": error.scope,
+            },
+            headers={"Retry-After": str(error.retry_after_seconds)},
+        ) from error
+    except VerificationAuthorizationError as error:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN
+            if error.code.startswith("CLIENT_KEY")
+            else status.HTTP_409_CONFLICT,
+            detail={"code": error.code, "message": error.message},
+        ) from error
     except Exception as error:
+        verification_code_logger.warning(
+            "verification_code_request_failed lease_id=%s mailbox_id=%s primary_email=%s error=%s",
+            lease_id,
+            response_mailbox_id or "-",
+            response_primary_email or "-",
+            summarize_exception(error),
+        )
         raise to_external_http_exception(error) from error
     return LeaseVerificationCodeResponse(
         lease_id=response_lease_id,
@@ -1432,6 +1661,8 @@ def list_mailboxes(
             has_access_token=mailbox.access_token_ciphertext is not None,
             access_token_expires_at=mailbox.access_token_expires_at,
             access_token_refreshed_at=mailbox.access_token_refreshed_at,
+            refresh_token_updated_at=mailbox.refresh_token_updated_at,
+            refresh_token_expires_at=mailbox.refresh_token_expires_at,
             scope=mailbox.scope,
             capability=mailbox.capability.value if mailbox.capability is not None else None,
             capability_probed_at=mailbox.capability_probed_at,
@@ -1495,17 +1726,51 @@ def import_mailboxes(
             errors.append(MailboxImportLineError(line_number=line_number, message="邮箱已存在。"))
             continue
 
+        if existing_mailbox is not None and payload.on_conflict == "replace_token":
+            admin_service = MailboxAdminService(session)
+            if admin_service.list_active_claim_mailbox_ids([existing_mailbox.id]):
+                if not payload.force_release_active_leases:
+                    errors.append(
+                        MailboxImportLineError(
+                            line_number=line_number,
+                            message="邮箱存在活跃租约 claim，默认拒绝替换；可 force_release_active_leases=true",
+                        )
+                    )
+                    continue
+                admin_service.force_release_active_claims(
+                    existing_mailbox.id,
+                    admin_id=admin_id,
+                )
+
         encrypted_mail_password = cipher.encrypt(mail_password)
         encrypted_refresh_token = cipher.encrypt(refresh_token)
+        refresh_token_touched_at = utc_now()
         if existing_mailbox is None:
-            session.add(
-                Mailbox(
-                    primary_email=primary_email,
-                    status=MailboxStatus.ACTIVE,
-                    client_id=client_id,
-                    mail_password_ciphertext=encrypted_mail_password,
-                    refresh_token_ciphertext=encrypted_refresh_token,
-                )
+            new_mailbox = Mailbox(
+                primary_email=primary_email,
+                status=MailboxStatus.ACTIVE,
+                client_id=client_id,
+                mail_password_ciphertext=encrypted_mail_password,
+                refresh_token_ciphertext=encrypted_refresh_token,
+            )
+            stamp_refresh_token_lifetime(
+                new_mailbox,
+                lifetime_days=settings.refresh_token_lifetime_days,
+                touched_at=refresh_token_touched_at,
+            )
+            session.add(new_mailbox)
+            session.flush()
+            create_audit_log(
+                session,
+                admin_id,
+                "mailbox.import_item",
+                "mailbox",
+                new_mailbox.id,
+                {
+                    "action": "created",
+                    "line_number": line_number,
+                    "primary_email": primary_email,
+                },
             )
             created_count += 1
         else:
@@ -1513,15 +1778,45 @@ def import_mailboxes(
             existing_mailbox.client_id = client_id
             existing_mailbox.mail_password_ciphertext = encrypted_mail_password
             existing_mailbox.refresh_token_ciphertext = encrypted_refresh_token
+            stamp_refresh_token_lifetime(
+                existing_mailbox,
+                lifetime_days=settings.refresh_token_lifetime_days,
+                touched_at=refresh_token_touched_at,
+            )
             existing_mailbox.access_token_ciphertext = None
             existing_mailbox.access_token_expires_at = None
             existing_mailbox.access_token_refreshed_at = None
+            existing_mailbox.access_token_source_version = None
             existing_mailbox.scope = None
             existing_mailbox.capability = None
             existing_mailbox.capability_probed_at = None
             existing_mailbox.capability_probe_error = None
-            existing_mailbox.token_version += 1
-            existing_mailbox.updated_at = utc_now()
+            existing_mailbox.updated_at = refresh_token_touched_at
+            # Persist field updates first, then atomically bump token_version in SQL (SEC-08).
+            session.flush()
+            from sqlalchemy import text as sql_text
+
+            session.execute(
+                sql_text(
+                    "UPDATE mailboxes SET token_version = token_version + 1 "
+                    "WHERE id = :mailbox_id"
+                ),
+                {"mailbox_id": existing_mailbox.id},
+            )
+            session.refresh(existing_mailbox)
+            create_audit_log(
+                session,
+                admin_id,
+                "mailbox.import_item",
+                "mailbox",
+                existing_mailbox.id,
+                {
+                    "action": "replaced",
+                    "line_number": line_number,
+                    "primary_email": primary_email,
+                    "token_version": existing_mailbox.token_version,
+                },
+            )
             updated_count += 1
 
     if not seen_primary_emails and not errors:
@@ -1670,33 +1965,27 @@ def delete_mailboxes(
     session: SessionDependency,
     admin_id: AdminDependency,
 ) -> MailboxBatchDeleteResponse:
-    """Delete selected mailboxes and cascade-related leases; missing IDs are reported, not fatal."""
-    mailboxes, missing_mailbox_ids = load_mailboxes_by_ids(session, payload.mailbox_ids)
-    deleted_mailbox_ids = [mailbox.id for mailbox in mailboxes]
-    deleted_primary_emails = [mailbox.primary_email for mailbox in mailboxes]
-
-    if deleted_mailbox_ids:
-        session.execute(delete(Lease).where(Lease.mailbox_id.in_(deleted_mailbox_ids)))
-        session.execute(delete(Mailbox).where(Mailbox.id.in_(deleted_mailbox_ids)))
-        session.flush()
-        create_audit_log(
-            session,
-            admin_id,
-            "mailbox.deleted",
-            "mailbox",
-            None,
-            {
-                "deleted": len(deleted_mailbox_ids),
-                "deleted_mailbox_ids": deleted_mailbox_ids,
-                "deleted_primary_emails": deleted_primary_emails,
-                "missing_mailbox_ids": missing_mailbox_ids,
-            },
+    """Delete selected mailboxes; active claims block unless force_release_active_leases."""
+    admin_service = MailboxAdminService(session)
+    try:
+        result = admin_service.delete_mailboxes_by_ids(
+            payload.mailbox_ids,
+            admin_id=admin_id,
+            force_release_active_leases=payload.force_release_active_leases,
         )
-
+    except ActiveLeaseClaimConflictError as error:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "ACTIVE_LEASE_CLAIM",
+                "message": "存在活跃租约 claim，默认拒绝删除；可 force_release_active_leases=true",
+                "mailbox_ids": error.mailbox_ids,
+            },
+        ) from error
     return MailboxBatchDeleteResponse(
-        deleted=len(deleted_mailbox_ids),
-        deleted_mailbox_ids=deleted_mailbox_ids,
-        missing_mailbox_ids=missing_mailbox_ids,
+        deleted=result.deleted,
+        deleted_mailbox_ids=result.deleted_mailbox_ids,
+        missing_mailbox_ids=result.missing_mailbox_ids,
     )
 
 
@@ -1845,73 +2134,225 @@ def _is_mysql_lock_wait_timeout(error: Exception) -> bool:
 def delete_invalid_mailboxes(
     session: SessionDependency,
     admin_id: AdminDependency,
+    force_release_active_leases: bool = Query(default=False),
 ) -> MailboxDeleteInvalidResponse:
-    """Delete invalid mailboxes in small batches to reduce lock-wait conflicts with long readers."""
-    invalid_mailbox_rows = list(
-        session.execute(
-            select(Mailbox.id, Mailbox.primary_email)
-            .where(Mailbox.status == MailboxStatus.INVALID)
-            .order_by(Mailbox.primary_email.asc())
-        ).all()
-    )
-    if not invalid_mailbox_rows:
-        return MailboxDeleteInvalidResponse(
-            deleted=0,
-            deleted_mailbox_ids=[],
-            deleted_primary_emails=[],
+    """Delete invalid mailboxes in SKIP LOCKED chunks with per-chunk durable audit."""
+    admin_service = MailboxAdminService(session)
+    try:
+        result = admin_service.delete_invalid_mailboxes_in_chunks(
+            admin_id=admin_id,
+            batch_size=25,
+            force_release_active_leases=force_release_active_leases,
         )
-
-    deleted_mailbox_ids: list[str] = []
-    deleted_primary_emails: list[str] = []
-    delete_batch_size = 25
-
-    for batch_start in range(0, len(invalid_mailbox_rows), delete_batch_size):
-        batch_rows = invalid_mailbox_rows[batch_start : batch_start + delete_batch_size]
-        batch_mailbox_ids = [row[0] for row in batch_rows]
-        batch_primary_emails = [row[1] for row in batch_rows]
-        try:
-            session.execute(delete(Lease).where(Lease.mailbox_id.in_(batch_mailbox_ids)))
-            session.execute(delete(Mailbox).where(Mailbox.id.in_(batch_mailbox_ids)))
-            session.flush()
-        except OperationalError as error:
-            session.rollback()
-            if _is_mysql_lock_wait_timeout(error):
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail={
-                        "code": "MAILBOX_DELETE_LOCK_TIMEOUT",
-                        "message": (
-                            "删除失效邮箱时等待数据库锁超时。"
-                            "可能有验证码轮询或其他写操作仍占用相关行锁，请稍后重试或避开高峰操作。"
-                        ),
-                        "deleted": len(deleted_mailbox_ids),
-                        "remaining": len(invalid_mailbox_rows) - len(deleted_mailbox_ids),
-                    },
-                ) from error
-            raise
-
-        deleted_mailbox_ids.extend(batch_mailbox_ids)
-        deleted_primary_emails.extend(batch_primary_emails)
-        # Commit each batch so locks are released before the next batch starts.
         session.commit()
-
-    create_audit_log(
-        session,
-        admin_id,
-        "mailbox.invalid_deleted",
-        "mailbox",
-        None,
-        {
-            "deleted": len(deleted_mailbox_ids),
-            "deleted_mailbox_ids": deleted_mailbox_ids,
-            "deleted_primary_emails": deleted_primary_emails,
-        },
+    except ActiveLeaseClaimConflictError as error:
+        session.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "ACTIVE_LEASE_CLAIM",
+                "message": "存在活跃租约 claim，默认拒绝删除；可 force_release_active_leases=true",
+                "mailbox_ids": error.mailbox_ids,
+            },
+        ) from error
+    except OperationalError as error:
+        session.rollback()
+        if _is_mysql_lock_wait_timeout(error):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": "MAILBOX_DELETE_LOCK_TIMEOUT",
+                    "message": "删除失效邮箱时等待数据库锁超时，请稍后重试。",
+                },
+            ) from error
+        raise
+    return MailboxDeleteInvalidResponse(
+        deleted=result.deleted,
+        deleted_mailbox_ids=result.deleted_mailbox_ids,
+        deleted_primary_emails=result.deleted_primary_emails,
     )
 
-    return MailboxDeleteInvalidResponse(
-        deleted=len(deleted_mailbox_ids),
-        deleted_mailbox_ids=deleted_mailbox_ids,
-        deleted_primary_emails=deleted_primary_emails,
+
+def serialize_usage_site_item(
+    site,
+    *,
+    active_usage_count: int | None = None,
+) -> UsageSiteItemResponse:
+    """Serialize a UsageSite ORM row for admin and external list responses."""
+    return UsageSiteItemResponse(
+        code=site.code,
+        display_name=site.display_name,
+        enabled=site.enabled,
+        created_at=site.created_at,
+        active_usage_count=active_usage_count,
+    )
+
+
+@app.get("/api/v1/admin/usage-sites", response_model=UsageSiteListResponse)
+def admin_list_usage_sites(
+    lease_service: LeaseServiceDependency,
+    _: AdminDependency,
+    include_disabled: bool = Query(default=True, description="是否包含已禁用站点。"),
+) -> UsageSiteListResponse:
+    """List registration-site whitelist entries for operators."""
+    sites = lease_service.list_usage_sites_for_admin(include_disabled=include_disabled)
+    return UsageSiteListResponse(
+        items=[
+            serialize_usage_site_item(
+                site,
+                active_usage_count=lease_service.count_active_email_site_usages(site.code),
+            )
+            for site in sites
+        ]
+    )
+
+
+@app.post(
+    "/api/v1/admin/usage-sites",
+    response_model=UsageSiteItemResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def admin_create_usage_site(
+    payload: UsageSiteCreateRequest,
+    lease_service: LeaseServiceDependency,
+    _: AdminDependency,
+) -> UsageSiteItemResponse:
+    """Create a new registration-site whitelist entry."""
+    try:
+        site = lease_service.create_usage_site(
+            code=payload.code,
+            display_name=payload.display_name,
+            enabled=payload.enabled,
+        )
+    except UsageSiteConflictError as error:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "USAGE_SITE_ALREADY_EXISTS", "message": str(error)},
+        ) from error
+    except ValueError as error:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"code": "INVALID_REQUEST", "message": str(error)},
+        ) from error
+    return serialize_usage_site_item(site)
+
+
+@app.patch("/api/v1/admin/usage-sites/{code}", response_model=UsageSiteItemResponse)
+def admin_update_usage_site(
+    code: str,
+    payload: UsageSiteUpdateRequest,
+    lease_service: LeaseServiceDependency,
+    _: AdminDependency,
+) -> UsageSiteItemResponse:
+    """Update display name and/or enabled flag for a whitelist site."""
+    try:
+        site = lease_service.update_usage_site(
+            code,
+            display_name=payload.display_name,
+            enabled=payload.enabled,
+        )
+    except UsageSiteNotFoundError as error:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "USAGE_SITE_NOT_FOUND", "message": str(error)},
+        ) from error
+    except ValueError as error:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"code": "INVALID_REQUEST", "message": str(error)},
+        ) from error
+    return serialize_usage_site_item(
+        site,
+        active_usage_count=lease_service.count_active_email_site_usages(site.code),
+    )
+
+
+@app.delete("/api/v1/admin/usage-sites/{code}", status_code=status.HTTP_204_NO_CONTENT)
+def admin_delete_usage_site(
+    code: str,
+    lease_service: LeaseServiceDependency,
+    _: AdminDependency,
+) -> Response:
+    """Delete a whitelist site when it has no active occupancy."""
+    try:
+        lease_service.delete_usage_site(code)
+    except UsageSiteNotFoundError as error:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "USAGE_SITE_NOT_FOUND", "message": str(error)},
+        ) from error
+    except UsageSiteInUseError as error:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "USAGE_SITE_IN_USE", "message": str(error)},
+        ) from error
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@app.get("/api/v1/admin/email-site-usages", response_model=EmailSiteUsageListResponse)
+def admin_list_email_site_usages(
+    lease_service: LeaseServiceDependency,
+    _: AdminDependency,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+    allocated_email: str | None = Query(default=None, description="按完整业务地址精确筛选。"),
+    usage_site: str | None = Query(default=None, description="按站点 code 筛选。"),
+    include_revoked: bool = Query(default=True, description="是否包含已撤销记录。"),
+) -> EmailSiteUsageListResponse:
+    """Page through email/site occupancy for operational troubleshooting."""
+    items, total_count = lease_service.list_email_site_usages(
+        allocated_email=allocated_email,
+        usage_site=usage_site,
+        include_revoked=include_revoked,
+        page=page,
+        page_size=page_size,
+    )
+    total_pages = max(1, (total_count + page_size - 1) // page_size)
+    return EmailSiteUsageListResponse(
+        total=total_count,
+        page=page,
+        page_size=page_size,
+        total_pages=total_pages,
+        items=[
+            EmailSiteUsageItemResponse(
+                id=item.id,
+                allocated_email=item.allocated_email,
+                usage_site=item.usage_site_code,
+                mailbox_id=item.mailbox_id,
+                lease_id=item.lease_id,
+                client_key_id=item.client_key_id,
+                created_at=item.created_at,
+                revoked_at=item.revoked_at,
+                updated_at=item.updated_at,
+            )
+            for item in items
+        ],
+    )
+
+
+@app.post(
+    "/api/v1/admin/email-site-usages/{usage_id}/revoke",
+    response_model=EmailSiteUsageRevokeResponse,
+)
+def admin_revoke_email_site_usage(
+    usage_id: str,
+    lease_service: LeaseServiceDependency,
+    _: AdminDependency,
+) -> EmailSiteUsageRevokeResponse:
+    """Soft-revoke an occupancy row so the address can be registered again."""
+    try:
+        usage = lease_service.revoke_email_site_usage(usage_id)
+    except LeaseNotFoundError as error:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "EMAIL_SITE_USAGE_NOT_FOUND", "message": str(error)},
+        ) from error
+    assert usage.revoked_at is not None
+    return EmailSiteUsageRevokeResponse(
+        id=usage.id,
+        allocated_email=usage.allocated_email,
+        usage_site=usage.usage_site_code,
+        revoked_at=usage.revoked_at,
     )
 
 

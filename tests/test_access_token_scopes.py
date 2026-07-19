@@ -5,7 +5,12 @@ from __future__ import annotations
 from base64 import urlsafe_b64encode
 import json
 
-from mailbox_service.access_token_scopes import extract_oauth_scopes_from_access_token
+from mailbox_service.access_token_scopes import (
+    GRAPH_MAIL_READ_SCOPE,
+    cached_token_matches_mail_channel,
+    extract_oauth_scopes_from_access_token,
+    resolve_oauth_refresh_scope_for_channel,
+)
 
 
 def build_unsigned_jwt(payload: dict) -> str:
@@ -60,3 +65,24 @@ def test_infer_mail_access_channel_preference_orders_by_scope_hints() -> None:
     ) == ["imap", "graph"]
     assert infer_mail_access_channel_preference("Mail.Read offline_access") == ["graph", "imap"]
     assert infer_mail_access_channel_preference(None) == ["imap", "graph"]
+
+
+def test_resolve_oauth_refresh_scope_for_channel() -> None:
+    assert resolve_oauth_refresh_scope_for_channel("graph") == GRAPH_MAIL_READ_SCOPE
+    assert resolve_oauth_refresh_scope_for_channel("imap") is None
+    assert resolve_oauth_refresh_scope_for_channel(None) is None
+
+
+def test_cached_token_matches_mail_channel_by_audience() -> None:
+    graph_scope = "https://graph.microsoft.com/Mail.Read offline_access"
+    outlook_scope = (
+        "https://outlook.office.com/IMAP.AccessAsUser.All "
+        "https://outlook.office.com/Mail.Read"
+    )
+
+    assert cached_token_matches_mail_channel(graph_scope, "graph") is True
+    assert cached_token_matches_mail_channel(graph_scope, "imap") is False
+    assert cached_token_matches_mail_channel(outlook_scope, "imap") is True
+    assert cached_token_matches_mail_channel(outlook_scope, "graph") is False
+    assert cached_token_matches_mail_channel(None, "imap") is True
+    assert cached_token_matches_mail_channel(None, "graph") is False

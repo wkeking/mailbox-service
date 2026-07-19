@@ -23,7 +23,13 @@ from mailbox_service.token_service import MailboxAccessTokenService
 class UnexpectedOAuthClient:
     """Fail immediately if a test unexpectedly bypasses the cached Access Token."""
 
-    def refresh_access_token(self, mailbox: Mailbox, refresh_token: str):
+    def refresh_access_token(
+        self,
+        mailbox: Mailbox,
+        refresh_token: str,
+        *,
+        scope: str | None = None,
+    ):
         raise AssertionError("有效 AT 缓存不应触发 OAuth 请求")
 
 
@@ -36,7 +42,8 @@ def test_external_api_uses_client_key_and_rejects_admin_token() -> None:
         poolclass=StaticPool,
     )
     Base.metadata.create_all(database_engine)
-    session: Session = sessionmaker(bind=database_engine, expire_on_commit=False)()
+    session_factory = sessionmaker(bind=database_engine, expire_on_commit=False)
+    session: Session = session_factory()
     encryption_key = urlsafe_b64encode(b"h" * 32).decode("ascii")
     settings = Settings(
         database_url="sqlite+pysqlite:///:memory:",
@@ -49,6 +56,7 @@ def test_external_api_uses_client_key_and_rejects_admin_token() -> None:
         client_id="client-id",
         refresh_token_ciphertext=credential_cipher.encrypt("refresh-token"),
         access_token_ciphertext=credential_cipher.encrypt("cached-access-token"),
+        access_token_source_version=1,
         access_token_expires_at=utc_now() + timedelta(minutes=20),
         access_token_refreshed_at=utc_now(),
     )
@@ -63,6 +71,7 @@ def test_external_api_uses_client_key_and_rejects_admin_token() -> None:
         settings,
         credential_cipher,
         UnexpectedOAuthClient(),
+        session_factory=session_factory,
     )
     lease_service = LeaseService(session, credential_cipher, access_token_service)
 

@@ -13,6 +13,10 @@ from mailbox_service.capability_probe_service import (
 from mailbox_service.config import Settings
 from mailbox_service.database import SessionFactory
 from mailbox_service.proxy_service import EgressProxyService, MicrosoftIMAPClient, MicrosoftOAuthClient
+from mailbox_service.scheduler_lease_repository import (
+    ScheduledJobLeaseRepository,
+    build_scheduler_owner_id,
+)
 from mailbox_service.security import CredentialCipher, summarize_exception
 from mailbox_service.token_service import MailboxAccessTokenService
 
@@ -34,19 +38,40 @@ class RefreshTokenKeepaliveRunner:
             return
 
         credential_cipher = CredentialCipher(self._settings.credential_encryption_key)
+        owner_id = build_scheduler_owner_id()
         with SessionFactory() as session:
-            proxy_service = EgressProxyService(session, self._settings, credential_cipher)
+            job_lease_repository = ScheduledJobLeaseRepository(session)
+            job_handle = job_lease_repository.try_acquire(
+                "refresh-token-keepalive",
+                owner_id,
+                lease_seconds=self._settings.scheduler_job_lease_seconds,
+            )
+            if job_handle is None:
+                session.rollback()
+                logger.info("Refresh-token keepalive skipped: another owner holds the job lease")
+                return
+            session.commit()
+
+        with SessionFactory() as session:
+            proxy_service = EgressProxyService(
+                session_factory=SessionFactory,
+                settings=self._settings,
+                credential_cipher=credential_cipher,
+            )
+            oauth_client = MicrosoftOAuthClient(proxy_service, self._settings)
             capability_prober = MailboxCapabilityProbeService(
                 self._settings,
                 MicrosoftIMAPClient(proxy_service, self._settings),
                 MicrosoftGraphMailProbeClient(proxy_service, self._settings),
+                oauth_client=oauth_client,
             )
             access_token_service = MailboxAccessTokenService(
                 session,
                 self._settings,
                 credential_cipher,
-                MicrosoftOAuthClient(proxy_service, self._settings),
+                oauth_client,
                 capability_prober=capability_prober,
+                session_factory=SessionFactory,
             )
             try:
                 result = access_token_service.run_refresh_token_keepalive_batch()
@@ -58,6 +83,13 @@ class RefreshTokenKeepaliveRunner:
                     summarize_exception(error),
                 )
                 return
+            finally:
+                try:
+                    with SessionFactory() as release_session:
+                        ScheduledJobLeaseRepository(release_session).release(job_handle)
+                        release_session.commit()
+                except Exception:  # noqa: BLE001 - release best-effort.
+                    logger.warning("Refresh-token keepalive job lease release failed")
 
         if result.successful or result.failed:
             logger.info(

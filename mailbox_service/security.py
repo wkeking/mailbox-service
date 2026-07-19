@@ -69,3 +69,50 @@ def summarize_exception(error: Exception, maximum_length: int = 200) -> str:
     if not message:
         return error.__class__.__name__
     return f"{error.__class__.__name__}: {message[:maximum_length]}"
+
+
+def summarize_text(value: str | None, maximum_length: int = 300) -> str:
+    """Collapse whitespace and truncate free-form remote error text for logs."""
+    if value is None:
+        return ""
+    cleaned = " ".join(value.split()).strip()
+    if not cleaned:
+        return ""
+    if len(cleaned) <= maximum_length:
+        return cleaned
+    return cleaned[:maximum_length] + "..."
+
+
+def summarize_microsoft_error_payload(payload: object, *, maximum_length: int = 300) -> str:
+    """Extract Microsoft OAuth/Graph error fields without leaking response bodies wholesale."""
+    if not isinstance(payload, dict):
+        return ""
+
+    oauth_error = payload.get("error")
+    if isinstance(oauth_error, str) and oauth_error.strip():
+        description = payload.get("error_description")
+        description_text = summarize_text(
+            description if isinstance(description, str) else None,
+            maximum_length=maximum_length,
+        )
+        if description_text:
+            return f"error={oauth_error.strip()} description={description_text}"
+        return f"error={oauth_error.strip()}"
+
+    graph_error = payload.get("error")
+    if isinstance(graph_error, dict):
+        code = graph_error.get("code")
+        message = graph_error.get("message")
+        code_text = code.strip() if isinstance(code, str) and code.strip() else None
+        message_text = summarize_text(
+            message if isinstance(message, str) else None,
+            maximum_length=maximum_length,
+        )
+        parts: list[str] = []
+        if code_text:
+            parts.append(f"code={code_text}")
+        if message_text:
+            parts.append(f"message={message_text}")
+        return " ".join(parts)
+
+    return ""

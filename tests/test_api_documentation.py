@@ -31,6 +31,7 @@ def test_public_documentation_only_exposes_external_service_routes() -> None:
         "/api/v1/mailboxes/acquire",
         "/api/v1/mailboxes/reacquire",
         "/api/v1/leases/{lease_id}/verification-code",
+        "/api/v1/usage-sites",
     }
     assert security_schemes["ClientApiKey"] == {
         "type": "apiKey",

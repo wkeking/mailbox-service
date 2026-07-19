@@ -8,6 +8,10 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from mailbox_service.models import EgressProxyProtocol, EgressProxyStatus, LeaseMode, MailboxStatus
+from mailbox_service.verification_code_matcher import (
+    SAFE_CODE_REGEX_PRESETS,
+    VerificationCodePatternType,
+)
 
 
 class EgressProxyCreate(BaseModel):
@@ -152,6 +156,13 @@ class MailboxImportRequest(BaseModel):
         pattern="^(skip|replace_token|error)$",
         description="邮箱已存在时的策略：skip 跳过，replace_token 替换凭证，error 记为失败。",
     )
+    force_release_active_leases: bool = Field(
+        default=False,
+        description=(
+            "replace_token 时若邮箱存在 active lease claim："
+            "默认 false 记为行级失败；true 则先释放 claim/lease 再替换 RT。"
+        ),
+    )
 
 
 class MailboxImportLineError(BaseModel):
@@ -178,6 +189,13 @@ class MailboxBatchIdsRequest(BaseModel):
         min_length=1,
         max_length=500,
         description="待操作邮箱 ID 列表；会自动去重，最多 500 个。",
+    )
+    force_release_active_leases: bool = Field(
+        default=False,
+        description=(
+            "为 true 时强制释放 active lease claim 后再删除；"
+            "默认 false，存在 active claim 时返回 409。"
+        ),
     )
 
     @field_validator("mailbox_ids")
@@ -316,6 +334,14 @@ class MailboxListItemResponse(BaseModel):
     has_access_token: bool = Field(description="是否已缓存 Access Token。")
     access_token_expires_at: datetime | None = Field(default=None, description="缓存 AT 过期时间。")
     access_token_refreshed_at: datetime | None = Field(default=None, description="最近一次刷新 AT 的时间。")
+    refresh_token_updated_at: datetime | None = Field(
+        default=None,
+        description="最近一次写入或成功使用 Refresh Token 的时间（滑动窗口起点）。",
+    )
+    refresh_token_expires_at: datetime | None = Field(
+        default=None,
+        description="服务估算的 Refresh Token 过期时间（updated_at + 配置寿命，默认 90 天）。",
+    )
     scope: str | None = Field(default=None, description="识别到的 OAuth scope 字符串。")
     capability: str | None = Field(default=None, description="运行时探测能力：imap / graph / unusable / unknown。")
     capability_probed_at: datetime | None = Field(default=None, description="能力最近探测时间。")
@@ -472,16 +498,31 @@ class MailboxAcquireRequest(BaseModel):
             "传入时等价于 use_plus_alias=true；不传且 use_plus_alias=true 时随机生成 8 位。"
         ),
     )
+    usage_site: str | None = Field(
+        default=None,
+        max_length=64,
+        description=(
+            "注册站点白名单 code（如 openai、grok）。"
+            "使用主邮箱时必填；使用 plus alias 时选填，填了才写入占用并参与后续排除。"
+        ),
+    )
     client_tag: str | None = Field(default=None, max_length=100, description="调用方自定义标签，便于排查。")
     purpose: str | None = Field(default=None, max_length=100, description="领取用途说明。")
 
-    @field_validator("preferred_email", "client_tag", "purpose", "alias_suffix")
+    @field_validator("preferred_email", "client_tag", "purpose", "alias_suffix", "usage_site")
     @classmethod
     def normalize_optional_mailbox_acquire_text(cls, value: str | None) -> str | None:
         if value is None:
             return None
         normalized_value = value.strip()
         return normalized_value or None
+
+    @field_validator("usage_site")
+    @classmethod
+    def normalize_usage_site_code(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return value.strip().lower() or None
 
 
 class MailboxAcquireResponse(BaseModel):
@@ -497,12 +538,116 @@ class MailboxAcquireResponse(BaseModel):
         default=None,
         description="业务地址类型：primary 表示主邮箱，plus_alias 表示 plus 别名；可能为空。",
     )
+    usage_site: str | None = Field(
+        default=None,
+        description="本租约声明的注册站点 code；未声明时为空。",
+    )
     mode: Literal[LeaseMode.MAIL_READ] = Field(
         default=LeaseMode.MAIL_READ,
         description="固定为 mail_read，不返回 access_token / refresh_token。",
     )
     expires_at: datetime = Field(description="租约到期时间。")
     created_at: datetime = Field(description="租约创建时间。")
+
+
+class UsageSiteItemResponse(BaseModel):
+    """注册站点白名单条目。"""
+
+    code: str = Field(description="站点稳定键，如 openai。")
+    display_name: str = Field(description="展示名称。")
+    enabled: bool = Field(description="是否允许新声明该站点。")
+    created_at: datetime | None = Field(default=None, description="创建时间；外部列表可能省略。")
+    active_usage_count: int | None = Field(
+        default=None,
+        description="未撤销占用条数；管理端列表返回，外部列表通常省略。",
+    )
+
+
+class UsageSiteListResponse(BaseModel):
+    """注册站点白名单列表。"""
+
+    items: list[UsageSiteItemResponse] = Field(description="站点列表。")
+
+
+class UsageSiteCreateRequest(BaseModel):
+    """管理员创建注册站点白名单条目。"""
+
+    code: str = Field(
+        min_length=2,
+        max_length=64,
+        description="站点稳定键，仅小写字母、数字、点、下划线、连字符；创建后不可改。",
+    )
+    display_name: str = Field(min_length=1, max_length=100, description="展示名称。")
+    enabled: bool = Field(default=True, description="创建后是否允许新声明。")
+
+    @field_validator("code")
+    @classmethod
+    def normalize_usage_site_code_field(cls, value: str) -> str:
+        normalized_code = value.strip().lower()
+        if not normalized_code:
+            raise ValueError("code 不能为空")
+        allowed_characters = set("abcdefghijklmnopqrstuvwxyz0123456789._-")
+        if not all(character in allowed_characters for character in normalized_code):
+            raise ValueError("code 仅允许小写字母、数字、点、下划线与连字符")
+        return normalized_code
+
+    @field_validator("display_name")
+    @classmethod
+    def normalize_usage_site_display_name(cls, value: str) -> str:
+        normalized_name = value.strip()
+        if not normalized_name:
+            raise ValueError("display_name 不能为空")
+        return normalized_name
+
+
+class UsageSiteUpdateRequest(BaseModel):
+    """管理员更新注册站点展示名或启用状态；code 不可修改。"""
+
+    display_name: str | None = Field(default=None, min_length=1, max_length=100, description="新的展示名称。")
+    enabled: bool | None = Field(default=None, description="是否允许新声明该站点。")
+
+    @field_validator("display_name")
+    @classmethod
+    def normalize_optional_display_name(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized_name = value.strip()
+        if not normalized_name:
+            raise ValueError("display_name 不能为空")
+        return normalized_name
+
+
+class EmailSiteUsageItemResponse(BaseModel):
+    """邮箱在某站点的占用记录（管理端）。"""
+
+    id: str = Field(description="占用记录 ID。")
+    allocated_email: str = Field(description="业务邮箱地址（主邮箱或 plus alias）。")
+    usage_site: str = Field(description="注册站点 code。")
+    mailbox_id: str | None = Field(default=None, description="关联邮箱 ID。")
+    lease_id: str | None = Field(default=None, description="最近写入该占用的租约 ID。")
+    client_key_id: str | None = Field(default=None, description="声明方 Client Key ID。")
+    created_at: datetime = Field(description="首次登记时间。")
+    revoked_at: datetime | None = Field(default=None, description="撤销时间；未撤销为空。")
+    updated_at: datetime = Field(description="最后更新时间。")
+
+
+class EmailSiteUsageListResponse(BaseModel):
+    """邮箱站点占用分页查询响应。"""
+
+    total: int = Field(description="总记录数。")
+    page: int = Field(description="当前页码，从 1 开始。")
+    page_size: int = Field(description="每页条数。")
+    total_pages: int = Field(description="总页数。")
+    items: list[EmailSiteUsageItemResponse] = Field(description="当前页占用列表。")
+
+
+class EmailSiteUsageRevokeResponse(BaseModel):
+    """撤销邮箱站点占用的结果。"""
+
+    id: str = Field(description="占用记录 ID。")
+    allocated_email: str = Field(description="业务邮箱地址。")
+    usage_site: str = Field(description="注册站点 code。")
+    revoked_at: datetime = Field(description="撤销时间。")
 
 
 class MailboxReacquireRequest(BaseModel):
@@ -599,18 +744,36 @@ class LeaseVerificationCodeRequest(BaseModel):
         default=None,
         max_length=200,
         description=(
-            "可选：自定义验证码正则（建议捕获组）。"
-            "默认优先匹配 xAI 格式 ABC-123，再兜底数字；传入时在 xAI 之后仅使用该正则。"
+            "已废弃：仅接受服务端登记的安全 preset（digits/alphanumeric/xai 及固定模板）。"
+            "不可信正则表达式会被拒绝。推荐使用 pattern_type。"
         ),
     )
+    pattern_type: VerificationCodePatternType | None = Field(
+        default=None,
+        description="安全验证码模式：digits / alphanumeric / xai。",
+    )
+    pattern_minimum_length: int | None = Field(default=None, ge=4, le=16)
+    pattern_maximum_length: int | None = Field(default=None, ge=4, le=16)
+    pattern_prefix: str | None = Field(default=None, max_length=32)
 
-    @field_validator("from_address", "subject_contains", "body_contains", "recipient", "code_regex")
+    @field_validator("from_address", "subject_contains", "body_contains", "recipient", "code_regex", "pattern_prefix")
     @classmethod
     def normalize_optional_filter_text(cls, value: str | None) -> str | None:
         if value is None:
             return None
         normalized_value = value.strip()
         return normalized_value or None
+
+    @field_validator("code_regex")
+    @classmethod
+    def reject_untrusted_code_regex(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if value not in SAFE_CODE_REGEX_PRESETS:
+            raise ValueError(
+                "code_regex 已废弃且仅接受服务端登记的安全 preset"
+            )
+        return value
 
 
 class LeaseVerificationCodeResponse(BaseModel):

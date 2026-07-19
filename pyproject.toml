@@ -25,6 +25,11 @@ dev = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+markers = [
+  "mysql: tests that require a real MySQL 8 database",
+  "stress: long-running concurrency or load tests",
+  "container: container and TLS smoke tests",
+]
 
 [tool.ruff]
 line-length = 100

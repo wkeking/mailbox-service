@@ -6,6 +6,7 @@ from base64 import urlsafe_b64encode
 from datetime import timedelta
 
 from sqlalchemy import create_engine
+from sqlalchemy.pool import StaticPool
 from sqlalchemy.orm import sessionmaker
 
 from mailbox_service.config import Settings
@@ -20,7 +21,13 @@ class RecordingOAuthClient:
     def __init__(self) -> None:
         self.refreshed_emails: list[str] = []
 
-    def refresh_access_token(self, mailbox: Mailbox, refresh_token: str) -> MicrosoftTokenResponse:
+    def refresh_access_token(
+        self,
+        mailbox: Mailbox,
+        refresh_token: str,
+        *,
+        scope: str | None = None,
+    ) -> MicrosoftTokenResponse:
         self.refreshed_emails.append(mailbox.primary_email)
         return MicrosoftTokenResponse(
             access_token=f"at-{mailbox.primary_email}",
@@ -36,9 +43,10 @@ def create_keepalive_service(
     lead_days: int = 7,
     batch_size: int = 20,
 ) -> tuple[MailboxAccessTokenService, CredentialCipher, RecordingOAuthClient, object]:
-    database_engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    database_engine = create_engine("sqlite+pysqlite:///:memory:", connect_args={"check_same_thread": False}, poolclass=StaticPool, future=True)
     Base.metadata.create_all(database_engine)
-    session = sessionmaker(bind=database_engine, expire_on_commit=False)()
+    session_factory = sessionmaker(bind=database_engine, expire_on_commit=False)
+    session = session_factory()
     encryption_key = urlsafe_b64encode(b"k" * 32).decode("ascii")
     settings = Settings(
         database_url="sqlite+pysqlite:///:memory:",
@@ -49,7 +57,7 @@ def create_keepalive_service(
     )
     credential_cipher = CredentialCipher(encryption_key)
     oauth_client = RecordingOAuthClient()
-    service = MailboxAccessTokenService(session, settings, credential_cipher, oauth_client)
+    service = MailboxAccessTokenService(session, settings, credential_cipher, oauth_client, session_factory=session_factory)
     return service, credential_cipher, oauth_client, session
 
 
@@ -60,14 +68,18 @@ def test_keepalive_selects_stale_active_mailboxes_and_skips_leased_or_fresh() ->
         batch_size=10,
     )
     now = utc_now()
+    # Expires in 5 days → within 7-day lead window → due.
     stale_mailbox = Mailbox(
         primary_email="stale@outlook.com",
         status=MailboxStatus.ACTIVE,
         client_id="client-id",
         refresh_token_ciphertext=credential_cipher.encrypt("old-rt"),
+        refresh_token_updated_at=now - timedelta(days=85),
+        refresh_token_expires_at=now + timedelta(days=5),
         access_token_refreshed_at=now - timedelta(days=85),
         created_at=now - timedelta(days=120),
     )
+    # Legacy row without RT expiry columns; last refresh 100 days ago → due via fallback.
     never_refreshed = Mailbox(
         primary_email="imported@outlook.com",
         status=MailboxStatus.ACTIVE,
@@ -76,19 +88,25 @@ def test_keepalive_selects_stale_active_mailboxes_and_skips_leased_or_fresh() ->
         access_token_refreshed_at=None,
         created_at=now - timedelta(days=100),
     )
+    # Expires in 80 days → outside lead window → skip.
     fresh_mailbox = Mailbox(
         primary_email="fresh@outlook.com",
         status=MailboxStatus.ACTIVE,
         client_id="client-id",
         refresh_token_ciphertext=credential_cipher.encrypt("fresh-rt"),
+        refresh_token_updated_at=now - timedelta(days=10),
+        refresh_token_expires_at=now + timedelta(days=80),
         access_token_refreshed_at=now - timedelta(days=10),
         created_at=now - timedelta(days=10),
     )
+    # Due by expiry but has an active lease → skip.
     leased_mailbox = Mailbox(
         primary_email="leased@outlook.com",
         status=MailboxStatus.ACTIVE,
         client_id="client-id",
         refresh_token_ciphertext=credential_cipher.encrypt("leased-rt"),
+        refresh_token_updated_at=now - timedelta(days=88),
+        refresh_token_expires_at=now + timedelta(days=2),
         access_token_refreshed_at=now - timedelta(days=88),
         created_at=now - timedelta(days=100),
     )
@@ -97,6 +115,8 @@ def test_keepalive_selects_stale_active_mailboxes_and_skips_leased_or_fresh() ->
         status=MailboxStatus.INVALID,
         client_id="client-id",
         refresh_token_ciphertext=credential_cipher.encrypt("invalid-rt"),
+        refresh_token_updated_at=now - timedelta(days=100),
+        refresh_token_expires_at=now - timedelta(days=10),
         access_token_refreshed_at=now - timedelta(days=100),
         created_at=now - timedelta(days=120),
     )
@@ -126,6 +146,13 @@ def test_keepalive_selects_stale_active_mailboxes_and_skips_leased_or_fresh() ->
     assert set(oauth_client.refreshed_emails) == {"stale@outlook.com", "imported@outlook.com"}
     assert "rotated-" in credential_cipher.decrypt(stale_mailbox.refresh_token_ciphertext or "")
     assert stale_mailbox.token_version == 2
+    assert stale_mailbox.refresh_token_updated_at is not None
+    assert stale_mailbox.refresh_token_expires_at is not None
+    # Successful refresh rewrites sliding window to ~now + 90 days.
+    # SQLite may return naive datetimes; normalize before comparing with aware utc_now().
+    from mailbox_service.models import ensure_utc
+
+    assert ensure_utc(stale_mailbox.refresh_token_expires_at) > now + timedelta(days=89)
 
 
 def test_keepalive_batch_size_limits_due_selection() -> None:
@@ -140,6 +167,8 @@ def test_keepalive_batch_size_limits_due_selection() -> None:
         status=MailboxStatus.ACTIVE,
         client_id="client-id",
         refresh_token_ciphertext=credential_cipher.encrypt("rt-a"),
+        refresh_token_updated_at=now - timedelta(days=100),
+        refresh_token_expires_at=now - timedelta(days=10),
         access_token_refreshed_at=now - timedelta(days=100),
         created_at=now - timedelta(days=120),
     )
@@ -148,6 +177,8 @@ def test_keepalive_batch_size_limits_due_selection() -> None:
         status=MailboxStatus.ACTIVE,
         client_id="client-id",
         refresh_token_ciphertext=credential_cipher.encrypt("rt-b"),
+        refresh_token_updated_at=now - timedelta(days=90),
+        refresh_token_expires_at=now + timedelta(days=1),
         access_token_refreshed_at=now - timedelta(days=90),
         created_at=now - timedelta(days=100),
     )

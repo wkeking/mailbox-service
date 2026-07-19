@@ -8,7 +8,10 @@ from email import message_from_bytes
 from email.header import decode_header, make_header
 from email.message import Message
 from email.utils import getaddresses, parsedate_to_datetime
+import asyncio
 import imaplib
+import inspect
+import logging
 import re
 import time
 from typing import Literal
@@ -17,15 +20,32 @@ from urllib.parse import quote
 import httpx
 
 from mailbox_service.config import Settings
+from mailbox_service.verification_code_matcher import (
+    MAX_MESSAGE_BODY_BYTES,
+    MAX_REQUEST_BODY_BYTES,
+    MAX_SCAN_BODY_BYTES,
+    SafeVerificationCodeMatcher,
+    VerificationCodePatternOptions,
+    VerificationCodePatternType,
+    truncate_text_to_byte_budget,
+)
 from mailbox_service.models import Mailbox, MailboxCapability, ensure_utc, utc_now
 from mailbox_service.proxy_service import (
     EgressProxyService,
     EgressProxyTransportError,
     MicrosoftIMAPClient,
     ResolvedProxy,
+    describe_proxy_for_log,
 )
-from mailbox_service.security import summarize_exception
+from mailbox_service.security import (
+    summarize_exception,
+    summarize_microsoft_error_payload,
+    summarize_text,
+)
 from mailbox_service.token_service import MailboxAccessTokenService
+
+# Prefer uvicorn's error logger so remote-mail diagnostics appear in process stdout / docker logs.
+logger = logging.getLogger("uvicorn.error")
 
 # Default digit fallback after xAI-style codes. Callers may override via code_regex.
 DEFAULT_VERIFICATION_CODE_REGEX = r"\b(\d{4,8})\b"
@@ -61,6 +81,58 @@ RECIPIENT_HEADER_NAMES = (
 )
 
 MailReadChannel = Literal["imap", "graph"]
+
+
+def _summarize_graph_response_error(response: httpx.Response) -> str:
+    """Return a truncated Graph error summary safe for operational logs."""
+    try:
+        payload = response.json()
+    except ValueError:
+        body_preview = summarize_text(response.text, maximum_length=200)
+        return body_preview or f"empty_body status={response.status_code}"
+    microsoft_error = summarize_microsoft_error_payload(payload)
+    if microsoft_error:
+        return microsoft_error
+    return f"unparsed_error status={response.status_code}"
+
+
+def is_mail_access_auth_failure(error: BaseException) -> bool:
+    """Return whether a mail-read failure looks like AT/auth rejection rather than transport.
+
+    Used to decide whether a force-refresh of the access token is worth trying once before
+    abandoning the current channel attempt. Walks ``__cause__`` so summarized
+    ``VerificationCodeReadError`` wrappers still match the underlying IMAP/Graph failure.
+    """
+    current: BaseException | None = error
+    visited: set[int] = set()
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        if isinstance(current, imaplib.IMAP4.error):
+            message = str(current).casefold()
+            if any(
+                marker in message
+                for marker in ("authenticate", "authentication", "auth failed", "login failed")
+            ):
+                return True
+        if isinstance(current, VerificationCodeReadError):
+            message = str(current).casefold()
+            original_message = str(current)
+            if "鉴权" in original_message:
+                return True
+            if any(
+                marker in message
+                for marker in (
+                    "authenticate",
+                    "authentication",
+                    "http 401",
+                    "http 403",
+                    "auth failed",
+                    "login failed",
+                )
+            ):
+                return True
+        current = current.__cause__ if isinstance(current.__cause__, BaseException) else None
+    return False
 
 
 class VerificationCodeReadError(Exception):
@@ -140,17 +212,49 @@ class MicrosoftGraphMailReader:
         """Return recent inbox messages newer than ``since_at`` (UTC)."""
         selected_proxy = self._proxy_service.resolve_for_mailbox(mailbox.id)
         try:
-            messages = self._list_once(access_token, since_at, max_messages, selected_proxy)
+            messages = self._list_once(
+                mailbox,
+                access_token,
+                since_at,
+                max_messages,
+                selected_proxy,
+            )
         except EgressProxyTransportError as error:
             if selected_proxy is None:
                 raise
+            logger.warning(
+                "microsoft_graph_proxy_failover mailbox_id=%s primary_email=%s "
+                "failed_proxy=%s error=%s",
+                mailbox.id,
+                mailbox.primary_email,
+                describe_proxy_for_log(selected_proxy),
+                summarize_exception(error),
+            )
             self._proxy_service.record_proxy_failure(selected_proxy.id, error)
             replacement_proxy = self._proxy_service.resolve_for_mailbox(
                 mailbox.id,
                 excluded_proxy_ids={selected_proxy.id},
                 force_rebind=True,
             )
-            messages = self._list_once(access_token, since_at, max_messages, replacement_proxy)
+            try:
+                messages = self._list_once(
+                    mailbox,
+                    access_token,
+                    since_at,
+                    max_messages,
+                    replacement_proxy,
+                )
+            except Exception as retry_error:
+                logger.warning(
+                    "microsoft_graph_proxy_failover_failed mailbox_id=%s primary_email=%s "
+                    "failed_proxy=%s replacement_proxy=%s error=%s",
+                    mailbox.id,
+                    mailbox.primary_email,
+                    describe_proxy_for_log(selected_proxy),
+                    describe_proxy_for_log(replacement_proxy),
+                    summarize_exception(retry_error),
+                )
+                raise
             if replacement_proxy is not None:
                 self._proxy_service.record_proxy_success(replacement_proxy.id)
             return messages
@@ -161,6 +265,7 @@ class MicrosoftGraphMailReader:
 
     def _list_once(
         self,
+        mailbox: Mailbox,
         access_token: str,
         since_at: datetime,
         max_messages: int,
@@ -177,6 +282,7 @@ class MicrosoftGraphMailReader:
             f"&$select={quote('from,subject,body,bodyPreview,receivedDateTime,toRecipients,ccRecipients')}"
         )
         proxy_url = selected_proxy.as_httpx_proxy_url() if selected_proxy is not None else None
+        proxy_description = describe_proxy_for_log(selected_proxy)
         timeout = httpx.Timeout(
             connect=self._connect_timeout,
             read=self._read_timeout,
@@ -197,22 +303,81 @@ class MicrosoftGraphMailReader:
                         headers={"Authorization": f"Bearer {access_token}"},
                     )
             except (httpx.ProxyError, httpx.ConnectTimeout, httpx.ReadTimeout) as error:
+                logger.warning(
+                    "microsoft_graph_read_failed mailbox_id=%s primary_email=%s "
+                    "proxy=%s folder=%s reason=proxy_chain error=%s",
+                    mailbox.id,
+                    mailbox.primary_email,
+                    proxy_description,
+                    folder_name,
+                    summarize_exception(error),
+                )
                 raise EgressProxyTransportError("Graph 代理链路不可用") from error
             except httpx.ConnectError as error:
                 if selected_proxy is not None:
+                    logger.warning(
+                        "microsoft_graph_read_failed mailbox_id=%s primary_email=%s "
+                        "proxy=%s folder=%s reason=proxy_connect error=%s",
+                        mailbox.id,
+                        mailbox.primary_email,
+                        proxy_description,
+                        folder_name,
+                        summarize_exception(error),
+                    )
                     raise EgressProxyTransportError("Graph 代理连接失败") from error
+                logger.warning(
+                    "microsoft_graph_read_failed mailbox_id=%s primary_email=%s "
+                    "proxy=%s folder=%s reason=connect error=%s",
+                    mailbox.id,
+                    mailbox.primary_email,
+                    proxy_description,
+                    folder_name,
+                    summarize_exception(error),
+                )
                 raise VerificationCodeReadError("无法连接 Microsoft Graph 读取收件箱") from error
 
             if response.status_code in {401, 403}:
+                microsoft_error = _summarize_graph_response_error(response)
+                logger.warning(
+                    "microsoft_graph_read_failed mailbox_id=%s primary_email=%s "
+                    "proxy=%s folder=%s reason=auth http_status=%s microsoft=%s",
+                    mailbox.id,
+                    mailbox.primary_email,
+                    proxy_description,
+                    folder_name,
+                    response.status_code,
+                    microsoft_error,
+                )
                 raise VerificationCodeReadError(f"Graph 鉴权失败，HTTP {response.status_code}")
             if response.status_code == 404 and folder_name != "inbox":
                 folder_scan_summary[folder_name] = -1
                 continue
             if response.status_code >= 400:
+                microsoft_error = _summarize_graph_response_error(response)
                 if folder_name == "inbox":
+                    logger.warning(
+                        "microsoft_graph_read_failed mailbox_id=%s primary_email=%s "
+                        "proxy=%s folder=%s reason=http_status http_status=%s microsoft=%s",
+                        mailbox.id,
+                        mailbox.primary_email,
+                        proxy_description,
+                        folder_name,
+                        response.status_code,
+                        microsoft_error,
+                    )
                     raise VerificationCodeReadError(
                         f"Graph 读取收件箱失败，HTTP {response.status_code}"
                     )
+                logger.warning(
+                    "microsoft_graph_optional_folder_failed mailbox_id=%s primary_email=%s "
+                    "proxy=%s folder=%s http_status=%s microsoft=%s",
+                    mailbox.id,
+                    mailbox.primary_email,
+                    proxy_description,
+                    folder_name,
+                    response.status_code,
+                    microsoft_error,
+                )
                 folder_scan_summary[folder_name] = -1
                 continue
 
@@ -269,18 +434,31 @@ class VerificationCodeService:
         self._sleep = sleep_function
         self._clock = clock
 
-    def wait_for_verification_code(
+    async def wait_for_verification_code(
         self,
         mailbox: Mailbox,
         options: VerificationCodeLookupOptions,
+        *,
+        authorization_checkpoint=None,
     ) -> VerificationCodeLookupResult:
-        """Poll inbox until a matching code is found or timeout is reached."""
-        custom_code_pattern: re.Pattern[str] | None = None
-        if options.code_regex:
-            try:
-                custom_code_pattern = re.compile(options.code_regex)
-            except re.error as error:
-                raise ValueError(f"验证码正则无效：{error}") from error
+        """Poll inbox until a matching code is found or timeout is reached (async).
+
+        Production uses ``asyncio.sleep`` when the injected ``sleep_function`` is the default
+        ``time.sleep``, so FastAPI async endpoints do not block the event loop on poll waits.
+        Tests may inject a sync no-op sleep. ``authorization_checkpoint`` may be sync or async.
+        """
+        custom_matcher: SafeVerificationCodeMatcher | None = None
+        if getattr(options, "code_regex", None):
+            custom_matcher = SafeVerificationCodeMatcher.from_deprecated_code_regex(options.code_regex)
+        elif getattr(options, "pattern_type", None) is not None:
+            custom_matcher = SafeVerificationCodeMatcher.from_options(
+                VerificationCodePatternOptions(
+                    pattern_type=options.pattern_type,
+                    minimum_length=getattr(options, "pattern_minimum_length", None) or 4,
+                    maximum_length=getattr(options, "pattern_maximum_length", None) or 8,
+                    prefix=getattr(options, "pattern_prefix", None),
+                )
+            )
 
         deadline = self._clock() + timedelta(seconds=max(options.timeout_seconds, 0))
         since_at = self._clock() - timedelta(seconds=max(options.since_seconds, 0))
@@ -294,36 +472,45 @@ class VerificationCodeService:
         # matching code" from "every scan failed", so persistent transport errors are not
         # silently reported as an empty result.
         any_scan_succeeded = False
+        request_body_bytes_consumed = 0
 
         while True:
+            if authorization_checkpoint is not None:
+                await _maybe_await(authorization_checkpoint())
             attempts += 1
-            if self._imap_client is not None and self._graph_reader is not None:
-                # Unit tests inject fakes and share one in-memory session.
-                access_token_result = self._access_token_service.ensure_access_token(mailbox.id)
-            else:
-                # Production: short-lived session/commit so FOR UPDATE locks are not held across sleeps.
-                access_token_result = self._access_token_service.ensure_access_token_in_short_transaction(
-                    mailbox.id
-                )
             for channel in channels:
                 try:
-                    messages = self._list_messages(
+                    messages = self._list_messages_with_auth_refresh(
                         mailbox,
-                        access_token_result.access_token,
                         channel=channel,
                         since_at=since_at,
+                        poll_attempt=attempts,
                     )
                 except Exception as error:  # noqa: BLE001 - continue alternate channel / retry.
                     last_error = error
+                    logger.warning(
+                        "verification_code_scan_attempt_failed mailbox_id=%s primary_email=%s "
+                        "channel=%s attempt=%s error=%s",
+                        mailbox.id,
+                        mailbox.primary_email,
+                        channel,
+                        attempts,
+                        summarize_exception(error),
+                    )
                     continue
                 any_scan_succeeded = True
-                match = self._find_code_in_messages(
+                remaining_request_budget = max(0, MAX_REQUEST_BODY_BYTES - request_body_bytes_consumed)
+                match, scan_bytes_consumed, request_budget_exhausted = self._find_code_in_messages(
                     messages,
                     options,
-                    custom_code_pattern=custom_code_pattern,
+                    custom_matcher=custom_matcher,
                     recipient_filter=recipient_filter,
+                    remaining_request_budget_bytes=remaining_request_budget,
                 )
+                request_body_bytes_consumed += scan_bytes_consumed
                 if match is not None:
+                    if authorization_checkpoint is not None:
+                        await _maybe_await(authorization_checkpoint())
                     return VerificationCodeLookupResult(
                         found=True,
                         code=match.code,
@@ -333,6 +520,17 @@ class VerificationCodeService:
                         channel=match.channel,
                         attempts=attempts,
                     )
+                if request_budget_exhausted:
+                    logger.warning(
+                        "verification_code_request_budget_exhausted mailbox_id=%s primary_email=%s "
+                        "consumed_bytes=%s limit_bytes=%s attempts=%s",
+                        mailbox.id,
+                        mailbox.primary_email,
+                        request_body_bytes_consumed,
+                        MAX_REQUEST_BODY_BYTES,
+                        attempts,
+                    )
+                    return VerificationCodeLookupResult(found=False, attempts=attempts)
 
             if self._clock() >= deadline:
                 break
@@ -340,13 +538,106 @@ class VerificationCodeService:
             sleep_seconds = min(max(options.poll_interval_seconds, 1), max(remaining_seconds, 0))
             if sleep_seconds <= 0:
                 break
-            self._sleep(sleep_seconds)
+            await self._async_sleep(sleep_seconds)
 
         # If no scan ever completed, every attempt hit a transport/auth failure. Surface it as an
         # error instead of masking a persistently unreachable inbox as an empty result.
         if not any_scan_succeeded and last_error is not None:
+            logger.error(
+                "verification_code_inbox_unreachable mailbox_id=%s primary_email=%s "
+                "channels=%s attempts=%s timeout_seconds=%s last_error=%s",
+                mailbox.id,
+                mailbox.primary_email,
+                ",".join(channels),
+                attempts,
+                options.timeout_seconds,
+                summarize_exception(last_error),
+            )
             raise VerificationCodeReadError(summarize_exception(last_error)) from last_error
         return VerificationCodeLookupResult(found=False, attempts=attempts)
+
+    async def _async_sleep(self, sleep_seconds: float) -> None:
+        """Prefer asyncio.sleep for default sleep; honor injectable test doubles."""
+        if self._sleep is time.sleep:
+            await asyncio.sleep(sleep_seconds)
+            return
+        sleep_result = self._sleep(sleep_seconds)
+        await _maybe_await(sleep_result)
+
+    def _list_messages_with_auth_refresh(
+        self,
+        mailbox: Mailbox,
+        *,
+        channel: MailReadChannel,
+        since_at: datetime,
+        poll_attempt: int,
+    ) -> list[InboxMessageCandidate]:
+        """Load messages, forcing one AT refresh when a cached token is rejected for auth.
+
+        Cached AT can still be within ``access_token_expires_at`` while Microsoft already
+        rejects it on IMAP XOAUTH2 or Graph (401/403). In that case re-exchange RT once and
+        retry the same channel before the outer poll loop moves on.
+        """
+        access_token_result = self._ensure_mailbox_access_token(
+            mailbox,
+            channel=channel,
+            force_refresh=False,
+        )
+        try:
+            return self._list_messages(
+                mailbox,
+                access_token_result.access_token,
+                channel=channel,
+                since_at=since_at,
+            )
+        except Exception as error:
+            if not is_mail_access_auth_failure(error):
+                raise
+            logger.warning(
+                "verification_code_auth_failed_refreshing_at mailbox_id=%s primary_email=%s "
+                "channel=%s poll_attempt=%s used_cached_token=%s error=%s",
+                mailbox.id,
+                mailbox.primary_email,
+                channel,
+                poll_attempt,
+                str(not access_token_result.refreshed).lower(),
+                summarize_exception(error),
+            )
+            refreshed_access_token_result = self._ensure_mailbox_access_token(
+                mailbox,
+                channel=channel,
+                force_refresh=True,
+            )
+            return self._list_messages(
+                mailbox,
+                refreshed_access_token_result.access_token,
+                channel=channel,
+                since_at=since_at,
+            )
+
+    def _ensure_mailbox_access_token(
+        self,
+        mailbox: Mailbox,
+        *,
+        channel: MailReadChannel,
+        force_refresh: bool,
+    ):
+        """Return AT for the requested channel; production uses a short-lived DB session."""
+        # Each channel needs a matching AT audience: Graph requires Graph-scoped AT,
+        # IMAP uses the RT default outlook-family AT.
+        if self._imap_client is not None and self._graph_reader is not None:
+            # Unit tests inject fakes and share one in-memory session.
+            return self._access_token_service.ensure_access_token(
+                mailbox.id,
+                force_refresh=force_refresh,
+                preferred_channel=channel,
+            )
+        # Production: short-lived session/commit so FOR UPDATE locks are not held across sleeps.
+        return self._access_token_service.ensure_access_token_in_short_transaction(
+            mailbox.id,
+            force_refresh=force_refresh,
+            preferred_channel=channel,
+        )
 
     def _list_messages(
         self,
@@ -373,37 +664,31 @@ class VerificationCodeService:
         if self._settings is None:
             raise RuntimeError("VerificationCodeService 缺少 settings，无法建立短事务邮件读取")
 
-        with self._access_token_service._session_factory() as session:
-            proxy_service = EgressProxyService(
-                session,
-                self._settings,
-                self._access_token_service._credential_cipher,
+        # Own short proxy UoW via session_factory so Graph/IMAP network I/O never holds a
+        # request-scoped Session / row lock (SEC-03).
+        proxy_service = EgressProxyService(
+            session_factory=self._access_token_service._session_factory,
+            settings=self._settings,
+            credential_cipher=self._access_token_service._credential_cipher,
+        )
+        if channel == "graph":
+            graph_reader = MicrosoftGraphMailReader(
+                proxy_service,
+                self._settings.proxy_connect_timeout_seconds,
+                self._settings.proxy_read_timeout_seconds,
             )
-            try:
-                if channel == "graph":
-                    graph_reader = MicrosoftGraphMailReader(
-                        proxy_service,
-                        self._settings.proxy_connect_timeout_seconds,
-                        self._settings.proxy_read_timeout_seconds,
-                    )
-                    messages = graph_reader.list_recent_messages(
-                        mailbox,
-                        access_token,
-                        since_at=since_at,
-                    )
-                else:
-                    imap_client = MicrosoftIMAPClient(proxy_service, self._settings)
-                    messages = self._list_imap_messages(
-                        imap_client,
-                        mailbox,
-                        access_token,
-                        since_at=since_at,
-                    )
-                session.commit()
-                return messages
-            except Exception:
-                session.rollback()
-                raise
+            return graph_reader.list_recent_messages(
+                mailbox,
+                access_token,
+                since_at=since_at,
+            )
+        imap_client = MicrosoftIMAPClient(proxy_service, self._settings)
+        return self._list_imap_messages(
+            imap_client,
+            mailbox,
+            access_token,
+            since_at=since_at,
+        )
 
     def _list_imap_messages(
         self,
@@ -423,7 +708,23 @@ class VerificationCodeService:
                 if status_code != "OK":
                     folder_scan_summary[folder_name] = {"select": status_code, "kept": 0}
                     if folder_name == "INBOX":
+                        logger.warning(
+                            "microsoft_imap_read_failed mailbox_id=%s primary_email=%s "
+                            "folder=%s reason=select_failed status=%s",
+                            mailbox.id,
+                            mailbox.primary_email,
+                            folder_name,
+                            status_code,
+                        )
                         raise VerificationCodeReadError("无法选择 IMAP 收件箱")
+                    logger.warning(
+                        "microsoft_imap_optional_folder_failed mailbox_id=%s primary_email=%s "
+                        "folder=%s reason=select_failed status=%s",
+                        mailbox.id,
+                        mailbox.primary_email,
+                        folder_name,
+                        status_code,
+                    )
                     continue
                 if folder_name == "INBOX":
                     inbox_select_succeeded = True
@@ -478,10 +779,24 @@ class VerificationCodeService:
                 }
 
             if not inbox_select_succeeded and not candidates:
+                logger.warning(
+                    "microsoft_imap_read_failed mailbox_id=%s primary_email=%s "
+                    "reason=inbox_unavailable folder_summary=%s",
+                    mailbox.id,
+                    mailbox.primary_email,
+                    folder_scan_summary,
+                )
                 raise VerificationCodeReadError("无法选择 IMAP 收件箱")
 
             return candidates
         except imaplib.IMAP4.error as error:
+            logger.warning(
+                "microsoft_imap_read_failed mailbox_id=%s primary_email=%s "
+                "reason=protocol error=%s",
+                mailbox.id,
+                mailbox.primary_email,
+                summarize_exception(error),
+            )
             raise VerificationCodeReadError(summarize_exception(error)) from error
         finally:
             try:
@@ -503,14 +818,32 @@ class VerificationCodeService:
         messages: list[InboxMessageCandidate],
         options: VerificationCodeLookupOptions,
         *,
-        custom_code_pattern: re.Pattern[str] | None,
+        custom_matcher: SafeVerificationCodeMatcher | None,
         recipient_filter: str | None,
-    ) -> VerificationCodeMatch | None:
+        remaining_request_budget_bytes: int = MAX_REQUEST_BODY_BYTES,
+    ) -> tuple[VerificationCodeMatch | None, int, bool]:
+        """Search messages under scan/request body budgets.
+
+        Returns ``(match, bytes_consumed, request_budget_exhausted)``.
+        """
         from_filter = (options.from_address or "").strip().lower()
         subject_filter = (options.subject_contains or "").strip().lower()
         body_filter = (options.body_contains or "").strip().lower()
 
+        scan_bytes_consumed = 0
+        scan_budget = min(MAX_SCAN_BODY_BYTES, max(0, remaining_request_budget_bytes))
+        request_budget_exhausted = remaining_request_budget_bytes <= 0
+
         for message in messages:
+            body_text = truncate_text_to_byte_budget(message.body_text or "", MAX_MESSAGE_BODY_BYTES)
+            body_byte_length = len(body_text.encode("utf-8"))
+            if scan_bytes_consumed + body_byte_length > scan_budget:
+                request_budget_exhausted = (
+                    remaining_request_budget_bytes - scan_bytes_consumed
+                ) <= body_byte_length or scan_bytes_consumed >= MAX_SCAN_BODY_BYTES
+                break
+            scan_bytes_consumed += body_byte_length
+
             if options.require_recipient_match:
                 if not recipient_filter:
                     continue
@@ -519,7 +852,7 @@ class VerificationCodeService:
 
             from_value = (message.from_address or "").lower()
             subject_value = (message.subject or "").lower()
-            body_value = message.body_text.lower()
+            body_value = body_text.lower()
             if from_filter and from_filter not in from_value:
                 continue
             if subject_filter and subject_filter not in subject_value:
@@ -529,19 +862,23 @@ class VerificationCodeService:
 
             code = extract_verification_code(
                 message.subject or "",
-                message.body_text,
-                custom_code_pattern=custom_code_pattern,
+                body_text,
+                custom_matcher=custom_matcher,
             )
             if code is None:
                 continue
-            return VerificationCodeMatch(
-                code=code,
-                matched_from=message.from_address,
-                matched_subject=message.subject,
-                message_received_at=message.received_at,
-                channel=message.channel,
+            return (
+                VerificationCodeMatch(
+                    code=code,
+                    matched_from=message.from_address,
+                    matched_subject=message.subject,
+                    message_received_at=message.received_at,
+                    channel=message.channel,
+                ),
+                scan_bytes_consumed,
+                False,
             )
-        return None
+        return None, scan_bytes_consumed, request_budget_exhausted
 
 
 def expand_lookback_since_at(since_at: datetime) -> datetime:
@@ -564,23 +901,25 @@ def extract_verification_code(
     subject: str,
     body_text: str,
     *,
+    custom_matcher: SafeVerificationCodeMatcher | None = None,
     custom_code_pattern: re.Pattern[str] | None = None,
 ) -> str | None:
-    """Extract a code with priority: xAI subject > explicit custom regex > xAI body > digit fallbacks.
+    """Extract a code with priority: xAI subject > safe custom matcher > xAI body > digit fallbacks.
 
-    An xAI subject like ``ABC-123 xAI`` is an unambiguous signal and stays first. A
-    caller-supplied ``custom_code_pattern`` expresses explicit intent, so it is tried before
-    the broad xAI body heuristic (which would otherwise match any ``ABC-123``-shaped token in
-    unrelated mail). When a custom pattern is provided, only it is used after the subject check.
+    External callers must not supply untrusted Python regex. ``custom_code_pattern`` remains only
+    for internal fixed patterns used by legacy tests; production uses SafeVerificationCodeMatcher.
     """
     subject_value = subject or ""
-    body_value = body_text or ""
+    body_value = truncate_text_to_byte_budget(body_text or "", MAX_MESSAGE_BODY_BYTES)
 
     subject_match = XAI_SUBJECT_CODE_REGEX.search(subject_value)
     if subject_match is not None:
         return subject_match.group(1)
 
     searchable_text = "\n".join(part for part in [subject_value, body_value] if part)
+
+    if custom_matcher is not None:
+        return custom_matcher.search(subject_value, body_value)
 
     if custom_code_pattern is not None:
         custom_match = custom_code_pattern.search(searchable_text)
@@ -800,3 +1139,10 @@ def _parse_iso_datetime(raw_value: object) -> datetime | None:
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
+
+
+async def _maybe_await(value: object) -> object:
+    """Await coroutine/future results; return plain values unchanged."""
+    if inspect.isawaitable(value):
+        return await value
+    return value

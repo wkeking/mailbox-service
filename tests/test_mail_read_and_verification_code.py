@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
+
 from base64 import urlsafe_b64encode
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine
+from sqlalchemy import select
+from sqlalchemy.pool import StaticPool
 from sqlalchemy.orm import Session, sessionmaker
 
 from mailbox_service.client_key_service import ClientKeyScopeError, ClientKeyService
@@ -14,30 +18,75 @@ from mailbox_service.config import Settings
 from mailbox_service.database import Base
 from mailbox_service.lease_service import (
     LeaseEmailNotFoundError,
+    LeaseEmailSiteConflictError,
     LeaseMailboxBusyError,
     LeaseModeError,
     LeaseService,
     LeaseUnavailableError,
+    LeaseUsageSiteError,
 )
-from mailbox_service.models import AuditLog, Lease, LeaseMode, Mailbox, MailboxCapability, utc_now
+from mailbox_service.models import (
+    AuditLog,
+    EmailSiteUsage,
+    Lease,
+    LeaseMode,
+    Mailbox,
+    MailboxCapability,
+    UsageSite,
+    utc_now,
+)
+from mailbox_service.proxy_service import MicrosoftTokenResponse
 from mailbox_service.security import CredentialCipher
 from mailbox_service.token_service import MailboxAccessTokenService
 from mailbox_service.verification_code_service import (
     IMAP_FETCH_ITEMS,
     InboxMessageCandidate,
     VerificationCodeLookupOptions,
+    VerificationCodeReadError,
     VerificationCodeService,
     expand_lookback_since_at,
     extract_verification_code,
+    is_mail_access_auth_failure,
     is_within_lookback_window,
 )
+import imaplib
 
 
 class FakeMicrosoftOAuthClient:
     """OAuth double that never refreshes during pure extraction tests."""
 
-    def refresh_access_token(self, mailbox: Mailbox, refresh_token: str):
+    def refresh_access_token(
+        self,
+        mailbox: Mailbox,
+        refresh_token: str,
+        *,
+        scope: str | None = None,
+    ):
         raise AssertionError("verification-code extraction should reuse cached access tokens")
+
+
+class RefreshableMicrosoftOAuthClient:
+    """OAuth double that returns a fresh access token when force-refresh is needed."""
+
+    def __init__(self, *, access_token: str = "refreshed-access-token", expires_in: int = 3600) -> None:
+        self.access_token = access_token
+        self.expires_in = expires_in
+        self.refresh_attempts: list[str] = []
+
+    def refresh_access_token(
+        self,
+        mailbox: Mailbox,
+        refresh_token: str,
+        *,
+        scope: str | None = None,
+    ) -> MicrosoftTokenResponse:
+        self.refresh_attempts.append(mailbox.primary_email)
+        return MicrosoftTokenResponse(
+            access_token=self.access_token,
+            expires_in=self.expires_in,
+            rotated_refresh_token=None,
+            scope="https://outlook.office.com/IMAP.AccessAsUser.All offline_access",
+        )
 
 
 class FakeImapClient:
@@ -56,9 +105,35 @@ class FakeImapClient:
             self._folder_messages.setdefault("INBOX", raw_message)
         self._internaldate = internaldate
         self.connect_calls = 0
+        self.access_tokens_seen: list[str] = []
 
     def connect(self, mailbox: Mailbox, access_token: str):
         self.connect_calls += 1
+        self.access_tokens_seen.append(access_token)
+        return FakeImapSession(self._folder_messages, internaldate=self._internaldate)
+
+
+class AuthFailThenSuccessImapClient(FakeImapClient):
+    """Fail XOAUTH2 once with AUTHENTICATE failed, then succeed on the refreshed AT."""
+
+    def __init__(
+        self,
+        raw_message: bytes,
+        *,
+        rejected_access_token: str,
+        accepted_access_token: str,
+    ) -> None:
+        super().__init__(raw_message)
+        self.rejected_access_token = rejected_access_token
+        self.accepted_access_token = accepted_access_token
+
+    def connect(self, mailbox: Mailbox, access_token: str):
+        self.connect_calls += 1
+        self.access_tokens_seen.append(access_token)
+        if access_token == self.rejected_access_token:
+            raise imaplib.IMAP4.error(b"AUTHENTICATE failed.")
+        if access_token != self.accepted_access_token:
+            raise imaplib.IMAP4.error(b"AUTHENTICATE failed.")
         return FakeImapSession(self._folder_messages, internaldate=self._internaldate)
 
 
@@ -127,9 +202,10 @@ class FakeGraphReader:
 
 
 def create_mail_read_context() -> tuple[Session, CredentialCipher, ClientKeyService, LeaseService]:
-    database_engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    database_engine = create_engine("sqlite+pysqlite:///:memory:", connect_args={"check_same_thread": False}, poolclass=StaticPool, future=True)
     Base.metadata.create_all(database_engine)
-    session = sessionmaker(bind=database_engine, expire_on_commit=False)()
+    session_factory = sessionmaker(bind=database_engine, expire_on_commit=False)
+    session = session_factory()
     encryption_key = urlsafe_b64encode(b"m" * 32).decode("ascii")
     settings = Settings(
         database_url="sqlite+pysqlite:///:memory:",
@@ -142,9 +218,18 @@ def create_mail_read_context() -> tuple[Session, CredentialCipher, ClientKeyServ
         settings,
         credential_cipher,
         FakeMicrosoftOAuthClient(),
+        session_factory=session_factory,
     )
     client_key_service = ClientKeyService(session)
     lease_service = LeaseService(session, credential_cipher, access_token_service)
+    session.add_all(
+        [
+            UsageSite(code="openai", display_name="OpenAI", enabled=True),
+            UsageSite(code="grok", display_name="Grok", enabled=True),
+            UsageSite(code="disabled-site", display_name="Disabled", enabled=False),
+        ]
+    )
+    session.flush()
     return session, credential_cipher, client_key_service, lease_service
 
 
@@ -167,6 +252,12 @@ def build_rfc822_message(
     return message.as_bytes()
 
 
+
+def _await_verification(service, *args, **kwargs):
+    """Run async verification poll from sync tests."""
+    return asyncio.run(service.wait_for_verification_code(*args, **kwargs))
+
+
 def test_mail_read_acquire_returns_mailbox_without_tokens_and_skips_unproven() -> None:
     """mail_read should only select imap/graph rows, not unprobed/unknown/unusable."""
     session, credential_cipher, client_key_service, lease_service = create_mail_read_context()
@@ -176,6 +267,7 @@ def test_mail_read_acquire_returns_mailbox_without_tokens_and_skips_unproven() -
         refresh_token_ciphertext=credential_cipher.encrypt("refresh-token"),
         capability=MailboxCapability.IMAP,
         access_token_ciphertext=credential_cipher.encrypt("cached-access-token"),
+        access_token_source_version=1,
         access_token_expires_at=utc_now() + timedelta(minutes=30),
     )
     unusable_mailbox = Mailbox(
@@ -205,10 +297,16 @@ def test_mail_read_acquire_returns_mailbox_without_tokens_and_skips_unproven() -
     )
     principal = client_key_service.authenticate(creation.api_key)
 
-    result = lease_service.acquire_lease(principal, mode=LeaseMode.MAIL_READ, ttl_seconds=600)
+    result = lease_service.acquire_lease(
+        principal,
+        mode=LeaseMode.MAIL_READ,
+        ttl_seconds=600,
+        usage_site="openai",
+    )
 
     assert result.primary_email == "usable@outlook.com"
     assert result.allocated_email == "usable@outlook.com"
+    assert result.usage_site == "openai"
     assert result.mode == LeaseMode.MAIL_READ
     assert result.access_token is None
     assert result.refresh_token is None
@@ -224,6 +322,7 @@ def test_mail_read_acquire_can_allocate_plus_alias() -> None:
             refresh_token_ciphertext=credential_cipher.encrypt("refresh-token"),
             capability=MailboxCapability.IMAP,
             access_token_ciphertext=credential_cipher.encrypt("cached-access-token"),
+            access_token_source_version=1,
             access_token_expires_at=utc_now() + timedelta(minutes=30),
         )
     )
@@ -254,6 +353,7 @@ def test_mail_read_acquire_can_allocate_plus_alias() -> None:
         refresh_token_ciphertext=credential_cipher.encrypt("refresh-token"),
         capability=MailboxCapability.IMAP,
         access_token_ciphertext=credential_cipher.encrypt("cached-access-token-2"),
+        access_token_source_version=1,
         access_token_expires_at=utc_now() + timedelta(minutes=30),
     )
     session.add(random_alias_result_mailbox)
@@ -304,7 +404,12 @@ def test_mail_read_acquire_requires_scope_and_rejects_unproven_pool() -> None:
     principal = client_key_service.authenticate(missing_scope.api_key)
 
     try:
-        lease_service.acquire_lease(principal, mode=LeaseMode.MAIL_READ, ttl_seconds=600)
+        lease_service.acquire_lease(
+            principal,
+            mode=LeaseMode.MAIL_READ,
+            ttl_seconds=600,
+            usage_site="openai",
+        )
     except Exception as error:
         assert "mailboxes:acquire" in str(error)
     else:
@@ -316,7 +421,12 @@ def test_mail_read_acquire_requires_scope_and_rejects_unproven_pool() -> None:
     )
     allowed_principal = client_key_service.authenticate(allowed.api_key)
     try:
-        lease_service.acquire_lease(allowed_principal, mode=LeaseMode.MAIL_READ, ttl_seconds=600)
+        lease_service.acquire_lease(
+            allowed_principal,
+            mode=LeaseMode.MAIL_READ,
+            ttl_seconds=600,
+            usage_site="openai",
+        )
     except LeaseUnavailableError:
         pass
     else:
@@ -335,6 +445,7 @@ def _seed_usable_mailbox(
         refresh_token_ciphertext=credential_cipher.encrypt("refresh-token"),
         capability=MailboxCapability.IMAP,
         access_token_ciphertext=credential_cipher.encrypt("cached-access-token"),
+        access_token_source_version=1,
         access_token_expires_at=utc_now() + timedelta(minutes=30),
     )
     session.add(mailbox)
@@ -352,7 +463,12 @@ def test_reacquire_primary_email_after_release() -> None:
     )
     principal = client_key_service.authenticate(creation.api_key)
 
-    first = lease_service.acquire_lease(principal, mode=LeaseMode.MAIL_READ, ttl_seconds=600)
+    first = lease_service.acquire_lease(
+        principal,
+        mode=LeaseMode.MAIL_READ,
+        ttl_seconds=600,
+        usage_site="openai",
+    )
     assert first.address_kind == "primary"
     assert first.allocated_email == "owner@outlook.com"
     lease_service.release_lease(principal, first.lease_id)
@@ -418,7 +534,12 @@ def test_reacquire_renews_matching_active_lease() -> None:
     )
     principal = client_key_service.authenticate(creation.api_key)
 
-    first = lease_service.acquire_lease(principal, mode=LeaseMode.MAIL_READ, ttl_seconds=120)
+    first = lease_service.acquire_lease(
+        principal,
+        mode=LeaseMode.MAIL_READ,
+        ttl_seconds=120,
+        usage_site="openai",
+    )
     renewed = lease_service.reacquire_lease_by_email(
         principal,
         email=first.allocated_email or first.primary_email,
@@ -487,7 +608,12 @@ def test_reacquire_requires_scope() -> None:
         scopes=["mailboxes:acquire", "leases:release"],
     )
     principal = client_key_service.authenticate(acquire_only.api_key)
-    first = lease_service.acquire_lease(principal, mode=LeaseMode.MAIL_READ, ttl_seconds=600)
+    first = lease_service.acquire_lease(
+        principal,
+        mode=LeaseMode.MAIL_READ,
+        ttl_seconds=600,
+        usage_site="openai",
+    )
     lease_service.release_lease(principal, first.lease_id)
 
     try:
@@ -521,6 +647,7 @@ def test_reacquire_rejects_when_mailbox_busy() -> None:
         mode=LeaseMode.MAIL_READ,
         ttl_seconds=600,
         preferred_email=mailbox.primary_email,
+        usage_site="openai",
     )
     lease_service.release_lease(owner_principal, history.lease_id)
     lease_service.acquire_lease(
@@ -558,6 +685,7 @@ def test_verification_code_reads_junk_folder_when_missing_from_inbox() -> None:
         refresh_token_ciphertext=credential_cipher.encrypt("refresh-token"),
         capability=MailboxCapability.IMAP,
         access_token_ciphertext=credential_cipher.encrypt("cached-access-token"),
+        access_token_source_version=1,
         access_token_expires_at=utc_now() + timedelta(minutes=30),
     )
     session.add(mailbox)
@@ -577,7 +705,7 @@ def test_verification_code_reads_junk_folder_when_missing_from_inbox() -> None:
         sleep_function=lambda _seconds: None,
     )
 
-    result = verification_service.wait_for_verification_code(
+    result = _await_verification(verification_service, 
         mailbox,
         VerificationCodeLookupOptions(timeout_seconds=0, since_seconds=180),
     )
@@ -585,6 +713,72 @@ def test_verification_code_reads_junk_folder_when_missing_from_inbox() -> None:
     assert result.found is True
     assert result.code == "666888"
     assert result.channel == "imap"
+
+
+def test_is_mail_access_auth_failure_detects_imap_and_graph_auth_errors() -> None:
+    """Auth markers must refresh AT; pure transport failures must not."""
+    assert is_mail_access_auth_failure(imaplib.IMAP4.error(b"AUTHENTICATE failed."))
+    assert is_mail_access_auth_failure(VerificationCodeReadError("Graph 鉴权失败，HTTP 401"))
+    assert is_mail_access_auth_failure(
+        VerificationCodeReadError("error: AUTHENTICATE failed.")
+    )
+    assert not is_mail_access_auth_failure(VerificationCodeReadError("无法选择 IMAP 收件箱"))
+    assert not is_mail_access_auth_failure(TimeoutError("read timed out"))
+
+
+def test_verification_code_refreshes_access_token_after_imap_auth_failure() -> None:
+    """Cached AT rejected by IMAP should force-refresh once and retry with the new AT."""
+    session, credential_cipher, client_key_service, lease_service = create_mail_read_context()
+    oauth_client = RefreshableMicrosoftOAuthClient(access_token="refreshed-access-token")
+    lease_service._access_token_service._oauth_client = oauth_client
+
+    mailbox = Mailbox(
+        primary_email="code@outlook.com",
+        client_id="client-id",
+        refresh_token_ciphertext=credential_cipher.encrypt("refresh-token"),
+        capability=MailboxCapability.IMAP,
+        scope="https://outlook.office.com/IMAP.AccessAsUser.All offline_access",
+        access_token_ciphertext=credential_cipher.encrypt("stale-cached-access-token"),
+        access_token_source_version=1,
+        access_token_expires_at=utc_now() + timedelta(minutes=30),
+    )
+    session.add(mailbox)
+    session.flush()
+
+    raw_message = build_rfc822_message(
+        subject="Your code",
+        body="请使用验证码 482917 完成登录",
+        from_address="noreply@example.com",
+        to_address="code@outlook.com",
+    )
+    imap_client = AuthFailThenSuccessImapClient(
+        raw_message,
+        rejected_access_token="stale-cached-access-token",
+        accepted_access_token="refreshed-access-token",
+    )
+    verification_service = VerificationCodeService(
+        lease_service._access_token_service,
+        imap_client,
+        FakeGraphReader(),
+        sleep_function=lambda _seconds: None,
+    )
+
+    result = _await_verification(verification_service, 
+        mailbox,
+        VerificationCodeLookupOptions(timeout_seconds=0, since_seconds=180),
+    )
+
+    assert result.found is True
+    assert result.code == "482917"
+    assert result.channel == "imap"
+    assert imap_client.connect_calls == 2
+    assert imap_client.access_tokens_seen == [
+        "stale-cached-access-token",
+        "refreshed-access-token",
+    ]
+    assert oauth_client.refresh_attempts == ["code@outlook.com"]
+    session.refresh(mailbox)
+    assert credential_cipher.decrypt(mailbox.access_token_ciphertext or "") == "refreshed-access-token"
 
 
 def test_verification_code_extracts_digits_from_imap_and_rejects_wrong_mode() -> None:
@@ -595,6 +789,7 @@ def test_verification_code_extracts_digits_from_imap_and_rejects_wrong_mode() ->
         refresh_token_ciphertext=credential_cipher.encrypt("refresh-token"),
         capability=MailboxCapability.IMAP,
         access_token_ciphertext=credential_cipher.encrypt("cached-access-token"),
+        access_token_source_version=1,
         access_token_expires_at=utc_now() + timedelta(minutes=30),
     )
     session.add(mailbox)
@@ -605,7 +800,12 @@ def test_verification_code_extracts_digits_from_imap_and_rejects_wrong_mode() ->
         scopes=["mailboxes:acquire", "mail:verification-code:read"],
     )
     principal = client_key_service.authenticate(mail_reader_key.api_key)
-    lease = lease_service.acquire_lease(principal, mode=LeaseMode.MAIL_READ, ttl_seconds=600)
+    lease = lease_service.acquire_lease(
+        principal,
+        mode=LeaseMode.MAIL_READ,
+        ttl_seconds=600,
+        usage_site="openai",
+    )
 
     raw_message = build_rfc822_message(
         subject="Your code",
@@ -623,7 +823,7 @@ def test_verification_code_extracts_digits_from_imap_and_rejects_wrong_mode() ->
         sleep_function=lambda _seconds: None,
     )
 
-    result = verification_service.wait_for_verification_code(
+    result = _await_verification(verification_service, 
         mailbox,
         VerificationCodeLookupOptions(timeout_seconds=0, since_seconds=180),
     )
@@ -640,6 +840,7 @@ def test_verification_code_extracts_digits_from_imap_and_rejects_wrong_mode() ->
         refresh_token_ciphertext=credential_cipher.encrypt("refresh-token"),
         capability=MailboxCapability.IMAP,
         access_token_ciphertext=credential_cipher.encrypt("cached-access-token-2"),
+        access_token_source_version=1,
         access_token_expires_at=utc_now() + timedelta(minutes=30),
     )
     session.add(second_mailbox)
@@ -670,6 +871,7 @@ def test_verification_code_prefers_xai_format_and_matches_plus_alias_recipient()
         refresh_token_ciphertext=credential_cipher.encrypt("refresh-token"),
         capability=MailboxCapability.IMAP,
         access_token_ciphertext=credential_cipher.encrypt("cached-access-token"),
+        access_token_source_version=1,
         access_token_expires_at=utc_now() + timedelta(minutes=30),
     )
     session.add(mailbox)
@@ -704,14 +906,14 @@ def test_verification_code_prefers_xai_format_and_matches_plus_alias_recipient()
     )
 
     # Default recipient uses primary when options.recipient is omitted.
-    mismatched = verification_service.wait_for_verification_code(
+    mismatched = _await_verification(verification_service, 
         mailbox,
         VerificationCodeLookupOptions(timeout_seconds=0, since_seconds=180),
     )
     assert mismatched.found is False
 
     # Lease allocated alias should match the message To header.
-    matched = verification_service.wait_for_verification_code(
+    matched = _await_verification(verification_service, 
         mailbox,
         VerificationCodeLookupOptions(
             timeout_seconds=0,
@@ -732,6 +934,7 @@ def test_verification_code_rejects_non_matching_recipient_by_default() -> None:
         refresh_token_ciphertext=credential_cipher.encrypt("refresh-token"),
         capability=MailboxCapability.IMAP,
         access_token_ciphertext=credential_cipher.encrypt("cached-access-token"),
+        access_token_source_version=1,
         access_token_expires_at=utc_now() + timedelta(minutes=30),
     )
     session.add(mailbox)
@@ -750,13 +953,13 @@ def test_verification_code_rejects_non_matching_recipient_by_default() -> None:
         sleep_function=lambda _seconds: None,
     )
 
-    result = verification_service.wait_for_verification_code(
+    result = _await_verification(verification_service, 
         mailbox,
         VerificationCodeLookupOptions(timeout_seconds=0, since_seconds=180),
     )
     assert result.found is False
 
-    relaxed = verification_service.wait_for_verification_code(
+    relaxed = _await_verification(verification_service, 
         mailbox,
         VerificationCodeLookupOptions(
             timeout_seconds=0,
@@ -775,8 +978,11 @@ def test_verification_code_prefers_imap_then_graph_when_capability_missing() -> 
         client_id="client-id",
         refresh_token_ciphertext=credential_cipher.encrypt("refresh-token"),
         capability=None,
-        access_token_ciphertext=credential_cipher.encrypt("cached-access-token"),
+        # Outlook-family cache is fine for IMAP; Graph path must re-audience.
+        access_token_ciphertext=credential_cipher.encrypt("cached-outlook-token"),
+        access_token_source_version=1,
         access_token_expires_at=utc_now() + timedelta(minutes=30),
+        scope="https://outlook.office.com/IMAP.AccessAsUser.All",
     )
     session.add(mailbox)
     session.flush()
@@ -784,6 +990,27 @@ def test_verification_code_prefers_imap_then_graph_when_capability_missing() -> 
     class FailingImapClient:
         def connect(self, mailbox: Mailbox, access_token: str):
             raise RuntimeError("imap unavailable")
+
+    class GraphAudienceOAuthClient:
+        """Provide Graph-audience AT when verification falls back to Graph after IMAP fails."""
+
+        def refresh_access_token(
+            self,
+            mailbox: Mailbox,
+            refresh_token: str,
+            *,
+            scope: str | None = None,
+        ):
+            from mailbox_service.proxy_service import MicrosoftTokenResponse
+
+            assert scope is not None and "graph.microsoft.com" in scope
+            return MicrosoftTokenResponse(
+                access_token="graph-audience-token",
+                expires_in=3600,
+                scope="https://graph.microsoft.com/Mail.Read",
+            )
+
+    lease_service._access_token_service._oauth_client = GraphAudienceOAuthClient()
 
     graph_reader = FakeGraphReader(
         [
@@ -803,7 +1030,7 @@ def test_verification_code_prefers_imap_then_graph_when_capability_missing() -> 
         graph_reader,
         sleep_function=lambda _seconds: None,
     )
-    result = verification_service.wait_for_verification_code(
+    result = _await_verification(verification_service, 
         mailbox,
         VerificationCodeLookupOptions(timeout_seconds=0, since_seconds=180),
     )
@@ -839,6 +1066,7 @@ def test_verification_code_prefers_imap_internaldate_over_stale_date_header() ->
         refresh_token_ciphertext=credential_cipher.encrypt("refresh-token"),
         capability=MailboxCapability.IMAP,
         access_token_ciphertext=credential_cipher.encrypt("cached-access-token"),
+        access_token_source_version=1,
         access_token_expires_at=utc_now() + timedelta(minutes=30),
     )
     session.add(mailbox)
@@ -860,10 +1088,277 @@ def test_verification_code_prefers_imap_internaldate_over_stale_date_header() ->
         FakeGraphReader(),
         sleep_function=lambda _seconds: None,
     )
-    result = verification_service.wait_for_verification_code(
+    result = _await_verification(verification_service, 
         mailbox,
         VerificationCodeLookupOptions(timeout_seconds=0, since_seconds=180),
     )
     assert result.found is True
     assert result.code == "654321"
     assert result.channel == "imap"
+
+
+
+def test_mail_read_primary_requires_usage_site() -> None:
+    session, credential_cipher, client_key_service, lease_service = create_mail_read_context()
+    _seed_usable_mailbox(session, credential_cipher)
+    creation = client_key_service.create_client_key(
+        name="usage-required",
+        scopes=["mailboxes:acquire"],
+    )
+    principal = client_key_service.authenticate(creation.api_key)
+
+    try:
+        lease_service.acquire_lease(principal, mode=LeaseMode.MAIL_READ, ttl_seconds=600)
+    except LeaseUsageSiteError:
+        pass
+    else:
+        raise AssertionError("主邮箱路径缺少 usage_site 应被拒绝")
+
+
+def test_mail_read_excludes_primary_already_used_for_site_and_allows_other_site() -> None:
+    session, credential_cipher, client_key_service, lease_service = create_mail_read_context()
+    _seed_usable_mailbox(session, credential_cipher, primary_email="pool-a@outlook.com")
+    _seed_usable_mailbox(session, credential_cipher, primary_email="pool-b@outlook.com")
+    creation = client_key_service.create_client_key(
+        name="site-exclude",
+        scopes=["mailboxes:acquire", "leases:release"],
+    )
+    principal = client_key_service.authenticate(creation.api_key)
+
+    first = lease_service.acquire_lease(
+        principal,
+        mode=LeaseMode.MAIL_READ,
+        ttl_seconds=600,
+        preferred_email="pool-a@outlook.com",
+        usage_site="openai",
+    )
+    assert first.allocated_email == "pool-a@outlook.com"
+    lease_service.release_lease(principal, first.lease_id)
+
+    second = lease_service.acquire_lease(
+        principal,
+        mode=LeaseMode.MAIL_READ,
+        ttl_seconds=600,
+        usage_site="openai",
+    )
+    assert second.allocated_email == "pool-b@outlook.com"
+
+    try:
+        lease_service.acquire_lease(
+            principal,
+            mode=LeaseMode.MAIL_READ,
+            ttl_seconds=600,
+            preferred_email="pool-a@outlook.com",
+            usage_site="openai",
+        )
+    except LeaseEmailSiteConflictError:
+        pass
+    else:
+        raise AssertionError("已登记站点的主邮箱应返回 EMAIL_SITE 冲突")
+
+    third = lease_service.acquire_lease(
+        principal,
+        mode=LeaseMode.MAIL_READ,
+        ttl_seconds=600,
+        preferred_email="pool-a@outlook.com",
+        usage_site="grok",
+    )
+    assert third.allocated_email == "pool-a@outlook.com"
+    assert third.usage_site == "grok"
+
+    usage_rows = list(session.scalars(select(EmailSiteUsage)))
+    assert {(row.allocated_email, row.usage_site_code, row.revoked_at is None) for row in usage_rows} >= {
+        ("pool-a@outlook.com", "openai", True),
+        ("pool-b@outlook.com", "openai", True),
+        ("pool-a@outlook.com", "grok", True),
+    }
+
+
+def test_mail_read_primary_usage_blocks_plus_alias_on_same_site_for_same_mailbox() -> None:
+    """Any active occupancy under a mailbox blocks further plus acquires for that site."""
+    session, credential_cipher, client_key_service, lease_service = create_mail_read_context()
+    _seed_usable_mailbox(session, credential_cipher, primary_email="alias-block@outlook.com")
+    _seed_usable_mailbox(session, credential_cipher, primary_email="alias-other@outlook.com")
+    creation = client_key_service.create_client_key(
+        name="plus-blocked-same-box",
+        scopes=["mailboxes:acquire", "leases:release"],
+    )
+    principal = client_key_service.authenticate(creation.api_key)
+
+    primary = lease_service.acquire_lease(
+        principal,
+        mode=LeaseMode.MAIL_READ,
+        ttl_seconds=600,
+        preferred_email="alias-block@outlook.com",
+        usage_site="openai",
+    )
+    lease_service.release_lease(principal, primary.lease_id)
+
+    try:
+        lease_service.acquire_lease(
+            principal,
+            mode=LeaseMode.MAIL_READ,
+            ttl_seconds=600,
+            preferred_email="alias-block@outlook.com",
+            use_plus_alias=True,
+            preferred_alias_suffix="site01",
+            usage_site="openai",
+        )
+    except LeaseEmailSiteConflictError:
+        pass
+    else:
+        raise AssertionError("同一主邮箱已在该站登记后，plus 路径应拒绝该箱")
+
+    other_plus = lease_service.acquire_lease(
+        principal,
+        mode=LeaseMode.MAIL_READ,
+        ttl_seconds=600,
+        use_plus_alias=True,
+        usage_site="openai",
+    )
+    assert other_plus.primary_email == "alias-other@outlook.com"
+    assert other_plus.allocated_email is not None
+    assert other_plus.allocated_email.startswith("alias-other+")
+
+
+def test_mail_read_revoke_allows_reactivation() -> None:
+    session, credential_cipher, client_key_service, lease_service = create_mail_read_context()
+    _seed_usable_mailbox(session, credential_cipher, primary_email="revive@outlook.com")
+    creation = client_key_service.create_client_key(
+        name="reactivate-bot",
+        scopes=["mailboxes:acquire", "leases:release"],
+    )
+    principal = client_key_service.authenticate(creation.api_key)
+
+    first = lease_service.acquire_lease(
+        principal,
+        mode=LeaseMode.MAIL_READ,
+        ttl_seconds=600,
+        preferred_email="revive@outlook.com",
+        usage_site="openai",
+    )
+    lease_service.release_lease(principal, first.lease_id)
+    usage = session.scalar(
+        select(EmailSiteUsage).where(
+            EmailSiteUsage.allocated_email == "revive@outlook.com",
+            EmailSiteUsage.usage_site_code == "openai",
+        )
+    )
+    assert usage is not None
+    lease_service.revoke_email_site_usage(usage.id)
+
+    second = lease_service.acquire_lease(
+        principal,
+        mode=LeaseMode.MAIL_READ,
+        ttl_seconds=600,
+        preferred_email="revive@outlook.com",
+        usage_site="openai",
+    )
+    assert second.allocated_email == "revive@outlook.com"
+    session.refresh(usage)
+    assert usage.revoked_at is None
+    assert usage.lease_id == second.lease_id
+
+
+def test_list_enabled_usage_sites_requires_scope() -> None:
+    session, _credential_cipher, client_key_service, lease_service = create_mail_read_context()
+    missing = client_key_service.create_client_key(
+        name="no-mail-acquire",
+        scopes=["leases:acquire", "tokens:access:read"],
+    )
+    principal = client_key_service.authenticate(missing.api_key)
+    try:
+        lease_service.list_enabled_usage_sites(principal)
+    except Exception as error:
+        assert "mailboxes:acquire" in str(error)
+    else:
+        raise AssertionError("缺少 mailboxes:acquire 时不应列出站点")
+
+    allowed = client_key_service.create_client_key(
+        name="can-list-sites",
+        scopes=["mailboxes:acquire"],
+    )
+    allowed_principal = client_key_service.authenticate(allowed.api_key)
+    sites = lease_service.list_enabled_usage_sites(allowed_principal)
+    assert [site.code for site in sites] == ["grok", "openai"]
+
+
+def test_mail_read_acquire_round_robins_by_updated_at_after_release() -> None:
+    """Successful acquire bumps mailbox.updated_at so the next free box is preferred."""
+    session, credential_cipher, client_key_service, lease_service = create_mail_read_context()
+    first_mailbox = _seed_usable_mailbox(session, credential_cipher, primary_email="older@outlook.com")
+    second_mailbox = _seed_usable_mailbox(session, credential_cipher, primary_email="newer@outlook.com")
+    first_mailbox.updated_at = utc_now() - timedelta(hours=2)
+    second_mailbox.updated_at = utc_now() - timedelta(hours=1)
+    session.flush()
+
+    creation = client_key_service.create_client_key(
+        name="round-robin-bot",
+        scopes=["mailboxes:acquire", "leases:release"],
+    )
+    principal = client_key_service.authenticate(creation.api_key)
+
+    first = lease_service.acquire_lease(
+        principal,
+        mode=LeaseMode.MAIL_READ,
+        ttl_seconds=600,
+        usage_site="openai",
+    )
+    assert first.primary_email == "older@outlook.com"
+    lease_service.release_lease(principal, first.lease_id)
+
+    second = lease_service.acquire_lease(
+        principal,
+        mode=LeaseMode.MAIL_READ,
+        ttl_seconds=600,
+        usage_site="grok",
+    )
+    assert second.primary_email == "newer@outlook.com"
+
+
+def test_mail_read_plus_with_usage_site_spreads_across_mailboxes() -> None:
+    """With usage_site, sequential plus acquires should not stick to one mailbox."""
+    session, credential_cipher, client_key_service, lease_service = create_mail_read_context()
+    _seed_usable_mailbox(session, credential_cipher, primary_email="box-a@outlook.com")
+    _seed_usable_mailbox(session, credential_cipher, primary_email="box-b@outlook.com")
+    creation = client_key_service.create_client_key(
+        name="plus-spread-bot",
+        scopes=["mailboxes:acquire", "leases:release"],
+    )
+    principal = client_key_service.authenticate(creation.api_key)
+
+    first = lease_service.acquire_lease(
+        principal,
+        mode=LeaseMode.MAIL_READ,
+        ttl_seconds=600,
+        use_plus_alias=True,
+        usage_site="openai",
+    )
+    lease_service.release_lease(principal, first.lease_id)
+
+    second = lease_service.acquire_lease(
+        principal,
+        mode=LeaseMode.MAIL_READ,
+        ttl_seconds=600,
+        use_plus_alias=True,
+        usage_site="openai",
+    )
+    assert first.primary_email != second.primary_email
+    assert {first.primary_email, second.primary_email} == {
+        "box-a@outlook.com",
+        "box-b@outlook.com",
+    }
+
+    lease_service.release_lease(principal, second.lease_id)
+    try:
+        lease_service.acquire_lease(
+            principal,
+            mode=LeaseMode.MAIL_READ,
+            ttl_seconds=600,
+            use_plus_alias=True,
+            usage_site="openai",
+        )
+    except LeaseUnavailableError:
+        pass
+    else:
+        raise AssertionError("两箱均已在该站占用后，plus 路径应耗尽")

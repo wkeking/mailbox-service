@@ -2,18 +2,21 @@
 
 from __future__ import annotations
 
+from sqlalchemy import create_engine, select
+from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.pool import StaticPool
+
 from base64 import urlsafe_b64encode
 from datetime import timedelta
 import hashlib
 import json
 import logging
 
-from sqlalchemy import create_engine, select
-from sqlalchemy.orm import Session, sessionmaker
 
+from mailbox_service.access_token_scopes import GRAPH_MAIL_READ_SCOPE
 from mailbox_service.config import Settings
 from mailbox_service.database import Base
-from mailbox_service.models import Mailbox, utc_now
+from mailbox_service.models import Mailbox, MailboxCapability, utc_now
 from mailbox_service.proxy_service import MicrosoftOAuthError, MicrosoftTokenResponse
 from mailbox_service.security import CredentialCipher
 from mailbox_service.token_service import MailboxAccessTokenService
@@ -34,9 +37,17 @@ class FakeMicrosoftOAuthClient:
     def __init__(self, responses: list[MicrosoftTokenResponse | Exception]) -> None:
         self.responses = responses
         self.refresh_attempts: list[tuple[str, str]] = []
+        self.requested_scopes: list[str | None] = []
 
-    def refresh_access_token(self, mailbox: Mailbox, refresh_token: str) -> MicrosoftTokenResponse:
+    def refresh_access_token(
+        self,
+        mailbox: Mailbox,
+        refresh_token: str,
+        *,
+        scope: str | None = None,
+    ) -> MicrosoftTokenResponse:
         self.refresh_attempts.append((mailbox.primary_email, refresh_token))
+        self.requested_scopes.append(scope)
         response = self.responses.pop(0)
         if isinstance(response, Exception):
             raise response
@@ -50,9 +61,10 @@ def create_access_token_test_context(
     debug_token_logging: bool = False,
 ) -> tuple[Session, CredentialCipher, FakeMicrosoftOAuthClient, MailboxAccessTokenService]:
     """Build an isolated mailbox token service with deterministic encryption."""
-    database_engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    database_engine = create_engine("sqlite+pysqlite:///:memory:", connect_args={"check_same_thread": False}, poolclass=StaticPool, future=True)
     Base.metadata.create_all(database_engine)
-    session = sessionmaker(bind=database_engine, expire_on_commit=False)()
+    session_factory = sessionmaker(bind=database_engine, expire_on_commit=False)
+    session = session_factory()
     encryption_key = urlsafe_b64encode(b"a" * 32).decode("ascii")
     settings = Settings(
         database_url="sqlite+pysqlite:///:memory:",
@@ -63,7 +75,7 @@ def create_access_token_test_context(
     )
     cipher = CredentialCipher(encryption_key)
     oauth_client = FakeMicrosoftOAuthClient(responses or [])
-    service = MailboxAccessTokenService(session, settings, cipher, oauth_client)
+    service = MailboxAccessTokenService(session, settings, cipher, oauth_client, session_factory=session_factory)
     return session, cipher, oauth_client, service
 
 
@@ -75,6 +87,7 @@ def test_unexpired_cached_access_token_is_returned_without_refresh() -> None:
         client_id="client-id",
         refresh_token_ciphertext=cipher.encrypt("refresh-token"),
         access_token_ciphertext=cipher.encrypt("cached-access-token"),
+        access_token_source_version=1,
         access_token_expires_at=utc_now() + timedelta(minutes=20),
         access_token_refreshed_at=utc_now() - timedelta(minutes=5),
     )
@@ -110,6 +123,7 @@ def test_expired_access_token_refreshes_and_persists_rotated_refresh_token() -> 
         client_id="client-id",
         refresh_token_ciphertext=cipher.encrypt("old-refresh-token"),
         access_token_ciphertext=cipher.encrypt("expired-access-token"),
+        access_token_source_version=1,
         access_token_expires_at=utc_now() - timedelta(minutes=1),
         access_token_refreshed_at=utc_now() - timedelta(hours=2),
         token_version=3,
@@ -143,6 +157,7 @@ def test_cached_access_token_backfills_missing_scope_without_refresh() -> None:
         client_id="client-id",
         refresh_token_ciphertext=cipher.encrypt("refresh-token"),
         access_token_ciphertext=cipher.encrypt(cached_access_token),
+        access_token_source_version=1,
         access_token_expires_at=utc_now() + timedelta(minutes=20),
         access_token_refreshed_at=utc_now() - timedelta(minutes=5),
         scope=None,
@@ -180,6 +195,7 @@ def test_development_token_logging_reports_fingerprints_without_plaintext(caplog
         client_id="client-id",
         refresh_token_ciphertext=cipher.encrypt(old_refresh_token),
         access_token_ciphertext=cipher.encrypt(old_access_token),
+        access_token_source_version=1,
         access_token_expires_at=utc_now() - timedelta(minutes=1),
     )
     session.add(mailbox)
@@ -283,3 +299,94 @@ def test_bulk_refresh_deduplicates_selected_mailbox_ids() -> None:
     assert result.failed == 0
     assert len(result.results) == 1
     assert oauth_client.refresh_attempts == [("owner@outlook.com", "refresh-token")]
+
+
+def test_graph_capability_refreshes_with_graph_scope() -> None:
+    """Classified Graph mailboxes must request a Graph-audience AT on refresh."""
+    session, cipher, oauth_client, service = create_access_token_test_context(
+        [
+            MicrosoftTokenResponse(
+                access_token="graph-access-token",
+                expires_in=3600,
+                scope="https://graph.microsoft.com/Mail.Read",
+            )
+        ]
+    )
+    mailbox = Mailbox(
+        primary_email="graph@outlook.com",
+        client_id="client-id",
+        capability=MailboxCapability.GRAPH,
+        refresh_token_ciphertext=cipher.encrypt("refresh-token"),
+        access_token_ciphertext=cipher.encrypt("expired-outlook-token"),
+        access_token_source_version=1,
+        access_token_expires_at=utc_now() - timedelta(minutes=1),
+        scope="https://outlook.office.com/IMAP.AccessAsUser.All",
+    )
+    session.add(mailbox)
+    session.flush()
+
+    result = service.ensure_access_token(mailbox.id)
+
+    assert result.access_token == "graph-access-token"
+    assert result.refreshed is True
+    assert oauth_client.requested_scopes == [GRAPH_MAIL_READ_SCOPE]
+    assert mailbox.scope == "https://graph.microsoft.com/Mail.Read"
+
+
+def test_graph_preferred_channel_rejects_outlook_cache_and_reaudiences() -> None:
+    """An explicit Graph channel must not reuse a still-valid outlook-audience cache."""
+    session, cipher, oauth_client, service = create_access_token_test_context(
+        [
+            MicrosoftTokenResponse(
+                access_token="fresh-graph-token",
+                expires_in=1800,
+                scope="https://graph.microsoft.com/Mail.Read offline_access",
+            )
+        ]
+    )
+    mailbox = Mailbox(
+        primary_email="owner@outlook.com",
+        client_id="client-id",
+        capability=MailboxCapability.IMAP,
+        refresh_token_ciphertext=cipher.encrypt("refresh-token"),
+        access_token_ciphertext=cipher.encrypt("outlook-cached-token"),
+        access_token_source_version=1,
+        access_token_expires_at=utc_now() + timedelta(minutes=30),
+        scope="https://outlook.office.com/IMAP.AccessAsUser.All",
+    )
+    session.add(mailbox)
+    session.flush()
+
+    result = service.ensure_access_token(mailbox.id, preferred_channel="graph")
+
+    assert result.access_token == "fresh-graph-token"
+    assert result.refreshed is True
+    assert oauth_client.requested_scopes == [GRAPH_MAIL_READ_SCOPE]
+    assert cipher.decrypt(mailbox.access_token_ciphertext or "") == "fresh-graph-token"
+
+
+def test_imap_capability_refresh_uses_default_scope() -> None:
+    session, cipher, oauth_client, service = create_access_token_test_context(
+        [
+            MicrosoftTokenResponse(
+                access_token="imap-access-token",
+                expires_in=3600,
+                scope="https://outlook.office.com/IMAP.AccessAsUser.All",
+            )
+        ]
+    )
+    mailbox = Mailbox(
+        primary_email="imap@outlook.com",
+        client_id="client-id",
+        capability=MailboxCapability.IMAP,
+        refresh_token_ciphertext=cipher.encrypt("refresh-token"),
+        access_token_expires_at=utc_now() - timedelta(minutes=1),
+        access_token_ciphertext=cipher.encrypt("old-token"),
+    )
+    session.add(mailbox)
+    session.flush()
+
+    result = service.ensure_access_token(mailbox.id)
+
+    assert result.access_token == "imap-access-token"
+    assert oauth_client.requested_scopes == [None]

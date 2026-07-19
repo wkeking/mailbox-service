@@ -7,7 +7,9 @@ import {
   Copy,
   Download,
   KeyRound,
+  ListFilter,
   LogOut,
+  Globe2,
   Network,
   PanelLeftClose,
   PanelLeftOpen,
@@ -23,27 +25,16 @@ import {
 
 type ProxyStatus = "healthy" | "cooldown" | "unknown";
 type ProxyProtocol = "http_connect" | "socks5";
-type NavigationSection = "dashboard" | "mailboxes" | "leases" | "egress-proxies" | "client-keys";
+type NavigationSection = "dashboard" | "mailboxes" | "leases" | "usage-sites" | "email-site-usages" | "egress-proxies" | "client-keys";
 
-const ADMIN_TOKEN_STORAGE_KEY = "mailbox-service.admin-token";
+const LEGACY_ADMIN_TOKEN_STORAGE_KEY = "mailbox-service.admin-token";
 
-function readStoredAdminToken(): string {
+/** Admin Token is memory-only (SEC-14). Best-effort purge of any legacy sessionStorage copy. */
+function clearLegacyAdminTokenStorage(): void {
   try {
-    return sessionStorage.getItem(ADMIN_TOKEN_STORAGE_KEY) ?? "";
+    sessionStorage.removeItem(LEGACY_ADMIN_TOKEN_STORAGE_KEY);
   } catch {
-    return "";
-  }
-}
-
-function writeStoredAdminToken(token: string): void {
-  try {
-    if (token) {
-      sessionStorage.setItem(ADMIN_TOKEN_STORAGE_KEY, token);
-    } else {
-      sessionStorage.removeItem(ADMIN_TOKEN_STORAGE_KEY);
-    }
-  } catch {
-    // Ignore storage failures (private mode / disabled storage); login still works in-memory.
+    // Ignore storage failures.
   }
 }
 
@@ -173,6 +164,8 @@ interface MailboxListItem {
   has_access_token: boolean;
   access_token_expires_at: string | null;
   access_token_refreshed_at: string | null;
+  refresh_token_updated_at: string | null;
+  refresh_token_expires_at: string | null;
   scope: string | null;
   capability: "imap" | "graph" | "unusable" | "unknown" | null;
   capability_probed_at: string | null;
@@ -269,6 +262,38 @@ interface LeaseListResponse {
   items: LeaseListItem[];
 }
 
+interface UsageSiteItem {
+  code: string;
+  display_name: string;
+  enabled: boolean;
+  created_at: string | null;
+  active_usage_count?: number | null;
+}
+
+interface UsageSiteListResponse {
+  items: UsageSiteItem[];
+}
+
+interface EmailSiteUsageItem {
+  id: string;
+  allocated_email: string;
+  usage_site: string;
+  mailbox_id: string | null;
+  lease_id: string | null;
+  client_key_id: string | null;
+  created_at: string;
+  revoked_at: string | null;
+  updated_at: string;
+}
+
+interface EmailSiteUsageListResponse {
+  total: number;
+  page: number;
+  page_size: number;
+  total_pages: number;
+  items: EmailSiteUsageItem[];
+}
+
 const apiBaseUrl = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8000";
 
 function formatTime(value: string | null): string {
@@ -310,6 +335,19 @@ function getErrorMessage(payload: unknown): string {
   return "请求失败，请检查服务状态和管理员凭证。";
 }
 
+type UnauthorizedHandler = (() => void) | null;
+let adminUnauthorizedHandler: UnauthorizedHandler = null;
+
+function registerAdminUnauthorizedHandler(handler: UnauthorizedHandler): void {
+  adminUnauthorizedHandler = handler;
+}
+
+function handlePossiblyUnauthorized(statusCode: number): void {
+  if (statusCode === 401 && adminUnauthorizedHandler) {
+    adminUnauthorizedHandler();
+  }
+}
+
 async function requestApi<ResponsePayload>(
   adminToken: string,
   path: string,
@@ -322,6 +360,10 @@ async function requestApi<ResponsePayload>(
   }
 
   const response = await fetch(`${apiBaseUrl}${path}`, { ...options, headers });
+  if (response.status === 401) {
+    handlePossiblyUnauthorized(401);
+    throw new Error("管理员认证失败，请重新登录。");
+  }
   if (response.status === 204) {
     return undefined as ResponsePayload;
   }
@@ -344,6 +386,10 @@ async function requestApiText(
   }
 
   const response = await fetch(`${apiBaseUrl}${path}`, { ...options, headers });
+  if (response.status === 401) {
+    handlePossiblyUnauthorized(401);
+    throw new Error("管理员认证失败，请重新登录。");
+  }
   if (!response.ok) {
     const payload: unknown = await response.json().catch(() => null);
     throw new Error(getErrorMessage(payload));
@@ -550,6 +596,7 @@ function MailboxesPage({
   onDeleteInvalidMailboxes,
   onToggleAllMailboxSelection,
   onToggleMailboxSelection,
+  onOpenSiteUsages,
 }: {
   mailboxes: MailboxListItem[];
   page: number;
@@ -572,6 +619,7 @@ function MailboxesPage({
   onDeleteInvalidMailboxes: () => void;
   onToggleAllMailboxSelection: (isSelected: boolean) => void;
   onToggleMailboxSelection: (mailboxId: string, isSelected: boolean) => void;
+  onOpenSiteUsages: (primaryEmail: string) => void;
 }): JSX.Element {
   const selectedMailboxCount = selectedMailboxIds.size;
   const areAllMailboxesSelected = mailboxes.length > 0 && mailboxes.every((mailbox) => selectedMailboxIds.has(mailbox.id));
@@ -590,9 +638,20 @@ function MailboxesPage({
           <h1 className="page-title">邮箱管理</h1>
           <p className="page-subtitle">集中维护邮箱凭证、状态、Token 版本与出口代理绑定。</p>
         </div>
-        <button className="button button-primary" type="button" onClick={onOpenImport}>
-          <Upload size={15} /> 导入邮箱
-        </button>
+        <div className="page-header-actions">
+          <button
+            className="button"
+            type="button"
+            onClick={onRefreshAllAccessTokens}
+            disabled={isSelectionBusy || total === 0}
+            title="强制刷新全部 active 邮箱的 RT/AT"
+          >
+            <RefreshCw size={14} /> {isRefreshingAccessTokens ? "刷新中" : "刷新全部 RT/AT"}
+          </button>
+          <button className="button button-primary" type="button" onClick={onOpenImport}>
+            <Upload size={15} /> 导入邮箱
+          </button>
+        </div>
       </header>
       <section className="panel">
         <div className="toolbar mailbox-toolbar">
@@ -643,14 +702,6 @@ function MailboxesPage({
             >
               <RefreshCw size={14} /> 刷新选中 RT/AT
             </button>
-            <button
-              className="button"
-              type="button"
-              onClick={onRefreshAllAccessTokens}
-              disabled={isSelectionBusy || mailboxes.length === 0}
-            >
-              <RefreshCw size={14} /> 刷新全部 RT/AT
-            </button>
             <div className="pagination-actions" aria-label="邮箱分页">
               <button className="button" type="button" onClick={() => onPageChange(page - 1)} disabled={page <= 1}>上一页</button>
               <span className="muted-copy">第 {page} / {normalizedTotalPages} 页</span>
@@ -677,9 +728,12 @@ function MailboxesPage({
                 <th>Token 版本</th>
                 <th>AT 过期时间</th>
                 <th>AT 刷新时间</th>
+                <th>RT 更新时间</th>
+                <th>RT 过期时间</th>
                 <th>出口代理</th>
                 <th>活跃租约</th>
                 <th>更新时间</th>
+                <th aria-label="操作" />
               </tr>
             </thead>
             <tbody>
@@ -711,9 +765,23 @@ function MailboxesPage({
                   <td>{mailbox.token_version}</td>
                   <td>{mailbox.has_access_token ? formatTime(mailbox.access_token_expires_at) : "未缓存"}</td>
                   <td>{formatTime(mailbox.access_token_refreshed_at)}</td>
+                  <td>{formatTime(mailbox.refresh_token_updated_at)}</td>
+                  <td>{formatTime(mailbox.refresh_token_expires_at)}</td>
                   <td>{mailbox.egress_proxy_name ?? "直连 / 未绑定"}<div className="muted-copy">{formatTime(mailbox.proxy_last_switch_at)}</div></td>
                   <td>{mailbox.active_lease_count}</td>
                   <td>{formatTime(mailbox.updated_at)}</td>
+                  <td>
+                    <div className="cell-actions">
+                      <button
+                        className="button"
+                        type="button"
+                        title="查看该主邮箱相关的站点占用（含 plus 别名需另行筛选）"
+                        onClick={() => onOpenSiteUsages(mailbox.primary_email)}
+                      >
+                        <ListFilter size={14} /> 站点占用
+                      </button>
+                    </div>
+                  </td>
                 </tr>
               ))}
             </tbody>
@@ -866,6 +934,289 @@ function LeasesPage({
           </table>
         </div>
         {leases.length === 0 && <div className="empty-state"><CircleOff size={16} style={{ verticalAlign: "middle", marginRight: 6 }} />暂无租约。调用方领取邮箱后会显示在这里。</div>}
+      </section>
+    </>
+  );
+}
+
+
+function UsageSitesPage({
+  sites,
+  isCreateDialogOpen,
+  isSaving,
+  deletingCode,
+  onOpenCreateDialog,
+  onCloseCreateDialog,
+  onCreate,
+  onToggleEnabled,
+  onDelete,
+  onRefresh,
+}: {
+  sites: UsageSiteItem[];
+  isCreateDialogOpen: boolean;
+  isSaving: boolean;
+  deletingCode: string | null;
+  onOpenCreateDialog: () => void;
+  onCloseCreateDialog: () => void;
+  onCreate: (event: FormEvent<HTMLFormElement>) => void;
+  onToggleEnabled: (site: UsageSiteItem) => void;
+  onDelete: (site: UsageSiteItem) => void;
+  onRefresh: () => void;
+}): JSX.Element {
+  return (
+    <>
+      <header className="page-header">
+        <div>
+          <h1 className="page-title">注册站点</h1>
+          <p className="page-subtitle">配置 mail_read 领取时可选的 usage_site 白名单；禁用后禁止新声明，历史占用仍参与排除。</p>
+        </div>
+        <div className="cell-actions">
+          <button className="button" type="button" onClick={onRefresh}><RefreshCw size={15} /> 刷新</button>
+          <button className="button button-primary" type="button" onClick={onOpenCreateDialog}><Plus size={15} /> 新增站点</button>
+        </div>
+      </header>
+      <section className="panel">
+        <div className="toolbar">
+          <div>
+            <h2 className="section-title">站点白名单</h2>
+            <span className="muted-copy">共 {sites.length} 个站点</span>
+          </div>
+        </div>
+        <div className="table-wrapper">
+          <table>
+            <thead>
+              <tr>
+                <th>code</th>
+                <th>展示名</th>
+                <th>状态</th>
+                <th>未撤销占用</th>
+                <th>创建时间</th>
+                <th aria-label="操作" />
+              </tr>
+            </thead>
+            <tbody>
+              {sites.map((site) => {
+                const activeUsageCount = site.active_usage_count ?? 0;
+                const canDelete = activeUsageCount === 0;
+                return (
+                <tr key={site.code}>
+                  <td><strong>{site.code}</strong></td>
+                  <td>{site.display_name}</td>
+                  <td>
+                    <span className={`badge ${site.enabled ? "badge-enabled" : "badge-disabled"}`}>
+                      {site.enabled ? "启用中" : "已禁用"}
+                    </span>
+                  </td>
+                  <td>{activeUsageCount}</td>
+                  <td>{formatTime(site.created_at)}</td>
+                  <td>
+                    <div className="cell-actions">
+                      <button className="button" type="button" onClick={() => onToggleEnabled(site)}>
+                        {site.enabled ? "禁用" : "启用"}
+                      </button>
+                      <button
+                        className="button button-danger"
+                        type="button"
+                        disabled={!canDelete || deletingCode === site.code}
+                        title={canDelete ? "删除站点" : "仍有未撤销占用，无法删除"}
+                        onClick={() => onDelete(site)}
+                      >
+                        <Trash2 size={14} /> {deletingCode === site.code ? "删除中" : "删除"}
+                      </button>
+                    </div>
+                  </td>
+                </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+        {sites.length === 0 && (
+          <div className="empty-state">
+            <CircleOff size={16} style={{ verticalAlign: "middle", marginRight: 6 }} />
+            暂无站点。请新增 openai / grok 等注册目标站。
+          </div>
+        )}
+      </section>
+      {isCreateDialogOpen && (
+        <div className="dialog-backdrop" role="presentation">
+          <form className="dialog" onSubmit={onCreate}>
+            <div className="section-header">
+              <div>
+                <h2 className="section-title">新增注册站点</h2>
+                <p className="page-subtitle">code 创建后不可修改，仅允许小写字母、数字、点、下划线与连字符。</p>
+              </div>
+            </div>
+            <div className="form-grid">
+              <label className="form-field">
+                code
+                <input className="input" name="code" required minLength={2} maxLength={64} placeholder="openai" pattern="[a-z0-9._-]+" />
+              </label>
+              <label className="form-field">
+                展示名
+                <input className="input" name="display_name" required maxLength={100} placeholder="OpenAI" />
+              </label>
+              <label className="checkbox-label" style={{ alignSelf: "end", minHeight: 34 }}>
+                <input type="checkbox" name="enabled" defaultChecked /> 创建后立即启用
+              </label>
+            </div>
+            <div className="dialog-actions">
+              <button className="button" type="button" onClick={onCloseCreateDialog} disabled={isSaving}>取消</button>
+              <button className="button button-primary" type="submit" disabled={isSaving}>
+                {isSaving ? "保存中…" : "创建"}
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+    </>
+  );
+}
+
+function EmailSiteUsagesPage({
+  usages,
+  page,
+  pageSize,
+  total,
+  totalPages,
+  allocatedEmailFilter,
+  usageSiteFilter,
+  includeRevoked,
+  siteOptions,
+  isRevokingId,
+  onAllocatedEmailFilterChange,
+  onUsageSiteFilterChange,
+  onIncludeRevokedChange,
+  onSearch,
+  onPageChange,
+  onRevoke,
+}: {
+  usages: EmailSiteUsageItem[];
+  page: number;
+  pageSize: number;
+  total: number;
+  totalPages: number;
+  allocatedEmailFilter: string;
+  usageSiteFilter: string;
+  includeRevoked: boolean;
+  siteOptions: UsageSiteItem[];
+  isRevokingId: string | null;
+  onAllocatedEmailFilterChange: (value: string) => void;
+  onUsageSiteFilterChange: (value: string) => void;
+  onIncludeRevokedChange: (value: boolean) => void;
+  onSearch: () => void;
+  onPageChange: (page: number) => void;
+  onRevoke: (usage: EmailSiteUsageItem) => void;
+}): JSX.Element {
+  const normalizedTotalPages = Math.max(totalPages, 1);
+  return (
+    <>
+      <header className="page-header">
+        <div>
+          <h1 className="page-title">邮箱站点占用</h1>
+          <p className="page-subtitle">查看某业务地址已在哪些站登记；撤销后同一地址可再次用于该站。</p>
+        </div>
+      </header>
+      <section className="panel">
+        <div className="toolbar" style={{ flexWrap: "wrap", gap: 12 }}>
+          <div>
+            <h2 className="section-title">占用记录</h2>
+            <span className="muted-copy">共 {total} 条，每页 {pageSize} 条</span>
+          </div>
+          <div className="cell-actions" style={{ flexWrap: "wrap" }}>
+            <input
+              className="input"
+              style={{ minWidth: 220 }}
+              value={allocatedEmailFilter}
+              onChange={(event) => onAllocatedEmailFilterChange(event.target.value)}
+              placeholder="业务邮箱（完整地址）"
+            />
+            <select
+              className="select"
+              style={{ minWidth: 140 }}
+              value={usageSiteFilter}
+              onChange={(event) => onUsageSiteFilterChange(event.target.value)}
+            >
+              <option value="">全部站点</option>
+              {siteOptions.map((site) => (
+                <option key={site.code} value={site.code}>{site.code}</option>
+              ))}
+            </select>
+            <label className="checkbox-label" style={{ minHeight: 34 }}>
+              <input
+                type="checkbox"
+                checked={includeRevoked}
+                onChange={(event) => onIncludeRevokedChange(event.target.checked)}
+              />
+              含已撤销
+            </label>
+            <button className="button button-primary" type="button" onClick={onSearch}>
+              <ListFilter size={15} /> 查询
+            </button>
+          </div>
+        </div>
+        <div className="table-wrapper">
+          <table>
+            <thead>
+              <tr>
+                <th>业务地址</th>
+                <th>站点</th>
+                <th>状态</th>
+                <th>Client Key</th>
+                <th>登记时间</th>
+                <th>更新时间</th>
+                <th aria-label="操作" />
+              </tr>
+            </thead>
+            <tbody>
+              {usages.map((usage) => {
+                const isActive = usage.revoked_at === null;
+                return (
+                  <tr key={usage.id}>
+                    <td>
+                      <strong>{usage.allocated_email}</strong>
+                      <div className="muted-copy">{usage.id}</div>
+                    </td>
+                    <td>{usage.usage_site}</td>
+                    <td>
+                      <span className={`badge ${isActive ? "badge-enabled" : "badge-disabled"}`}>
+                        {isActive ? "占用中" : "已撤销"}
+                      </span>
+                    </td>
+                    <td>{usage.client_key_id ?? "-"}</td>
+                    <td>{formatTime(usage.created_at)}</td>
+                    <td>{formatTime(usage.updated_at)}</td>
+                    <td>
+                      {isActive ? (
+                        <button
+                          className="button"
+                          type="button"
+                          disabled={isRevokingId === usage.id}
+                          onClick={() => onRevoke(usage)}
+                        >
+                          {isRevokingId === usage.id ? "撤销中…" : "撤销占用"}
+                        </button>
+                      ) : (
+                        <span className="muted-copy">撤销于 {formatTime(usage.revoked_at)}</span>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+        {usages.length === 0 && (
+          <div className="empty-state">
+            <CircleOff size={16} style={{ verticalAlign: "middle", marginRight: 6 }} />
+            暂无匹配的占用记录。
+          </div>
+        )}
+        <div className="pagination-actions" aria-label="占用分页" style={{ marginTop: 16 }}>
+          <button className="button" type="button" onClick={() => onPageChange(page - 1)} disabled={page <= 1}>上一页</button>
+          <span className="muted-copy">第 {page} / {normalizedTotalPages} 页</span>
+          <button className="button" type="button" onClick={() => onPageChange(page + 1)} disabled={page >= normalizedTotalPages}>下一页</button>
+        </div>
       </section>
     </>
   );
@@ -1127,7 +1478,7 @@ function LoginPage({
           <div>
             <h2 className="section-title">管理员登录</h2>
             <p className="page-subtitle">
-              输入部署环境中的 Admin Token。登录后会保存在当前浏览器标签页的会话存储中，刷新页面无需重新输入；关闭标签页后清除。
+              输入部署环境中的 Admin Token。Token 仅保存在当前页面内存中，刷新或关闭标签页后需重新输入；不会写入 sessionStorage 或 localStorage。
             </p>
           </div>
           <label className="form-field full-width">
@@ -1153,9 +1504,9 @@ function LoginPage({
 }
 
 function App(): JSX.Element {
-  const [adminToken, setAdminToken] = useState(() => readStoredAdminToken());
+  const [adminToken, setAdminToken] = useState("");
   const [isAuthenticated, setIsAuthenticated] = useState(false);
-  const [isRestoringSession, setIsRestoringSession] = useState(() => Boolean(readStoredAdminToken()));
+  const [isRestoringSession, setIsRestoringSession] = useState(false);
   const [isSidebarVisible, setIsSidebarVisible] = useState(true);
   const [activeNavigationSection, setActiveNavigationSection] = useState<NavigationSection>("dashboard");
   const [dashboardSummary, setDashboardSummary] = useState<DashboardSummary | null>(null);
@@ -1163,6 +1514,21 @@ function App(): JSX.Element {
   const [mailboxPagination, setMailboxPagination] = useState({ total: 0, page: 1, pageSize: 20, totalPages: 1 });
   const [leases, setLeases] = useState<LeaseListItem[]>([]);
   const [leasePagination, setLeasePagination] = useState({ total: 0, page: 1, pageSize: 20, totalPages: 1 });
+  const [usageSites, setUsageSites] = useState<UsageSiteItem[]>([]);
+  const [isUsageSiteCreateDialogOpen, setIsUsageSiteCreateDialogOpen] = useState(false);
+  const [isSavingUsageSite, setIsSavingUsageSite] = useState(false);
+  const [deletingUsageSiteCode, setDeletingUsageSiteCode] = useState<string | null>(null);
+  const [emailSiteUsages, setEmailSiteUsages] = useState<EmailSiteUsageItem[]>([]);
+  const [emailSiteUsagePagination, setEmailSiteUsagePagination] = useState({
+    total: 0,
+    page: 1,
+    pageSize: 20,
+    totalPages: 1,
+  });
+  const [emailSiteUsageEmailFilter, setEmailSiteUsageEmailFilter] = useState("");
+  const [emailSiteUsageSiteFilter, setEmailSiteUsageSiteFilter] = useState("");
+  const [emailSiteUsageIncludeRevoked, setEmailSiteUsageIncludeRevoked] = useState(true);
+  const [isRevokingUsageId, setIsRevokingUsageId] = useState<string | null>(null);
   const [proxies, setProxies] = useState<EgressProxy[]>([]);
   const [policy, setPolicy] = useState<ProxyPolicy | null>(null);
   const [clientKeys, setClientKeys] = useState<ClientKeyListItem[]>([]);
@@ -1334,6 +1700,83 @@ function App(): JSX.Element {
     }
   }
 
+
+  async function loadUsageSites(tokenOverride?: string): Promise<boolean> {
+    const tokenForRequest = resolveAdminToken(tokenOverride);
+    if (!tokenForRequest) {
+      setErrorMessage("输入管理员 Token 后才能读取管理台数据。");
+      return false;
+    }
+    setIsLoading(true);
+    setErrorMessage(null);
+    try {
+      const response = await requestApi<UsageSiteListResponse>(
+        tokenForRequest,
+        "/api/v1/admin/usage-sites?include_disabled=true",
+      );
+      setUsageSites(response.items);
+      return true;
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : "无法加载注册站点列表。");
+      return false;
+    } finally {
+      setIsLoading(false);
+    }
+  }
+
+  async function loadEmailSiteUsages(
+    requestedPage = emailSiteUsagePagination.page,
+    tokenOverride?: string,
+    filterOverrides?: {
+      allocatedEmail?: string;
+      usageSite?: string;
+      includeRevoked?: boolean;
+    },
+  ): Promise<boolean> {
+    const tokenForRequest = resolveAdminToken(tokenOverride);
+    if (!tokenForRequest) {
+      setErrorMessage("输入管理员 Token 后才能读取管理台数据。");
+      return false;
+    }
+    setIsLoading(true);
+    setErrorMessage(null);
+    try {
+      const resolvedEmail = (filterOverrides?.allocatedEmail ?? emailSiteUsageEmailFilter).trim();
+      const resolvedSite = (filterOverrides?.usageSite ?? emailSiteUsageSiteFilter).trim();
+      const resolvedIncludeRevoked = filterOverrides?.includeRevoked ?? emailSiteUsageIncludeRevoked;
+      const query = new URLSearchParams({
+        page: String(requestedPage),
+        page_size: String(emailSiteUsagePagination.pageSize),
+        include_revoked: String(resolvedIncludeRevoked),
+      });
+      const normalizedEmail = resolvedEmail;
+      const normalizedSite = resolvedSite;
+      if (normalizedEmail) {
+        query.set("allocated_email", normalizedEmail);
+      }
+      if (normalizedSite) {
+        query.set("usage_site", normalizedSite);
+      }
+      const response = await requestApi<EmailSiteUsageListResponse>(
+        tokenForRequest,
+        `/api/v1/admin/email-site-usages?${query.toString()}`,
+      );
+      setEmailSiteUsages(response.items);
+      setEmailSiteUsagePagination({
+        total: response.total,
+        page: response.page,
+        pageSize: response.page_size,
+        totalPages: response.total_pages,
+      });
+      return true;
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : "无法加载邮箱站点占用。");
+      return false;
+    } finally {
+      setIsLoading(false);
+    }
+  }
+
   async function loadSectionData(
     section: NavigationSection,
     tokenOverride?: string,
@@ -1345,6 +1788,12 @@ function App(): JSX.Element {
         return loadMailboxes(mailboxPagination.page, tokenOverride);
       case "leases":
         return loadLeases(leasePagination.page, tokenOverride);
+      case "usage-sites":
+        return loadUsageSites(tokenOverride);
+      case "email-site-usages":
+        // Keep site options available for the occupancy filter dropdown.
+        void loadUsageSites(tokenOverride);
+        return loadEmailSiteUsages(emailSiteUsagePagination.page, tokenOverride);
       case "egress-proxies":
         return loadEgressProxies(tokenOverride);
       case "client-keys":
@@ -1362,37 +1811,16 @@ function App(): JSX.Element {
   }
 
   useEffect(() => {
-    const storedToken = readStoredAdminToken().trim();
-    if (!storedToken) {
-      setIsRestoringSession(false);
-      return;
-    }
-
-    let cancelled = false;
-    void (async () => {
-      // Session restore lands on dashboard; only fetch overview data.
-      const isLoaded = await loadDashboard(storedToken);
-      if (cancelled) {
-        return;
-      }
-      if (isLoaded) {
-        setAdminToken(storedToken);
-        setIsAuthenticated(true);
-        setActiveNavigationSection("dashboard");
-        setNotice(null);
-      } else {
-        writeStoredAdminToken("");
-        setAdminToken("");
-        setIsAuthenticated(false);
-      }
-      setIsRestoringSession(false);
-    })();
-
+    clearLegacyAdminTokenStorage();
+    registerAdminUnauthorizedHandler(() => {
+      clearLegacyAdminTokenStorage();
+      setIsAuthenticated(false);
+      setAdminToken("");
+      setErrorMessage("管理员认证已失效，请重新登录。");
+    });
     return () => {
-      cancelled = true;
+      registerAdminUnauthorizedHandler(null);
     };
-    // Restore once on mount from sessionStorage.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   async function handleLogin(event: FormEvent<HTMLFormElement>): Promise<void> {
@@ -1405,7 +1833,7 @@ function App(): JSX.Element {
     // Login lands on dashboard; only fetch overview data.
     const isLoaded = await loadDashboard(tokenForLogin);
     if (isLoaded) {
-      writeStoredAdminToken(tokenForLogin);
+      clearLegacyAdminTokenStorage();
       setAdminToken(tokenForLogin);
       setIsAuthenticated(true);
       setActiveNavigationSection("dashboard");
@@ -1414,7 +1842,7 @@ function App(): JSX.Element {
   }
 
   function handleLogout(): void {
-    writeStoredAdminToken("");
+    clearLegacyAdminTokenStorage();
     setIsAuthenticated(false);
     setIsRestoringSession(false);
     setIsSidebarVisible(true);
@@ -1668,6 +2096,132 @@ function App(): JSX.Element {
     }
     await loadLeases(boundedNextPage);
   }
+
+  async function changeEmailSiteUsagePage(nextPage: number): Promise<void> {
+    await loadEmailSiteUsages(nextPage);
+  }
+
+  async function createUsageSite(event: FormEvent<HTMLFormElement>): Promise<void> {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const formData = new FormData(form);
+    const code = String(formData.get("code") ?? "").trim().toLowerCase();
+    const displayName = String(formData.get("display_name") ?? "").trim();
+    const enabled = formData.get("enabled") === "on";
+    if (!code || !displayName) {
+      setErrorMessage("code 与展示名不能为空。");
+      return;
+    }
+    setIsSavingUsageSite(true);
+    setErrorMessage(null);
+    try {
+      await requestApi<UsageSiteItem>(adminToken, "/api/v1/admin/usage-sites", {
+        method: "POST",
+        body: JSON.stringify({ code, display_name: displayName, enabled }),
+      });
+      setIsUsageSiteCreateDialogOpen(false);
+      setNotice(`注册站点「${code}」已创建。`);
+      await loadUsageSites();
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : "无法创建注册站点。");
+    } finally {
+      setIsSavingUsageSite(false);
+    }
+  }
+
+  async function toggleUsageSiteEnabled(site: UsageSiteItem): Promise<void> {
+    const nextEnabled = !site.enabled;
+    const actionLabel = nextEnabled ? "启用" : "禁用";
+    const shouldContinue = window.confirm(
+      `${actionLabel}站点「${site.code}」？${nextEnabled ? "" : "禁用后调用方不能再声明该站点。"}`,
+    );
+    if (!shouldContinue) {
+      return;
+    }
+    setErrorMessage(null);
+    try {
+      const updated = await requestApi<UsageSiteItem>(
+        adminToken,
+        `/api/v1/admin/usage-sites/${encodeURIComponent(site.code)}`,
+        {
+          method: "PATCH",
+          body: JSON.stringify({ enabled: nextEnabled }),
+        },
+      );
+      setUsageSites((currentSites) =>
+        currentSites.map((currentSite) => (currentSite.code === updated.code ? updated : currentSite)),
+      );
+      setNotice(`站点「${site.code}」已${actionLabel}。`);
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : "无法更新注册站点。");
+    }
+  }
+
+
+  async function openEmailSiteUsagesForEmail(primaryEmail: string): Promise<void> {
+    const normalizedEmail = primaryEmail.trim().toLowerCase();
+    setEmailSiteUsageEmailFilter(normalizedEmail);
+    setEmailSiteUsageSiteFilter("");
+    setEmailSiteUsageIncludeRevoked(true);
+    setActiveNavigationSection("email-site-usages");
+    setErrorMessage(null);
+    void loadUsageSites();
+    await loadEmailSiteUsages(1, undefined, {
+      allocatedEmail: normalizedEmail,
+      usageSite: "",
+      includeRevoked: true,
+    });
+  }
+
+  async function deleteUsageSite(site: UsageSiteItem): Promise<void> {
+    const activeUsageCount = site.active_usage_count ?? 0;
+    if (activeUsageCount > 0) {
+      setErrorMessage(`站点「${site.code}」仍有 ${activeUsageCount} 条未撤销占用，无法删除。请先在「站点占用」中撤销。`);
+      return;
+    }
+    const shouldDelete = window.confirm(
+      `删除注册站点「${site.code}」？仅当无未撤销占用时可删除；已撤销占用会一并清理。`,
+    );
+    if (!shouldDelete) {
+      return;
+    }
+    setDeletingUsageSiteCode(site.code);
+    setErrorMessage(null);
+    try {
+      await requestApi(adminToken, `/api/v1/admin/usage-sites/${encodeURIComponent(site.code)}`, {
+        method: "DELETE",
+      });
+      setNotice(`注册站点「${site.code}」已删除。`);
+      await loadUsageSites();
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : "无法删除注册站点。");
+    } finally {
+      setDeletingUsageSiteCode(null);
+    }
+  }
+
+  async function revokeEmailSiteUsage(usage: EmailSiteUsageItem): Promise<void> {
+    const shouldRevoke = window.confirm(
+      `撤销占用「${usage.allocated_email} @ ${usage.usage_site}」？撤销后该地址可再次用于此站点。`,
+    );
+    if (!shouldRevoke) {
+      return;
+    }
+    setIsRevokingUsageId(usage.id);
+    setErrorMessage(null);
+    try {
+      await requestApi(adminToken, `/api/v1/admin/email-site-usages/${usage.id}/revoke`, {
+        method: "POST",
+      });
+      setNotice(`已撤销 ${usage.allocated_email} 在 ${usage.usage_site} 的占用。`);
+      await loadEmailSiteUsages(emailSiteUsagePagination.page);
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : "无法撤销占用。");
+    } finally {
+      setIsRevokingUsageId(null);
+    }
+  }
+
 
   function openMailboxImportDialog(): void {
     setErrorMessage(null);
@@ -2062,6 +2616,8 @@ function App(): JSX.Element {
           <button className={`navigation-item ${activeNavigationSection === "dashboard" ? "active" : ""}`} type="button" onClick={() => navigateToSection("dashboard")} aria-current={activeNavigationSection === "dashboard" ? "page" : undefined}><ServerCog size={16} /> 概览</button>
           <button className={`navigation-item ${activeNavigationSection === "mailboxes" ? "active" : ""}`} type="button" onClick={() => navigateToSection("mailboxes")} aria-current={activeNavigationSection === "mailboxes" ? "page" : undefined}><ShieldCheck size={16} /> 邮箱管理</button>
           <button className={`navigation-item ${activeNavigationSection === "leases" ? "active" : ""}`} type="button" onClick={() => navigateToSection("leases")} aria-current={activeNavigationSection === "leases" ? "page" : undefined}><Network size={16} /> 租约管理</button>
+          <button className={`navigation-item ${activeNavigationSection === "usage-sites" ? "active" : ""}`} type="button" onClick={() => navigateToSection("usage-sites")} aria-current={activeNavigationSection === "usage-sites" ? "page" : undefined}><Globe2 size={16} /> 注册站点</button>
+          <button className={`navigation-item ${activeNavigationSection === "email-site-usages" ? "active" : ""}`} type="button" onClick={() => navigateToSection("email-site-usages")} aria-current={activeNavigationSection === "email-site-usages" ? "page" : undefined}><ListFilter size={16} /> 站点占用</button>
           <button className={`navigation-item ${activeNavigationSection === "egress-proxies" ? "active" : ""}`} type="button" onClick={() => navigateToSection("egress-proxies")} aria-current={activeNavigationSection === "egress-proxies" ? "page" : undefined}><Settings2 size={16} /> 出口代理</button>
           <button className={`navigation-item ${activeNavigationSection === "client-keys" ? "active" : ""}`} type="button" onClick={() => navigateToSection("client-keys")} aria-current={activeNavigationSection === "client-keys" ? "page" : undefined}><KeyRound size={16} /> Client Key</button>
           <a className="navigation-item" href={`${apiBaseUrl}/redoc`} target="_blank" rel="noreferrer">
@@ -2148,6 +2704,7 @@ function App(): JSX.Element {
             onDeleteInvalidMailboxes={() => void deleteInvalidMailboxes()}
             onToggleAllMailboxSelection={toggleAllMailboxSelection}
             onToggleMailboxSelection={toggleMailboxSelection}
+            onOpenSiteUsages={(primaryEmail) => void openEmailSiteUsagesForEmail(primaryEmail)}
           />
         ) : activeNavigationSection === "leases" ? (
           <LeasesPage
@@ -2157,6 +2714,41 @@ function App(): JSX.Element {
             total={leasePagination.total}
             totalPages={leasePagination.totalPages}
             onPageChange={(nextPage) => void changeLeasePage(nextPage)}
+          />
+        ) : activeNavigationSection === "usage-sites" ? (
+          <UsageSitesPage
+            sites={usageSites}
+            isCreateDialogOpen={isUsageSiteCreateDialogOpen}
+            isSaving={isSavingUsageSite}
+            deletingCode={deletingUsageSiteCode}
+            onOpenCreateDialog={() => {
+              setErrorMessage(null);
+              setIsUsageSiteCreateDialogOpen(true);
+            }}
+            onCloseCreateDialog={() => setIsUsageSiteCreateDialogOpen(false)}
+            onCreate={(event) => void createUsageSite(event)}
+            onToggleEnabled={(site) => void toggleUsageSiteEnabled(site)}
+            onDelete={(site) => void deleteUsageSite(site)}
+            onRefresh={() => void loadUsageSites()}
+          />
+        ) : activeNavigationSection === "email-site-usages" ? (
+          <EmailSiteUsagesPage
+            usages={emailSiteUsages}
+            page={emailSiteUsagePagination.page}
+            pageSize={emailSiteUsagePagination.pageSize}
+            total={emailSiteUsagePagination.total}
+            totalPages={emailSiteUsagePagination.totalPages}
+            allocatedEmailFilter={emailSiteUsageEmailFilter}
+            usageSiteFilter={emailSiteUsageSiteFilter}
+            includeRevoked={emailSiteUsageIncludeRevoked}
+            siteOptions={usageSites}
+            isRevokingId={isRevokingUsageId}
+            onAllocatedEmailFilterChange={setEmailSiteUsageEmailFilter}
+            onUsageSiteFilterChange={setEmailSiteUsageSiteFilter}
+            onIncludeRevokedChange={setEmailSiteUsageIncludeRevoked}
+            onSearch={() => void loadEmailSiteUsages(1)}
+            onPageChange={(nextPage) => void changeEmailSiteUsagePage(nextPage)}
+            onRevoke={(usage) => void revokeEmailSiteUsage(usage)}
           />
         ) : activeNavigationSection === "client-keys" ? (
           <ClientKeysPage

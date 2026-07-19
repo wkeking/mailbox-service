@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from sqlalchemy import create_engine
+from sqlalchemy.pool import StaticPool
 from sqlalchemy.orm import Session, sessionmaker
 
 from mailbox_service.config import Settings
@@ -18,7 +19,7 @@ from mailbox_service.security import CredentialCipher
 
 def create_test_service(failure_threshold: int = 3) -> tuple[Session, EgressProxyService]:
     """Build an isolated SQLite-backed service with a deterministic encryption key."""
-    database_engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    database_engine = create_engine("sqlite+pysqlite:///:memory:", connect_args={"check_same_thread": False}, poolclass=StaticPool, future=True)
     Base.metadata.create_all(database_engine)
     session = sessionmaker(bind=database_engine, expire_on_commit=False)()
     encryption_key = urlsafe_b64encode(b"p" * 32).decode("ascii")
@@ -61,13 +62,14 @@ def test_mailbox_reuses_its_healthy_proxy_binding() -> None:
     assert mailbox.egress_proxy_id == first_proxy.id
 
 
-def test_commit_open_transaction_releases_proxy_row_for_sibling_session() -> None:
-    """After bind+commit, another session must be able to claim the same proxy row.
-
-    Without an early commit, FOR UPDATE held across OAuth I/O makes concurrent batch
-    workers observe SKIP LOCKED empty pools and fail with NoHealthyEgressProxyError.
-    """
-    database_engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+def test_session_factory_resolve_commits_short_transaction_without_caller_session() -> None:
+    """Factory-owned resolve must not require a long-lived caller Session (SEC-01/03)."""
+    database_engine = create_engine(
+        "sqlite+pysqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+        future=True,
+    )
     Base.metadata.create_all(database_engine)
     session_factory = sessionmaker(bind=database_engine, expire_on_commit=False)
     encryption_key = urlsafe_b64encode(b"p" * 32).decode("ascii")
@@ -76,38 +78,33 @@ def test_commit_open_transaction_releases_proxy_row_for_sibling_session() -> Non
         credential_encryption_key=encryption_key,
         proxy_required=True,
         proxy_enabled=True,
+        app_env="test",
     )
     cipher = CredentialCipher(encryption_key)
 
     seed_session = session_factory()
     sole_proxy = create_proxy("only", priority=10)
     first_mailbox = Mailbox(primary_email="first@outlook.com")
-    second_mailbox = Mailbox(primary_email="second@outlook.com")
-    seed_session.add_all([sole_proxy, first_mailbox, second_mailbox])
+    seed_session.add_all([sole_proxy, first_mailbox])
     seed_session.commit()
     sole_proxy_id = sole_proxy.id
     first_mailbox_id = first_mailbox.id
-    second_mailbox_id = second_mailbox.id
     seed_session.close()
 
-    worker_session = session_factory()
-    worker_service = EgressProxyService(worker_session, settings, cipher)
-    first_resolution = worker_service.resolve_for_mailbox(first_mailbox_id)
-    assert first_resolution is not None
-    assert first_resolution.id == sole_proxy_id
-    # Critical: release FOR UPDATE before long network I/O / sibling workers bind.
-    worker_service.commit_open_transaction()
+    proxy_service = EgressProxyService(
+        session_factory=session_factory,
+        settings=settings,
+        credential_cipher=cipher,
+    )
+    resolution = proxy_service.resolve_for_mailbox(first_mailbox_id)
+    assert resolution is not None
+    assert resolution.id == sole_proxy_id
 
-    sibling_session = session_factory()
-    sibling_service = EgressProxyService(sibling_session, settings, cipher)
-    # Sticky reuse path should still work after sibling binds.
-    second_resolution = sibling_service.resolve_for_mailbox(second_mailbox_id)
-    assert second_resolution is not None
-    assert second_resolution.id == sole_proxy_id
-    sibling_service.commit_open_transaction()
-
-    worker_session.close()
-    sibling_session.close()
+    verify_session = session_factory()
+    bound_mailbox = verify_session.get(Mailbox, first_mailbox_id)
+    assert bound_mailbox is not None
+    assert bound_mailbox.egress_proxy_id == sole_proxy_id
+    verify_session.close()
 
 
 def test_failed_proxy_enters_cooldown_and_mailbox_switches() -> None:

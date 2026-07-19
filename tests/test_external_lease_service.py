@@ -6,6 +6,7 @@ from base64 import urlsafe_b64encode
 from datetime import timedelta
 
 from sqlalchemy import create_engine
+from sqlalchemy.pool import StaticPool
 from sqlalchemy.orm import Session, sessionmaker
 
 from mailbox_service.client_key_service import ClientKeyService
@@ -24,7 +25,13 @@ class FakeMicrosoftOAuthClient:
     def __init__(self) -> None:
         self.refresh_attempts: list[tuple[str, str]] = []
 
-    def refresh_access_token(self, mailbox: Mailbox, refresh_token: str) -> MicrosoftTokenResponse:
+    def refresh_access_token(
+        self,
+        mailbox: Mailbox,
+        refresh_token: str,
+        *,
+        scope: str | None = None,
+    ) -> MicrosoftTokenResponse:
         self.refresh_attempts.append((mailbox.primary_email, refresh_token))
         return MicrosoftTokenResponse(access_token="new-access-token", expires_in=3600)
 
@@ -37,9 +44,10 @@ def create_lease_test_context() -> tuple[
     LeaseService,
 ]:
     """Build an isolated lease service with deterministic credential encryption."""
-    database_engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    database_engine = create_engine("sqlite+pysqlite:///:memory:", connect_args={"check_same_thread": False}, poolclass=StaticPool, future=True)
     Base.metadata.create_all(database_engine)
-    session = sessionmaker(bind=database_engine, expire_on_commit=False)()
+    session_factory = sessionmaker(bind=database_engine, expire_on_commit=False)
+    session = session_factory()
     encryption_key = urlsafe_b64encode(b"l" * 32).decode("ascii")
     settings = Settings(
         database_url="sqlite+pysqlite:///:memory:",
@@ -48,7 +56,7 @@ def create_lease_test_context() -> tuple[
     )
     credential_cipher = CredentialCipher(encryption_key)
     oauth_client = FakeMicrosoftOAuthClient()
-    access_token_service = MailboxAccessTokenService(session, settings, credential_cipher, oauth_client)
+    access_token_service = MailboxAccessTokenService(session, settings, credential_cipher, oauth_client, session_factory=session_factory)
     client_key_service = ClientKeyService(session)
     lease_service = LeaseService(session, credential_cipher, access_token_service)
     return session, credential_cipher, oauth_client, client_key_service, lease_service
@@ -116,6 +124,7 @@ def test_access_token_lease_returns_cached_token_and_rejects_other_client() -> N
         client_id="client-id",
         refresh_token_ciphertext=credential_cipher.encrypt("refresh-token"),
         access_token_ciphertext=credential_cipher.encrypt("cached-access-token"),
+        access_token_source_version=1,
         access_token_expires_at=utc_now() + timedelta(minutes=20),
         access_token_refreshed_at=utc_now(),
     )

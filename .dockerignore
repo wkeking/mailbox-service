@@ -13,6 +13,7 @@ __pycache__
 .env
 .env.*
 !.env.example
+!.env.production.example
 *.log
 .DS_Store
 
@@ -24,8 +25,19 @@ frontend/.vite
 # IDE / local notes
 .idea
 .vscode
+
 # Local image export artifacts
 dist
 
-# Tests are not needed in the runtime image
+# Not needed in the runtime image (keep build context small & stable)
 tests
+scripts
+docs
+**/*.md
+!README.md
+
+# Dev lock/tooling that must not invalidate app COPY layers via context noise
+.python-version
+.cursor
+.coverage
+htmlcov

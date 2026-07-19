@@ -1,4 +1,4 @@
-"""Bounded single-instance health probes for global egress proxies."""
+"""Bounded cluster-coordinated health probes for global egress proxies."""
 
 from __future__ import annotations
 
@@ -11,6 +11,10 @@ from mailbox_service.config import Settings
 from mailbox_service.database import SessionFactory
 from mailbox_service.models import EgressProxy
 from mailbox_service.proxy_service import EgressProxyService, EgressProxyTransportError
+from mailbox_service.scheduler_lease_repository import (
+    ScheduledJobLeaseRepository,
+    build_scheduler_owner_id,
+)
 from mailbox_service.security import CredentialCipher, summarize_exception
 
 logger = logging.getLogger(__name__)
@@ -22,19 +26,42 @@ class ProxyHealthProbeRunner:
     def __init__(self, settings: Settings, batch_size: int = 20) -> None:
         self._settings = settings
         self._batch_size = batch_size
+        self._owner_id = build_scheduler_owner_id()
 
     def run_once(self) -> None:
-        """Probe enabled proxies and persist health results in short transactions."""
-        with SessionFactory() as read_session:
-            proxy_ids = read_session.scalars(
-                select(EgressProxy.id)
-                .where(EgressProxy.enabled.is_(True))
-                .order_by(EgressProxy.priority.asc(), EgressProxy.id.asc())
-                .limit(self._batch_size)
-            ).all()
+        """Probe enabled proxies only when this process holds the job lease."""
+        with SessionFactory() as session:
+            job_lease_repository = ScheduledJobLeaseRepository(session)
+            job_handle = job_lease_repository.try_acquire(
+                "egress-proxy-health-probe",
+                self._owner_id,
+                lease_seconds=self._settings.scheduler_job_lease_seconds,
+            )
+            if job_handle is None:
+                session.rollback()
+                logger.info("Egress proxy health probe skipped: another owner holds the job lease")
+                return
+            session.commit()
 
-        for proxy_id in proxy_ids:
-            self._probe_proxy(proxy_id)
+        try:
+            with SessionFactory() as read_session:
+                proxy_ids = list(
+                    read_session.scalars(
+                        select(EgressProxy.id)
+                        .where(EgressProxy.enabled.is_(True))
+                        .order_by(EgressProxy.priority.asc(), EgressProxy.id.asc())
+                        .limit(self._batch_size)
+                    )
+                )
+            for proxy_id in proxy_ids:
+                self._probe_proxy(proxy_id)
+        finally:
+            try:
+                with SessionFactory() as release_session:
+                    ScheduledJobLeaseRepository(release_session).release(job_handle)
+                    release_session.commit()
+            except Exception:  # noqa: BLE001
+                logger.warning("Egress proxy health probe job lease release failed")
 
     def _probe_proxy(self, proxy_id: str) -> None:
         """Isolate one probe failure so it cannot prevent later proxy checks."""

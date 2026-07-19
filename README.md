@@ -50,7 +50,7 @@
 
    ```bash
    cd frontend
-   npm install
+   npm ci
    npm run dev
    ```
 
@@ -117,7 +117,8 @@ curl -X POST http://localhost:8000/api/v1/admin/client-keys \
 | `POST` | `/api/v1/leases/{lease_id}/release` | 幂等释放租约 |
 | `POST` | `/api/v1/leases/{lease_id}/access-token` | 获取未过期缓存 AT，过期时自动刷新 |
 | `POST` | `/api/v1/leases/{lease_id}/refresh-token` | 按 `expected_token_version` CAS 回写 RT |
-| `POST` | `/api/v1/mailboxes/acquire` | 领取可用邮箱账号（mail_read，只返回邮箱与租约） |
+| `POST` | `/api/v1/mailboxes/acquire` | 领取可用邮箱账号（mail_read；主邮箱须传 `usage_site`） |
+| `GET` | `/api/v1/usage-sites` | 查询启用中的注册站点白名单（需 `mailboxes:acquire`） |
 | `POST` | `/api/v1/mailboxes/reacquire` | 按历史业务地址（主邮箱或 plus 别名）重新领取 mail_read 租约 |
 | `POST` | `/api/v1/leases/{lease_id}/verification-code` | 在 mail_read 租约下提取收件箱验证码 |
 
@@ -168,6 +169,18 @@ curl -X POST http://localhost:8000/api/v1/mailboxes/reacquire \
 | `POST` | `/api/v1/admin/client-keys` | 创建 Client Key，明文只返回一次 |
 | `GET` | `/api/v1/admin/client-keys` | 查询不含密钥和摘要的 Client Key 元数据 |
 | `POST` | `/api/v1/admin/client-keys/{id}/disable` | 停用 Client Key |
+| `GET` | `/api/v1/admin/usage-sites` | 查询注册站点白名单（含已禁用） |
+| `POST` | `/api/v1/admin/usage-sites` | 创建注册站点（code 不可改） |
+| `PATCH` | `/api/v1/admin/usage-sites/{code}` | 更新展示名或启用状态 |
+| `DELETE` | `/api/v1/admin/usage-sites/{code}` | 删除站点（仅无未撤销占用时） |
+| `GET` | `/api/v1/admin/email-site-usages` | 分页查询邮箱站点占用 |
+| `POST` | `/api/v1/admin/email-site-usages/{id}/revoke` | 软撤销邮箱站点占用（幂等） |
+
+管理台：
+
+- **注册站点**：新增 / 启停 / 删除（无占用时）白名单
+- **站点占用**：按业务邮箱、站点筛选占用，并可一键撤销
+- **邮箱管理**：行内「站点占用」跳转并按主邮箱筛选占用
 
 ## Refresh Token 保活
 
@@ -184,9 +197,9 @@ SPA / 某些 OTP 流程可能是 24 小时；个人 Outlook / Hotmail 常见为 
 规则摘要：
 
 1. 只处理 `status=active` 且具备 `client_id` / RT 的邮箱  
-2. 以 `access_token_refreshed_at`（无则 `created_at`）判断是否 overdue  
+2. 以 `refresh_token_expires_at` 判断是否即将/已经过期（提前 `KEEPALIVE_LEAD_DAYS`）；缺失时回退到 `access_token_refreshed_at` / `created_at` + 寿命估算  
 3. 跳过仍有未过期租约的邮箱，避免 RT mode 持有方拿到旧 RT  
-4. 调用 Microsoft token 端点强制刷新；若返回新 RT 则加密落库并 `token_version + 1`  
+4. 调用 Microsoft token 端点强制刷新；成功后刷新 `refresh_token_updated_at` / `refresh_token_expires_at`（滑动窗口）；若返回新 RT 则加密落库并 `token_version + 1`  
 5. `invalid_grant` 会标记邮箱 `invalid`
 
 也可在管理台对选中/全部邮箱执行 `POST /api/v1/admin/mailboxes/access-tokens/refresh` 做手动批量刷新。
@@ -197,17 +210,26 @@ SPA / 某些 OTP 流程可能是 24 小时；个人 Outlook / Hotmail 常见为 
 基座镜像为 `python:3.14-slim-bookworm`，与本地开发版本对齐。  
 默认镜像名：**`registry.example.com/mailbox-service:latest`**；`./scripts/build-image.sh` **默认构建后自动推送**到该私有仓库。`docker-compose.yml` 默认 `image` 与此一致。
 
-**分层缓存（减小服务器 pull）：** runtime **只根据 `pyproject.toml` 的依赖列表**安装第三方包，再分别拷贝业务代码、migrations、README、前端 dist。  
-仅改后端代码时，依赖层可复用，服务器通常只需拉取约 **几十～几百 KB** 的代码层，而不是整包依赖（约 27MB）。  
-只有改 `pyproject.toml` 依赖、或前端构建产物变化时，对应大层才会失效。  
-注意：不要把 README / 业务源码放进依赖安装层之前，否则文档或代码一改仍会重拉 ~27MB。
+**分层缓存（减小 push / pull）：** 依赖与代码严格分 stage / layer：
+
+| 层 | 何时失效 | 典型体积 |
+| --- | --- | --- |
+| OS + `appuser` | 基座镜像 / apt 变更 | 中 |
+| Python `.venv`（`python-deps`） | 仅 `pyproject.toml` / `uv.lock` 变更 | 大（约数十 MB） |
+| `mailbox_service/` | 后端代码变更 | 小 |
+| `migrations/` | 迁移脚本变更 | 很小 |
+| `frontend_dist` | 前端构建产物变更 | 中小 |
+| 前端 `npm ci`（`frontend-deps`） | 仅 `package-lock.json` 变更 | 构建期大，不进最终镜像依赖重装 |
+
+仅改后端代码时，`docker push` / `docker pull` 会跳过仓库里已有的依赖层，服务器通常只需拉取代码层。  
+推送方式：构建完成后执行 `docker push registry.example.com/mailbox-service:<tag>`（仅正式镜像标签）。**不**推送 BuildKit 的 `:buildcache`；跨机器构建加速靠 Dockerfile 分层 + 本机 BuildKit 缓存即可。
 
 相关文件：
 
 | 路径 | 作用 |
 | --- | --- |
-| `Dockerfile` | 多阶段构建定义 |
-| `scripts/build-image.sh` | 一键 buildx 打包并默认推送到 `registry.example.com` |
+| `Dockerfile` | 多阶段 / 分层构建定义 |
+| `scripts/build-image.sh` | buildx `--load` 后 `docker push` 正式镜像 |
 | `docker-compose.yml` | 应用部署；默认拉取 `registry.example.com/mailbox-service:latest`，外连 mysql-host |
 | `.dockerignore` | 减小构建上下文 |
 
@@ -388,3 +410,34 @@ docker compose up -d
 - 生产环境建议启用 `PROXY_REQUIRED=true`，并仅允许内网访问管理 API。
 - 未实现 Microsoft 交互式 OAuth 首次授权；需导入已经获取的 refresh token。
 - 生产镜像中务必更换默认 MySQL 密码、`ADMIN_API_TOKEN` 与 `CREDENTIAL_ENCRYPTION_KEY`。
+
+
+## 安全加固与测试
+
+本仓库按 `REQ-20260719-001` / `PLN-20260719-001` 落地了 Token claim/CAS、Lease claim、验证码授权复核、生产密钥校验、前端纯内存 Admin Token 等加固。
+
+生产环境因历史部署**允许** `DATABASE_URL` 使用 root、`CORS_ALLOW_ORIGINS=*`、`TLS_MODE=disabled`；仍要求 `ADMIN_API_TOKEN` 长度大于 10 位（并拒绝常见占位值）、合法 `CREDENTIAL_ENCRYPTION_KEY`，并拒绝 `FORWARDED_ALLOW_IPS=*`。
+
+### 本地可自动跑
+
+```bash
+./scripts/smoke-local.sh
+# 等价于：
+uv lock --check
+uv run --frozen pytest -q
+```
+
+设置 `TEST_DATABASE_URL` 为 MySQL 8 后，`smoke-local.sh` 会额外执行 `pytest -m mysql`。
+
+### 需要你环境配合的项
+
+见 `scripts/smoke-operator-checklist.md`（MySQL 并发、TLS、浏览器 Token、压测、镜像）。
+
+### 关键行为提示
+
+- **导入 `replace_token`**：若邮箱存在 active lease claim，默认该行失败；传 `force_release_active_leases=true` 可先释放再替换。
+- **删除邮箱**：默认同样拒绝 active claim；可 force。
+- **验证码长轮询**：async endpoint；轮询等待使用 `asyncio.sleep`；Key/Lease 每轮 revalidate；超并发返回 **429**。
+- **Admin Token**：仅内存保存，不写 `sessionStorage`。
+- **迁移 CLI**：`uv run python scripts/migrate.py --database-url 'mysql+pymysql://...'`
+

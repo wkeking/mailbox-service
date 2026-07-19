@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 # 构建 mailbox-service 镜像并默认推送到私有仓库 registry.example.com。
 #
-# 默认 push 流程：buildx --load 装入本机 Docker，再 docker push。
-# 不要用 buildx --push 直推：container 驱动会走 HTTPS 访问仓库，
-# 而 registry.example.com 多为 HTTP insecure registry，会报 Head "https://...": EOF。
-# 本机 docker push 会走 Docker daemon 的 insecure-registries 配置，与手动推送一致。
+# 流程：buildx --load 装入本机 Docker，再 docker push <registry>/<name>:<tag>。
+# 不推送 BuildKit 远程 cache（:buildcache）；依赖复用靠 Dockerfile 分层 + 本机层缓存。
+# 不要用 buildx --push 直推：container 驱动会走 HTTPS，HTTP insecure registry 常报 EOF。
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -27,9 +26,9 @@ usage() {
 默认行为:
   构建 linux/arm64 镜像 registry.example.com/mailbox-service:latest：
   1) buildx --load 载入本机 Docker
-  2) docker push 推送到私有仓库
+  2) docker push registry.example.com/mailbox-service:<tag>
   仓库无需 docker login；网络可达 registry.example.com 即可。
-  （Docker Desktop / daemon 需已把该地址加入 insecure-registries，与手动 push 相同。）
+  （Docker Desktop / daemon 需已把该地址加入 insecure-registries。）
 
 选项:
   --platform <平台>     目标平台，默认 linux/arm64
@@ -38,17 +37,23 @@ usage() {
   --name <名称>         镜像仓库名，默认 mailbox-service
   --registry <主机>     私有仓库主机，默认 registry.example.com
   --output <方式>       push | load | tar（默认 push）
-                        push : 载入本机后 docker push
+                        push : 载入本机后 docker push 正式镜像
                         load : 仅载入本机 Docker（不推送）
                         tar  : 导出 docker-archive 到 dist/（不推送）
   --builder <名称>      buildx builder 名称，默认 mailbox-service-builder
   -h, --help            显示帮助
 
+镜像分层（Dockerfile，减小反复 push/pull 的层传输）:
+  - Python 依赖：仅 pyproject.toml + uv.lock 变化时重建 .venv
+  - 前端依赖：仅 package-lock.json 变化时重建 node_modules
+  - 业务代码 / migrations / frontend dist：各自独立层
+  不推送、不拉取 :buildcache；不使用 registry 型 BuildKit 远程缓存。
+
 环境变量（与选项等价，选项优先）:
   REGISTRY / IMAGE_NAME / IMAGE_TAG / PLATFORM / OUTPUT / BUILDER_NAME
 
 示例:
-  # 默认：构建并推送 registry.example.com/mailbox-service:latest
+  # 默认：构建并 docker push registry.example.com/mailbox-service:latest
   ./scripts/build-image.sh
 
   # 仅本机调试，不推仓库
@@ -84,6 +89,10 @@ while [[ $# -gt 0 ]]; do
     --builder)
       BUILDER_NAME="${2:?}"
       shift 2
+      ;;
+    --no-registry-cache)
+      # 兼容旧参数：远程 cache 已默认关闭，此选项为 no-op。
+      shift
       ;;
     -h|--help)
       usage
@@ -121,7 +130,9 @@ echo "========================================"
 echo "镜像:     ${FULL_IMAGE_REF}"
 echo "平台:     ${PLATFORM}"
 echo "输出方式: ${OUTPUT}"
+echo "推送:     仅正式镜像（docker push）；不推 :buildcache"
 echo "上下文:   ${ROOT_DIR}"
+echo "分层:     依赖层(pyproject/uv.lock、npm lock) 与 代码层(mailbox_service/frontend) 分离"
 echo "========================================"
 
 COMMON_ARGS=(
@@ -138,14 +149,16 @@ build_and_load_local() {
     echo "请使用 --platform linux/arm64 或 linux/amd64。" >&2
     exit 1
   fi
+  # 不使用 --cache-to/--cache-from type=registry；层复用由 Dockerfile 多阶段 + 本机 BuildKit 完成。
   docker buildx build --load "${COMMON_ARGS[@]}"
   docker image inspect "${FULL_IMAGE_REF}" --format '架构={{.Architecture}} OS={{.Os}} 大小={{.Size}}'
+  echo
+  echo "层摘要（自上而下；未变化的层在 docker push/pull 时可跳过）："
+  docker history --no-trunc --human "${FULL_IMAGE_REF}" | head -n 20 || true
 }
 
 case "${OUTPUT}" in
   push)
-    # 与手动 docker push 同一路径：先进入本机镜像列表，再由 daemon push。
-    # 避免 buildx --push 对 HTTP 私有仓强制 HTTPS 导致 EOF。
     build_and_load_local
     echo
     echo "正在推送: ${FULL_IMAGE_REF}"
@@ -154,7 +167,6 @@ case "${OUTPUT}" in
     echo "已推送: ${FULL_IMAGE_REF}"
     echo "服务器拉取 / Compose 使用:"
     echo "  docker pull ${FULL_IMAGE_REF}"
-    echo "  # docker-compose.yml 默认 image 已对齐该名称"
     ;;
   load)
     build_and_load_local

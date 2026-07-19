@@ -54,7 +54,11 @@ def test_mailbox_import_creates_encrypted_credentials() -> None:
     assert stored_mailbox.refresh_token_ciphertext != "refresh-token"
     assert cipher.decrypt(stored_mailbox.mail_password_ciphertext) == "mail-secret"
     assert cipher.decrypt(stored_mailbox.refresh_token_ciphertext) == "refresh-token"
-    assert audit_log_count == 1
+    assert stored_mailbox.refresh_token_updated_at is not None
+    assert stored_mailbox.refresh_token_expires_at is not None
+    assert stored_mailbox.refresh_token_expires_at > stored_mailbox.refresh_token_updated_at
+    # Per-item import audit + batch summary audit (SEC-11).
+    assert audit_log_count == 2
 
 
 def test_mailbox_import_replaces_existing_token_version() -> None:
@@ -66,6 +70,7 @@ def test_mailbox_import_replaces_existing_token_version() -> None:
         mail_password_ciphertext=cipher.encrypt("old-mail-secret"),
         refresh_token_ciphertext=cipher.encrypt("old-refresh-token"),
         access_token_ciphertext=cipher.encrypt("old-access-token"),
+        access_token_source_version=1,
         access_token_expires_at=utc_now() + timedelta(hours=1),
         access_token_refreshed_at=utc_now(),
         scope="Mail.Read offline_access",
@@ -91,6 +96,8 @@ def test_mailbox_import_replaces_existing_token_version() -> None:
     assert existing_mailbox.access_token_ciphertext is None
     assert existing_mailbox.access_token_expires_at is None
     assert existing_mailbox.access_token_refreshed_at is None
+    assert existing_mailbox.refresh_token_updated_at is not None
+    assert existing_mailbox.refresh_token_expires_at is not None
     assert existing_mailbox.scope is None
     assert existing_mailbox.capability is None
     assert existing_mailbox.capability_probed_at is None

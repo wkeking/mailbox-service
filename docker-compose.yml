@@ -1,14 +1,11 @@
 # Single-host app deployment. MySQL is external: local mysql-host on infra_default.
 #
 # Prerequisites:
-#   1. mysql-host is running (e.g. Soothe/infra compose) and joined to network infra_default
-#   2. Create app database once (if missing):
-#        docker exec -i mysql-host mysql -uroot -proot \
-#          -e "CREATE DATABASE IF NOT EXISTS mailbox_service CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;"
-#   3. cp .env.example .env  # fill secrets
-#      Compose 容器内 DATABASE_URL 主机名须为 mysql-host（勿用 127.0.0.1）
+#   1. mysql-host is running and joined to network infra_default
+#   2. Create app database and least-privilege accounts (see README)
+#   3. cp .env.production.example .env  # fill secrets; never use root:root
 #
-# Usage (after building/loading the image):
+# Usage:
 #   docker compose up -d
 
 services:
@@ -16,25 +13,62 @@ services:
     image: ${MAILBOX_IMAGE:-registry.example.com/mailbox-service:latest}
     container_name: mailbox-service
     restart: unless-stopped
+    # Production default: do not publish the app port to the public host interface.
+    # Prefer an external reverse proxy on the same Docker network, or bind loopback only.
     ports:
-      - "${HOST_PORT:-8000}:8000"
+      - "${HOST_BIND_ADDRESS:-127.0.0.1}:${HOST_PORT:-8000}:8000"
     env_file:
       - .env
     environment:
-      # 与 .env 共用 DATABASE_URL；未在 .env 配置时使用下面默认值（指向 mysql-host）。
-      DATABASE_URL: ${DATABASE_URL:-mysql+pymysql://root:root@mysql-host:3306/mailbox_service}
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}
       APP_ENV: ${APP_ENV:-production}
-      CORS_ALLOW_ORIGINS: ${CORS_ALLOW_ORIGINS:-*}
+      CORS_ALLOW_ORIGINS: ${CORS_ALLOW_ORIGINS:?CORS_ALLOW_ORIGINS is required}
+      FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS:-127.0.0.1}
+      TLS_MODE: ${TLS_MODE:-terminated_at_proxy}
+      AUTO_MIGRATE_ON_STARTUP: ${AUTO_MIGRATE_ON_STARTUP:-false}
     networks:
       - infra_default
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    init: true
+    pids_limit: 256
+    mem_limit: 512m
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/health"]
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/ready"]
       interval: 30s
       timeout: 5s
       retries: 3
       start_period: 20s
 
+  # Optional reverse proxy profile for TLS termination on the same host.
+  # Enable with: docker compose --profile tls up -d
+  caddy:
+    profiles: ["tls"]
+    image: caddy:2.9-alpine
+    container_name: mailbox-caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - infra_default
+    depends_on:
+      - mailbox-service
+
 networks:
   infra_default:
     external: true
     name: infra_default
+
+volumes:
+  caddy_data:
+  caddy_config:
