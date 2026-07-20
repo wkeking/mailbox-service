@@ -460,6 +460,17 @@ class VerificationCodeService:
                 )
             )
 
+        # Provider-aware: SMSBower uses direct getCode; on-demand HTTP providers list messages.
+        provider_type = getattr(mailbox, "provider_type", None) or "microsoft"
+        if provider_type == "smsbower_gmail":
+            return await self._wait_for_smsbower_code(mailbox, options, authorization_checkpoint)
+        from mailbox_service.providers.catalog import ON_DEMAND_PROVIDER_TYPES
+
+        if provider_type in ON_DEMAND_PROVIDER_TYPES:
+            return await self._wait_for_ondemand_code(
+                mailbox, options, authorization_checkpoint, provider_type=provider_type
+            )
+
         deadline = self._clock() + timedelta(seconds=max(options.timeout_seconds, 0))
         since_at = self._clock() - timedelta(seconds=max(options.since_seconds, 0))
         channels = self._resolve_channel_order(mailbox)
@@ -563,6 +574,226 @@ class VerificationCodeService:
             return
         sleep_result = self._sleep(sleep_seconds)
         await _maybe_await(sleep_result)
+
+
+    async def _wait_for_smsbower_code(
+        self,
+        mailbox: Mailbox,
+        options: VerificationCodeLookupOptions,
+        authorization_checkpoint=None,
+    ) -> VerificationCodeLookupResult:
+        """Poll SMSBower getCode without Microsoft TokenService."""
+        from mailbox_service.models import MailboxProviderResource
+        from mailbox_service.providers.smsbower_contracts import (
+            build_get_code_request,
+            normalize_smsbower_base_url,
+        )
+        from mailbox_service.providers.smsbower_gmail import SmsBowerUnsupportedFilterError
+        from mailbox_service.providers.smsbower_transport import (
+            HttpxSmsBowerClient,
+            SmsBowerMailTransport,
+            SmsBowerTransportError,
+        )
+        import json
+
+        if any(
+            (
+                options.from_address,
+                options.subject_contains,
+                options.body_contains,
+                options.recipient,
+            )
+        ):
+            raise SmsBowerUnsupportedFilterError(
+                "SMSBower direct-code path does not support message filters"
+            )
+        if self._settings is None:
+            raise RuntimeError("VerificationCodeService 缺少 settings")
+        deadline = self._clock() + timedelta(seconds=max(options.timeout_seconds, 0))
+        attempts = 0
+        while True:
+            if authorization_checkpoint is not None:
+                await _maybe_await(authorization_checkpoint())
+            attempts += 1
+            # Reload resource each round; releasing/cooldown must fail closed.
+            session_factory = self._access_token_service._session_factory
+            with session_factory() as session:
+                resource = session.get(MailboxProviderResource, mailbox.id)
+                if resource is None or resource.lifecycle_state not in ("claimed",):
+                    raise VerificationCodeReadError("SMSBower resource not claimable for verification")
+                mail_id = resource.external_resource_id
+                secret_blob = resource.encrypted_secret
+            if secret_blob:
+                try:
+                    secret = json.loads(
+                        self._access_token_service._credential_cipher.decrypt(secret_blob)
+                    )
+                    mail_id = secret.get("mail_id") or mail_id
+                except Exception:
+                    pass
+            from mailbox_service.provider_settings_service import ProviderSettingsService
+
+            with session_factory() as settings_session:
+                runtime = ProviderSettingsService(
+                    settings_session,
+                    self._settings,
+                    self._access_token_service._credential_cipher,
+                ).resolve_smsbower_runtime()
+            if not runtime.enabled or not (runtime.api_key or "").strip():
+                raise VerificationCodeReadError("SMSBower is not configured")
+            transport = SmsBowerMailTransport(
+                HttpxSmsBowerClient(timeout_seconds=runtime.request_timeout_seconds),
+                api_key=(runtime.api_key or "").strip(),
+            )
+            prepared = build_get_code_request(
+                base_url=normalize_smsbower_base_url(runtime.api_base),
+                mail_id=str(mail_id),
+            )
+            try:
+                code, is_pending = transport.get_code(prepared)
+            except SmsBowerTransportError as error:
+                if self._clock() >= deadline:
+                    raise VerificationCodeReadError(str(error)) from error
+                code, is_pending = None, True
+            if code and not is_pending:
+                if authorization_checkpoint is not None:
+                    await _maybe_await(authorization_checkpoint())
+                return VerificationCodeLookupResult(
+                    found=True,
+                    code=code,
+                    matched_from=None,
+                    matched_subject=None,
+                    message_received_at=None,
+                    channel=None,
+                    attempts=attempts,
+                )
+            if self._clock() >= deadline:
+                break
+            remaining_seconds = (deadline - self._clock()).total_seconds()
+            sleep_seconds = min(max(options.poll_interval_seconds, 1), max(remaining_seconds, 0))
+            if sleep_seconds <= 0:
+                break
+            await self._async_sleep(sleep_seconds)
+        return VerificationCodeLookupResult(found=False, attempts=attempts, channel=None)
+
+    async def _wait_for_ondemand_code(
+        self,
+        mailbox: Mailbox,
+        options: VerificationCodeLookupOptions,
+        authorization_checkpoint=None,
+        *,
+        provider_type: str,
+    ) -> VerificationCodeLookupResult:
+        """Poll on-demand HTTP providers via VerificationEvidenceSource-style adapters."""
+        import json
+
+        from mailbox_service.models import MailboxProviderResource
+        from mailbox_service.providers.ondemand_adapters import OnDemandProviderError
+        from mailbox_service.providers.ondemand_facade import OnDemandProviderService
+        from mailbox_service.providers.ports import (
+            VerificationAllocationSnapshot,
+            VerificationQuery,
+        )
+
+        if self._settings is None:
+            raise RuntimeError("VerificationCodeService 缺少 settings")
+        session_factory = self._access_token_service._session_factory
+        cipher = self._access_token_service._credential_cipher
+        service = OnDemandProviderService(
+            self._settings,
+            credential_cipher=cipher,
+            session_factory=session_factory,
+        )
+        deadline = self._clock() + timedelta(seconds=max(options.timeout_seconds, 0))
+        since_at = self._clock() - timedelta(seconds=max(options.since_seconds, 0))
+        attempts = 0
+        custom_matcher: SafeVerificationCodeMatcher | None = None
+        if getattr(options, "code_regex", None):
+            custom_matcher = SafeVerificationCodeMatcher.from_deprecated_code_regex(options.code_regex)
+        while True:
+            if authorization_checkpoint is not None:
+                await _maybe_await(authorization_checkpoint())
+            attempts += 1
+            with session_factory() as session:
+                resource = session.get(MailboxProviderResource, mailbox.id)
+                if resource is None or resource.lifecycle_state not in ("claimed",):
+                    raise VerificationCodeReadError(
+                        f"{provider_type} resource not claimable for verification"
+                    )
+                secret_blob = resource.encrypted_secret
+                external_id = resource.external_resource_id
+                instance_id = resource.provider_instance_id
+            access_context: dict[str, str] = {"external_resource_id": str(external_id or "")}
+            if secret_blob:
+                try:
+                    secret = json.loads(cipher.decrypt(secret_blob))
+                    if isinstance(secret, dict):
+                        for key, value in secret.items():
+                            if value is not None:
+                                access_context[str(key)] = str(value)
+                except Exception:
+                    pass
+            allocation = VerificationAllocationSnapshot(
+                lease_id="",
+                mailbox_id=mailbox.id,
+                provider_type=provider_type,
+                provider_instance_id=instance_id,
+                primary_email=mailbox.primary_email,
+                allocated_email=mailbox.primary_email,
+                access_context=access_context,
+            )
+            query = VerificationQuery(
+                from_address=options.from_address,
+                subject_contains=options.subject_contains,
+                body_contains=options.body_contains,
+                recipient=options.recipient,
+                newer_than=since_at,
+                max_messages=MAX_MESSAGES_PER_SCAN,
+            )
+            try:
+                evidence = service.fetch_evidence(allocation, query)
+            except OnDemandProviderError as error:
+                if self._clock() >= deadline:
+                    raise VerificationCodeReadError(str(error)) from error
+                evidence = None
+            except Exception as error:
+                if self._clock() >= deadline:
+                    raise VerificationCodeReadError(str(error)) from error
+                evidence = None
+            if evidence is not None:
+                if evidence.direct_code:
+                    return VerificationCodeLookupResult(
+                        found=True,
+                        code=evidence.direct_code,
+                        attempts=attempts,
+                        channel=None,
+                    )
+                for message in evidence.messages:
+                    body = message.body_text or ""
+                    subject = message.subject or ""
+                    code = None
+                    if custom_matcher is not None:
+                        code = custom_matcher.extract(f"{subject}\n{body}")
+                    else:
+                        code = extract_verification_code(subject=subject, body_text=body)
+                    if code:
+                        return VerificationCodeLookupResult(
+                            found=True,
+                            code=code,
+                            matched_from=message.from_address,
+                            matched_subject=message.subject,
+                            message_received_at=message.received_at,
+                            channel=None,
+                            attempts=attempts,
+                        )
+            if self._clock() >= deadline:
+                break
+            remaining_seconds = (deadline - self._clock()).total_seconds()
+            sleep_seconds = min(max(options.poll_interval_seconds, 1), max(remaining_seconds, 0))
+            if sleep_seconds <= 0:
+                break
+            await self._async_sleep(sleep_seconds)
+        return VerificationCodeLookupResult(found=False, attempts=attempts, channel=None)
 
     def _list_messages_with_auth_refresh(
         self,

@@ -90,6 +90,17 @@ class Settings(BaseSettings):
     mail_poll_max_concurrency_per_lease: int = Field(default=1, ge=1, le=8)
     mail_scan_timeout_seconds: float = Field(default=10.0, gt=0, le=120)
 
+    # SMSBower Gmail inventory provider (Phase 1A). API Key from env only — never JSON metadata.
+    smsbower_enabled: bool = False
+    smsbower_api_base: str = "https://smsbower.page/api/mail"
+    smsbower_api_key: str | None = None
+    smsbower_api_key_file: str | None = None
+    smsbower_service: str = "openai"
+    smsbower_domain: str = "gmail.com"
+    smsbower_max_price: float | None = None
+    smsbower_instance_id: str = "default"
+    smsbower_request_timeout_seconds: float = Field(default=30.0, gt=0, le=120)
+
     @property
     def token_diagnostic_logging_enabled(self) -> bool:
         """Allow sensitive-adjacent Token diagnostics only in explicit development mode."""
@@ -156,6 +167,12 @@ class Settings(BaseSettings):
                 self,
                 "credential_encryption_key",
                 _read_optional_secret_file(self.credential_encryption_key_file),
+            )
+        if not self.smsbower_api_key and self.smsbower_api_key_file:
+            object.__setattr__(
+                self,
+                "smsbower_api_key",
+                _read_optional_secret_file(self.smsbower_api_key_file),
             )
 
         if self.app_env != "production":

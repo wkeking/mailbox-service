@@ -241,6 +241,10 @@ button {
   padding: 20px;
 }
 
+.panel + .panel {
+  margin-top: 16px;
+}
+
 .section-header {
   justify-content: space-between;
   gap: 16px;
@@ -750,6 +754,54 @@ tbody tr:hover {
   font-size: 12px;
 }
 
+.provider-row-selected {
+  background: #f0f0ef;
+}
+
+.provider-row-selected td {
+  border-top-color: #e5e5e5;
+}
+
+.provider-type-code {
+  display: inline-block;
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  font-size: 11px;
+  color: #4a4a4a;
+}
+
+.provider-instance-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  min-height: 34px;
+  padding: 0 10px;
+  border: 1px solid #e4e4e4;
+  border-radius: 8px;
+  background: #fcfcfc;
+  font-size: 12px;
+}
+
+.provider-instance-meta code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  font-size: 11px;
+  color: #171717;
+}
+
+.provider-config-actions {
+  margin-top: 8px;
+  margin-bottom: 16px;
+  justify-content: flex-start;
+}
+
+.provider-config-actions + .import-format-help {
+  margin-top: 0;
+}
+
 .dialog-actions {
   justify-content: flex-end;
   gap: 8px;
@@ -860,6 +912,24 @@ tbody tr:hover {
   .metric-card,
   .panel {
     background: #2a2a2a;
+  }
+
+  .provider-row-selected,
+  tbody tr.provider-row-selected:hover {
+    background: #333;
+  }
+
+  .provider-type-code {
+    color: #d4d4d4;
+  }
+
+  .provider-instance-meta {
+    border-color: #404040;
+    background: #2a2a2a;
+  }
+
+  .provider-instance-meta code {
+    color: #f2f2f2;
   }
 
   .button {

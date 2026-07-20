@@ -1,6 +1,25 @@
 # Mailbox Service
 
-用于集中维护 Outlook / Hotmail OAuth 凭证的单实例服务。本仓库当前实现了全局出口代理池的基础设施：OAuth Token 刷新和 XOAUTH2 IMAP 连接按邮箱粘性地复用同一健康代理，并在代理链路失败后切换至备用代理。
+用于集中维护邮箱凭证与 `mail_read` 租约的单实例服务。当前已接入 Provider：
+
+| Provider | 供给 | 能力 | 说明 |
+| --- | --- | --- | --- |
+| `microsoft` | inventory 导入 | AT / RT / mail_read | Outlook/Hotmail OAuth；四段文本导入；默认路径（省略 `provider` 仅此） |
+| `smsbower_gmail` | inventory 补货 | mail_read | 显式 `provider` + `providers:smsbower_gmail:acquire`；管理台可配置与补货 |
+| `cloudflare_temp_email` | on_demand | mail_read | 管理台配置；领取时即时开箱 |
+| `ddg_mail` | on_demand | mail_read | DDG 别名 + CF 兼容收件箱 |
+| `cloudmail_gen` | on_demand | mail_read | 管理台配置 |
+| `tempmail_lol` | on_demand | mail_read | 管理台配置 |
+| `duckmail` | on_demand | mail_read | 管理台配置 |
+| `gptmail` | on_demand | mail_read | 管理台配置 |
+| `moemail` | on_demand | mail_read | 管理台配置 |
+| `inbucket` | on_demand | mail_read | 自建 Inbucket |
+| `yyds_mail` | on_demand | mail_read | 管理台配置 |
+
+管理台 **邮箱 Provider** 页可维护各类型启停、API Base、域名与密钥（密钥加密保存、不回显明文）。  
+非 Microsoft 领取须 Client Key 具备 `providers:{type}:acquire`，且请求显式传 `provider`。
+
+同时实现了全局出口代理池：OAuth Token 刷新和 XOAUTH2 IMAP 连接按邮箱粘性地复用同一健康代理，并在代理链路失败后切换至备用代理。
 
 ## 已实现的出口代理能力
 
@@ -106,6 +125,7 @@ curl -X POST http://localhost:8000/api/v1/admin/client-keys \
 - `mailboxes:acquire`：领取可用邮箱账号（mail_read 租约，不返回 Token）
 - `mailboxes:reacquire`：按历史主邮箱或 plus 别名重新领取 mail_read 租约
 - `mail:verification-code:read`：在 mail_read 租约下读取收件箱验证码
+- `providers:smsbower_gmail:acquire`：显式领取 SMSBower Gmail 库存（须与 `mailboxes:acquire` 同时授予；默认 Key **不含**此权限）
 
 ## 外部服务 API
 
@@ -113,14 +133,23 @@ curl -X POST http://localhost:8000/api/v1/admin/client-keys \
 
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
-| `POST` | `/api/v1/leases/acquire` | 领取 AT 或 RT mode 邮箱租约 |
+| `POST` | `/api/v1/leases/acquire` | 领取 AT 或 RT mode 邮箱租约（Microsoft only） |
 | `POST` | `/api/v1/leases/{lease_id}/release` | 幂等释放租约 |
 | `POST` | `/api/v1/leases/{lease_id}/access-token` | 获取未过期缓存 AT，过期时自动刷新 |
 | `POST` | `/api/v1/leases/{lease_id}/refresh-token` | 按 `expected_token_version` CAS 回写 RT |
-| `POST` | `/api/v1/mailboxes/acquire` | 领取可用邮箱账号（mail_read；主邮箱须传 `usage_site`） |
+| `POST` | `/api/v1/mailboxes/acquire` | 领取可用邮箱账号（mail_read；省略 `provider` 仅 Microsoft；主邮箱须传 `usage_site`） |
 | `GET` | `/api/v1/usage-sites` | 查询启用中的注册站点白名单（需 `mailboxes:acquire`） |
 | `POST` | `/api/v1/mailboxes/reacquire` | 按历史业务地址（主邮箱或 plus 别名）重新领取 mail_read 租约 |
 | `POST` | `/api/v1/leases/{lease_id}/verification-code` | 在 mail_read 租约下提取收件箱验证码 |
+
+### Provider 矩阵（本轮已验证）
+
+| provider_type | 供给方式 | 支持模式 | 备注 |
+| --- | --- | --- | --- |
+| `microsoft` | inventory（四段导入） | AT / RT / mail_read | 默认路径；省略 `provider` 仅此 |
+| `smsbower_gmail` | inventory（Admin 补货） | mail_read only | 须显式 `provider` + scope；详见 [docs/smsbower-gmail-phase1a.md](docs/smsbower-gmail-phase1a.md) |
+
+TempMail / DDG / 通用 HTTP profile **未**作为 enabled Provider 暴露。
 
 ### 按历史地址重新领取（reacquire）
 
@@ -230,7 +259,7 @@ SPA / 某些 OTP 流程可能是 24 小时；个人 Outlook / Hotmail 常见为 
 | --- | --- |
 | `Dockerfile` | 多阶段 / 分层构建定义 |
 | `scripts/build-image.sh` | buildx `--load` 后 `docker push` 正式镜像 |
-| `docker-compose.yml` | 应用部署；默认拉取 `registry.example.com/mailbox-service:latest`，外连 mysql-host |
+| `docker-compose.yml` | 应用部署；默认拉取 `registry.example.com/mailbox-service:latest`，外连共享 infra MySQL |
 | `.dockerignore` | 减小构建上下文 |
 
 ### 前置条件
@@ -311,7 +340,7 @@ python3 -c "import base64, os; print(base64.urlsafe_b64encode(os.urandom(32)).de
 **数据库迁移：**
 
 - **推荐**：保持 `AUTO_MIGRATE_ON_STARTUP=true`（默认）。服务启动时会自动检测版本并执行 `migrations/` 中尚未记录的脚本，结果写入 `schema_migrations`。
-- Compose 使用外置 `mysql-host` 时，请先创建 `mailbox_service` 库；表结构由应用启动迁移负责。
+- Compose 使用共享基础设施 `mysql-host`（网络 `external_network`）时，请先创建 `mailbox_service` 库；表结构由应用启动迁移负责。
 - 关闭自动迁移时设 `AUTO_MIGRATE_ON_STARTUP=false`，再按序号手动执行：
 
 ```bash
@@ -322,7 +351,7 @@ done
 
 - 新增迁移请继续使用 `00N_描述.sql` 命名；**不要修改已上线版本的 SQL 内容**（版本号一旦记录即视为已应用）。
 
-### 4a. 用 Compose 部署（应用 + 外连 mysql-host）
+### 4a. 用 Compose 部署（应用 + 外连共享 infra MySQL）
 
 `docker-compose.yml` 默认镜像为 `registry.example.com/mailbox-service:latest`，与打包脚本一致。可覆盖：
 
@@ -331,20 +360,36 @@ export MAILBOX_IMAGE=registry.example.com/mailbox-service:latest
 # 或 docker compose pull && docker compose up -d
 ```
 
-Compose 默认**不自带 MySQL**，接入本机已运行的 `mysql-host`（Docker 网络 `infra_default`）。  
-连接串只使用 `.env` 中的 `DATABASE_URL`（与本机 uvicorn 同一变量）。容器内主机名须为 `mysql-host`，勿写 `127.0.0.1`：
+Compose 默认**不自带 MySQL**，接入本机已运行的共享基础设施（见 `Docker/infra/docker-compose.yml`）：
+
+| 资源 | 值 |
+| --- | --- |
+| 网络 | `external_network`（compose 项目 `infra` 的 `infra` 网络） |
+| MySQL 容器 | `mysql-host` |
+| 默认账号 | `root` / `change-me`（仅本地开发） |
+
+先启动基础设施：
+
+```bash
+cd /path/to/infra
+docker compose up -d
+```
+
+应用侧 `.env` 中容器内主机名须为 `mysql-host`，勿写 `127.0.0.1`：
 
 ```env
-DATABASE_URL=mysql+pymysql://root:root@mysql-host:3306/mailbox_service
+DATABASE_URL=mysql+pymysql://root:change-me@mysql-host:3306/mailbox_service
 APP_ENV=production
 CORS_ALLOW_ORIGINS=*
 ```
 
+本机直接跑 uvicorn 时把主机改成 `127.0.0.1` 即可。
+
 首次使用需保证库已创建：
 
 ```bash
-docker exec -i mysql-host mysql -uroot -proot \
-  -e "CREATE DATABASE IF NOT EXISTS mailbox_service CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;"
+docker exec -i mysql-host mysql -uroot -pchange-me \
+  -e "CREATE DATABASE IF NOT EXISTS mailbox_service CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
 ```
 
 启动：

@@ -32,6 +32,8 @@ from mailbox_service.client_key_service import (
 from mailbox_service.database import SessionFactory, database_engine, get_session
 from mailbox_service.migration_runner import run_pending_migrations
 from mailbox_service.lease_service import (
+    ProviderNotConfiguredError,
+    ProviderUnsupportedError,
     LeaseEmailNotFoundError,
     LeaseEmailSiteConflictError,
     LeaseInactiveError,
@@ -91,6 +93,13 @@ from mailbox_service.schemas import (
     EmailSiteUsageRevokeResponse,
     MailboxAcquireRequest,
     MailboxAcquireResponse,
+    SmsbowerReplenishResponse,
+    ProviderCatalogResponse,
+    ProviderCatalogItemResponse,
+    ProviderInstanceSettingsResponse,
+    ProviderInstanceSettingsUpdate,
+    SmsbowerSettingsResponse,
+    SmsbowerSettingsUpdate,
     MailboxReacquireRequest,
     UsageSiteCreateRequest,
     UsageSiteItemResponse,
@@ -457,6 +466,17 @@ async def application_lifespan(_: FastAPI):
     """Run schema migrations, then process-local background jobs for this instance."""
     settings = get_settings()
     run_pending_migrations(database_engine, settings)
+    cipher = get_credential_cipher(settings)
+    if cipher is not None:
+        from mailbox_service.lease_service import set_on_demand_provision_hook
+        from mailbox_service.providers.ondemand_facade import OnDemandProviderService
+
+        on_demand_service = OnDemandProviderService(
+            settings,
+            credential_cipher=cipher,
+            session_factory=SessionFactory,
+        )
+        set_on_demand_provision_hook(on_demand_service.provision)
     proxy_health_scheduler = start_proxy_health_scheduler(settings)
     refresh_token_keepalive_scheduler = start_refresh_token_keepalive_scheduler(settings)
     try:
@@ -775,7 +795,12 @@ def get_lease_service(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail={"code": "CREDENTIAL_ENCRYPTION_NOT_CONFIGURED", "message": "未配置凭证加密密钥"},
         )
-    return LeaseService(session, credential_cipher, access_token_service)
+    return LeaseService(
+        session,
+        credential_cipher,
+        access_token_service,
+        session_factory=SessionFactory,
+    )
 
 
 LeaseServiceDependency = Annotated[LeaseService, Depends(get_lease_service)]
@@ -843,6 +868,32 @@ def to_external_http_exception(error: Exception) -> HTTPException:
         return HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail={"code": "CLIENT_SCOPE_REQUIRED", "message": str(error)},
+        )
+    if isinstance(error, ProviderUnsupportedError):
+        return HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "PROVIDER_UNSUPPORTED", "message": str(error)},
+        )
+    if isinstance(error, ProviderNotConfiguredError):
+        return HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "PROVIDER_NOT_CONFIGURED", "message": str(error)},
+        )
+    try:
+        from mailbox_service.providers.smsbower_gmail import SmsBowerUnsupportedFilterError
+        from mailbox_service.providers.microsoft_guards import ProviderNotMicrosoftError
+    except Exception:  # pragma: no cover - import always available in production
+        SmsBowerUnsupportedFilterError = ()  # type: ignore[misc, assignment]
+        ProviderNotMicrosoftError = ()  # type: ignore[misc, assignment]
+    if isinstance(error, SmsBowerUnsupportedFilterError):
+        return HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "PROVIDER_FILTER_UNSUPPORTED", "message": str(error)},
+        )
+    if isinstance(error, ProviderNotMicrosoftError):
+        return HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "PROVIDER_NOT_MICROSOFT", "message": str(error)},
         )
     if isinstance(error, LeaseNotFoundError):
         return HTTPException(
@@ -1145,6 +1196,7 @@ def acquire_mailbox_account(
 ) -> MailboxAcquireResponse:
     """Acquire one usable mailbox account as a mail_read lease without returning tokens."""
     try:
+        explicit_provider = payload.provider is not None
         result = lease_service.acquire_lease(
             principal,
             mode=LeaseMode.MAIL_READ,
@@ -1155,10 +1207,12 @@ def acquire_mailbox_account(
             use_plus_alias=payload.use_plus_alias,
             preferred_alias_suffix=payload.alias_suffix,
             usage_site=payload.usage_site,
+            provider=payload.provider,
+            explicit_provider_request=explicit_provider,
         )
     except Exception as error:
         raise to_external_http_exception(error) from error
-    return MailboxAcquireResponse(
+    response = MailboxAcquireResponse(
         lease_id=result.lease_id,
         mailbox_id=result.mailbox_id,
         primary_email=result.primary_email,
@@ -1169,6 +1223,10 @@ def acquire_mailbox_account(
         expires_at=result.expires_at,
         created_at=result.created_at,
     )
+    # Legacy wire shape: omit provider when caller did not request one explicitly.
+    if explicit_provider:
+        response.provider = result.provider_type
+    return response
 
 
 @app.get("/api/v1/usage-sites", response_model=UsageSiteListResponse)
@@ -1345,6 +1403,8 @@ def acquire_external_lease(
 ) -> LeaseAcquireResponse:
     """Acquire one mailbox lease and return the credential selected by its mode."""
     try:
+        if payload.provider not in (None, "microsoft"):
+            raise ProviderUnsupportedError("leases/acquire 本轮仅支持省略 provider 或 provider=microsoft")
         result = lease_service.acquire_lease(
             principal,
             mode=LeaseMode(payload.mode),
@@ -1352,6 +1412,8 @@ def acquire_external_lease(
             preferred_email=payload.preferred_email,
             client_tag=payload.client_tag,
             purpose=payload.purpose,
+            provider=payload.provider or "microsoft",
+            explicit_provider_request=payload.provider is not None,
         )
     except Exception as error:
         raise to_external_http_exception(error) from error
@@ -1402,10 +1464,15 @@ def release_external_lease(
     lease_id: str,
     principal: ClientPrincipalDependency,
     lease_service: LeaseServiceDependency,
+    session: SessionDependency,
+    settings: SettingsDependency,
 ) -> LeaseReleaseResponse:
     """Idempotently release an active lease owned by the authenticated Client Key."""
     try:
         result = lease_service.release_lease(principal, lease_id)
+        # Durable remote finalize runs after local release is durable.
+        # request Session is committed by middleware after success; finalize opens short UoWs.
+        _maybe_finalize_smsbower_release(session, settings, lease_id)
     except Exception as error:
         raise to_external_http_exception(error) from error
     return LeaseReleaseResponse(lease_id=result.lease_id, released_at=result.released_at)
@@ -1682,6 +1749,301 @@ def list_mailboxes(
     )
 
 
+
+
+def _maybe_finalize_smsbower_release(session, settings: Settings, lease_id: str) -> None:
+    """Best-effort setStatus after local release commit path (same request after flush)."""
+    from mailbox_service.models import Lease, MailboxProviderOperation, MailboxProviderResource
+    from mailbox_service.provider_operation_service import ProviderOperationService
+    from mailbox_service.providers.ports import ReleaseOperationSnapshot
+    from mailbox_service.providers.smsbower_contracts import SMSBOWER_STATUS_CLOSE_SUCCESS
+    from mailbox_service.providers.smsbower_gmail import SmsBowerGmailProvider
+
+    lease = session.get(Lease, lease_id)
+    if lease is None or (lease.provider_type or "microsoft") != "smsbower_gmail":
+        return
+    operation = session.scalar(
+        select(MailboxProviderOperation).where(
+            MailboxProviderOperation.lease_id == lease_id,
+            MailboxProviderOperation.operation_type == "release",
+        ).order_by(MailboxProviderOperation.created_at.desc())
+    )
+    if operation is None or operation.status not in ("pending", "running", "unknown"):
+        return
+    resource = session.get(MailboxProviderResource, lease.mailbox_id)
+    if resource is None:
+        return
+    # Commit local state before network.
+    session.commit()
+    provider = SmsBowerGmailProvider(
+        settings,
+        credential_cipher=get_credential_cipher(settings),
+        session_factory=SessionFactory,
+    )
+    snapshot = ReleaseOperationSnapshot(
+        operation_id=operation.id,
+        provider_type=operation.provider_type,
+        provider_instance_id=operation.provider_instance_id,
+        external_resource_id=resource.external_resource_id,
+        resource_generation=int(operation.resource_generation or resource.resource_generation or 0),
+        expected_state_version=int(operation.expected_state_version or resource.state_version or 0),
+        lease_id=lease_id,
+        remote_status=SMSBOWER_STATUS_CLOSE_SUCCESS,
+    )
+    try:
+        outcome = provider.finalize(snapshot)
+    except Exception:
+        outcome_status = "unknown"
+        error_class = "exception"
+        clear_secret = False
+    else:
+        outcome_status = outcome.outcome
+        error_class = outcome.error_class
+        clear_secret = outcome.outcome == "succeeded"
+    with SessionFactory() as finalize_session:
+        try:
+            ops = ProviderOperationService(finalize_session)
+            ops.finalize_release_cas(
+                operation_id=operation.id,
+                mailbox_id=lease.mailbox_id,
+                expected_generation=int(snapshot.resource_generation),
+                expected_state_version=int(snapshot.expected_state_version),
+                outcome=outcome_status if outcome_status in ("succeeded", "failed", "unknown") else "unknown",
+                clear_secret=clear_secret,
+            )
+            if error_class and outcome_status != "succeeded":
+                op_row = finalize_session.get(MailboxProviderOperation, operation.id)
+                if op_row is not None:
+                    op_row.last_error_class = error_class
+            finalize_session.commit()
+        except Exception:
+            finalize_session.rollback()
+
+
+def _serialize_smsbower_settings(view) -> SmsbowerSettingsResponse:
+    return SmsbowerSettingsResponse(
+        provider_type=view.provider_type,
+        instance_id=view.instance_id,
+        enabled=view.enabled,
+        api_base=view.api_base,
+        service=view.service,
+        domain=view.domain,
+        max_price=view.max_price,
+        request_timeout_seconds=view.request_timeout_seconds,
+        has_api_key=view.has_api_key,
+        source=view.source,
+        env_enabled_default=view.env_enabled_default,
+        updated_at=view.updated_at,
+    )
+
+
+@app.get("/api/v1/admin/providers", response_model=ProviderCatalogResponse)
+def admin_list_providers(
+    session: SessionDependency,
+    settings: SettingsDependency,
+    _: AdminDependency,
+) -> ProviderCatalogResponse:
+    """List known mailbox providers and whether they are UI-configurable."""
+    from mailbox_service.provider_settings_service import ProviderSettingsService
+
+    service = ProviderSettingsService(session, settings, get_credential_cipher(settings))
+    items = [
+        ProviderCatalogItemResponse(**item) for item in service.list_provider_summaries()
+    ]
+    return ProviderCatalogResponse(items=items)
+
+
+@app.get(
+    "/api/v1/admin/providers/{provider_type}/instances/{instance_id}",
+    response_model=ProviderInstanceSettingsResponse,
+)
+def admin_get_provider_instance(
+    provider_type: str,
+    instance_id: str,
+    session: SessionDependency,
+    settings: SettingsDependency,
+    _: AdminDependency,
+) -> ProviderInstanceSettingsResponse:
+    """Read one provider instance settings without secret plaintext."""
+    from mailbox_service.provider_settings_service import ProviderSettingsService
+    from mailbox_service.providers.catalog import ALL_PROVIDER_TYPES
+
+    if provider_type not in ALL_PROVIDER_TYPES or provider_type == "microsoft":
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "PROVIDER_NOT_FOUND", "message": f"未知或不可配置的 provider：{provider_type}"},
+        )
+    view = ProviderSettingsService(
+        session, settings, get_credential_cipher(settings)
+    ).get_provider_admin_view(provider_type, instance_id)
+    return ProviderInstanceSettingsResponse(**view)
+
+
+@app.put(
+    "/api/v1/admin/providers/{provider_type}/instances/{instance_id}",
+    response_model=ProviderInstanceSettingsResponse,
+)
+def admin_update_provider_instance(
+    provider_type: str,
+    instance_id: str,
+    payload: ProviderInstanceSettingsUpdate,
+    session: SessionDependency,
+    settings: SettingsDependency,
+    admin_id: AdminDependency,
+) -> ProviderInstanceSettingsResponse:
+    """Update one provider instance; secrets are encrypted and never returned."""
+    from mailbox_service.provider_settings_service import ProviderSettingsService
+    from mailbox_service.providers.catalog import ALL_PROVIDER_TYPES
+
+    if provider_type not in ALL_PROVIDER_TYPES or provider_type == "microsoft":
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "PROVIDER_NOT_FOUND", "message": f"未知或不可配置的 provider：{provider_type}"},
+        )
+    try:
+        view = ProviderSettingsService(
+            session, settings, get_credential_cipher(settings)
+        ).update_provider_instance(
+            provider_type,
+            instance_id=instance_id,
+            enabled=payload.enabled,
+            values=payload.values,
+            secrets=payload.secrets,
+            clear_secrets=payload.clear_secrets,
+        )
+    except KeyError as error:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "PROVIDER_NOT_FOUND", "message": str(error)},
+        ) from error
+    except RuntimeError as error:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "CREDENTIAL_ENCRYPTION_NOT_CONFIGURED", "message": str(error)},
+        ) from error
+    create_audit_log(
+        session,
+        admin_id,
+        "provider.settings_updated",
+        "provider_instance",
+        f"{provider_type}:{instance_id}",
+        {
+            "provider_type": provider_type,
+            "enabled": view.get("enabled"),
+            "has_any_secret": view.get("has_any_secret"),
+            "cleared_secrets": payload.clear_secrets or [],
+            "updated_value_keys": sorted((payload.values or {}).keys()),
+            "updated_secret_keys": sorted((payload.secrets or {}).keys()),
+        },
+    )
+    return ProviderInstanceSettingsResponse(**view)
+
+
+@app.get(
+    "/api/v1/admin/providers/smsbower_gmail/settings",
+    response_model=SmsbowerSettingsResponse,
+)
+def admin_get_smsbower_settings(
+    session: SessionDependency,
+    settings: SettingsDependency,
+    _: AdminDependency,
+) -> SmsbowerSettingsResponse:
+    """Read SMSBower instance settings without API Key plaintext."""
+    from mailbox_service.provider_settings_service import ProviderSettingsService
+
+    view = ProviderSettingsService(
+        session, settings, get_credential_cipher(settings)
+    ).get_smsbower_admin_view()
+    return _serialize_smsbower_settings(view)
+
+
+@app.patch(
+    "/api/v1/admin/providers/smsbower_gmail/settings",
+    response_model=SmsbowerSettingsResponse,
+)
+def admin_update_smsbower_settings(
+    payload: SmsbowerSettingsUpdate,
+    session: SessionDependency,
+    settings: SettingsDependency,
+    admin_id: AdminDependency,
+) -> SmsbowerSettingsResponse:
+    """Update SMSBower settings; API Key is encrypted and never returned."""
+    from mailbox_service.provider_settings_service import ProviderSettingsService
+
+    cipher = get_credential_cipher(settings)
+    service = ProviderSettingsService(session, settings, cipher)
+    try:
+        view = service.update_smsbower(
+            enabled=payload.enabled,
+            api_base=payload.api_base,
+            service=payload.service,
+            domain=payload.domain,
+            max_price=payload.max_price,
+            clear_max_price=payload.clear_max_price,
+            request_timeout_seconds=payload.request_timeout_seconds,
+            api_key=payload.api_key,
+            clear_api_key=payload.clear_api_key,
+        )
+    except RuntimeError as error:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "CREDENTIAL_ENCRYPTION_NOT_CONFIGURED", "message": str(error)},
+        ) from error
+    create_audit_log(
+        session,
+        admin_id,
+        "provider.settings_updated",
+        "provider_instance",
+        f"smsbower_gmail:{view.instance_id}",
+        {
+            "provider_type": "smsbower_gmail",
+            "updated_fields": sorted(payload.model_fields_set),
+            "has_api_key": view.has_api_key,
+            "enabled": view.enabled,
+        },
+    )
+    return _serialize_smsbower_settings(view)
+
+
+@app.post(
+    "/api/v1/admin/providers/smsbower_gmail/replenish",
+    response_model=SmsbowerReplenishResponse,
+)
+def admin_replenish_smsbower(
+    settings: SettingsDependency,
+    admin_id: AdminDependency,
+) -> SmsbowerReplenishResponse:
+    """Admin-triggered SMSBower inventory replenish (single activation)."""
+    cipher = get_credential_cipher(settings)
+    if cipher is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "CREDENTIAL_ENCRYPTION_NOT_CONFIGURED", "message": "未配置凭证加密密钥"},
+        )
+    from mailbox_service.providers.smsbower_gmail import SmsBowerGmailProvider, SmsBowerNotConfiguredError
+
+    provider = SmsBowerGmailProvider(
+        settings,
+        credential_cipher=cipher,
+        session_factory=SessionFactory,
+    )
+    try:
+        outcome = provider.replenish_one(actor_id=admin_id)
+    except SmsBowerNotConfiguredError as error:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "PROVIDER_NOT_CONFIGURED", "message": str(error)},
+        ) from error
+    return SmsbowerReplenishResponse(
+        operation_id=outcome.operation_id,
+        status=outcome.status,
+        mailbox_id=outcome.mailbox_id,
+        primary_email=outcome.primary_email,
+        external_resource_id=outcome.external_resource_id,
+        error_class=outcome.error_class,
+    )
+
+
 @app.post("/api/v1/admin/mailboxes/import", response_model=MailboxImportResponse)
 def import_mailboxes(
     payload: MailboxImportRequest,
@@ -1719,6 +2081,14 @@ def import_mailboxes(
         seen_primary_emails.add(primary_email)
 
         existing_mailbox = session.scalar(select(Mailbox).where(Mailbox.primary_email == primary_email))
+        if existing_mailbox is not None and (existing_mailbox.provider_type or "microsoft") != "microsoft":
+            errors.append(
+                MailboxImportLineError(
+                    line_number=line_number,
+                    message="邮箱已存在且属于其他 Provider，Microsoft 四段导入拒绝覆盖。",
+                )
+            )
+            continue
         if existing_mailbox is not None and payload.on_conflict == "skip":
             skipped_count += 1
             continue
@@ -1748,6 +2118,7 @@ def import_mailboxes(
         if existing_mailbox is None:
             new_mailbox = Mailbox(
                 primary_email=primary_email,
+                provider_type="microsoft",
                 status=MailboxStatus.ACTIVE,
                 client_id=client_id,
                 mail_password_ciphertext=encrypted_mail_password,

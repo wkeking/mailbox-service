@@ -15,6 +15,14 @@ from sqlalchemy.orm import Session
 from mailbox_service.models import ClientKey, utc_now
 
 
+from mailbox_service.providers.catalog import PROVIDER_DEFINITIONS
+
+_PROVIDER_ACQUIRE_SCOPES = frozenset(
+    f"providers:{definition.provider_type}:acquire"
+    for definition in PROVIDER_DEFINITIONS
+    if definition.requires_acquire_scope
+)
+
 ALLOWED_CLIENT_KEY_SCOPES = frozenset(
     {
         "leases:acquire",
@@ -25,8 +33,15 @@ ALLOWED_CLIENT_KEY_SCOPES = frozenset(
         "mailboxes:acquire",
         "mailboxes:reacquire",
         "mail:verification-code:read",
+        # Explicit provider allowlist scopes (existing keys do not get these by default).
+        *_PROVIDER_ACQUIRE_SCOPES,
     }
 )
+
+
+def provider_acquire_scope(provider_type: str) -> str:
+    """Return the Client Key scope required to acquire a non-default provider."""
+    return f"providers:{provider_type}:acquire"
 
 
 class ClientKeyAuthenticationError(Exception):

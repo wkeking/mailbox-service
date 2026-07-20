@@ -286,3 +286,49 @@ def test_mysql_lock_retry_replays_callable() -> None:
     )
     assert result == "ok"
     assert attempts["count"] == 3
+
+
+def test_access_token_acquire_defers_token_until_after_reserve() -> None:
+    """ACCESS_TOKEN path reserves claim before OAuth and compensates on failure."""
+    from mailbox_service.client_key_service import ClientKeyService
+    from mailbox_service.lease_service import LeaseService
+    from mailbox_service.models import Lease, LeaseMode, MailboxLeaseClaim, MailboxStatus
+    from mailbox_service.proxy_service import MicrosoftOAuthError
+
+    class BoomOAuth:
+        def refresh_access_token(self, mailbox, refresh_token, *, scope=None):
+            raise MicrosoftOAuthError("boom")
+
+    session, cipher, service, session_factory, settings = _build_token_service(BoomOAuth())
+    # Rebuild token service with boom client already applied.
+    mailbox = Mailbox(
+        primary_email="at-compensate@example.com",
+        client_id="client-id",
+        refresh_token_ciphertext=cipher.encrypt("rt"),
+        token_version=1,
+        status=MailboxStatus.ACTIVE,
+    )
+    session.add(mailbox)
+    session.flush()
+    creation = ClientKeyService(session).create_client_key(
+        name="at-compensate",
+        scopes=["leases:acquire", "leases:release", "tokens:access:read"],
+    )
+    principal = ClientKeyService(session).authenticate(creation.api_key)
+    lease_service = LeaseService(session, cipher, service)
+    try:
+        lease_service.acquire_lease(principal, mode=LeaseMode.ACCESS_TOKEN, ttl_seconds=300)
+        raised = False
+    except MicrosoftOAuthError:
+        raised = True
+    assert raised
+    session.flush()
+    assert session.get(MailboxLeaseClaim, mailbox.id) is None
+    active = session.scalars(
+        select(Lease).where(Lease.mailbox_id == mailbox.id, Lease.released_at.is_(None))
+    ).all()
+    assert active == []
+    released = session.scalars(
+        select(Lease).where(Lease.mailbox_id == mailbox.id, Lease.released_at.is_not(None))
+    ).all()
+    assert len(released) == 1

@@ -64,11 +64,8 @@ def mysql_engine(mysql_settings: Settings):
     with engine.connect() as connection:
         connection.execute(text("SET SESSION innodb_lock_wait_timeout = 2"))
         connection.commit()
-    # Prefer migrations when available; fall back to metadata create for empty test DBs.
-    try:
-        run_pending_migrations(engine, mysql_settings)
-    except Exception:
-        Base.metadata.create_all(engine)
+    # Migration failure must fail the suite — never mask with Base.metadata.create_all().
+    run_pending_migrations(engine, mysql_settings)
     yield engine
     engine.dispose()
 

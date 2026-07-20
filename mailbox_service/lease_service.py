@@ -9,9 +9,10 @@ import string
 
 from sqlalchemy import delete, exists, func, select, update
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
 from mailbox_service.client_key_service import ClientPrincipal
+from mailbox_service.client_key_service import provider_acquire_scope
 from mailbox_service.models import (
     AuditLog,
     EmailSiteUsage,
@@ -20,13 +21,23 @@ from mailbox_service.models import (
     Mailbox,
     MailboxCapability,
     MailboxLeaseClaim,
+    MailboxProviderResource,
     MailboxStatus,
+    ProviderResourceLifecycle,
+    ProviderResourceReadiness,
     UsageSite,
     is_expired,
     utc_now,
 )
+from mailbox_service.providers.catalog import ON_DEMAND_PROVIDER_TYPES, ALL_PROVIDER_TYPES
+from mailbox_service.providers.registry import DEFAULT_PROVIDER_TYPE, normalize_provider_type
 from mailbox_service.security import CredentialCipher
 from mailbox_service.token_service import MailboxAccessTokenResult, MailboxAccessTokenService
+
+SessionFactoryType = sessionmaker[Session]
+
+# Optional injectable on-demand provisioner (set by main app / tests).
+_ON_DEMAND_PROVISION_HOOK = None
 
 PLUS_ALIAS_SUFFIX_ALPHABET = string.ascii_lowercase + string.digits
 DEFAULT_PLUS_ALIAS_SUFFIX_LENGTH = 8
@@ -101,12 +112,22 @@ class LeaseAcquireResult:
     address_kind: str | None = None
     # Registration site declared at mail_read acquire; omitted for AT/RT and reacquire.
     usage_site: str | None = None
+    provider_type: str | None = None
+    provider_instance_id: str | None = None
     access_token: str | None = None
     access_token_expires_at: datetime | None = None
     access_token_refreshed: bool | None = None
     client_id: str | None = None
     refresh_token: str | None = None
     token_version: int | None = None
+
+
+class ProviderNotConfiguredError(Exception):
+    """Authorized caller requested a provider that is not enabled/configured."""
+
+
+class ProviderUnsupportedError(Exception):
+    """Caller requested an unknown or unsupported provider type."""
 
 
 @dataclass(frozen=True)
@@ -135,10 +156,15 @@ class LeaseService:
         session: Session,
         credential_cipher: CredentialCipher,
         access_token_service: MailboxAccessTokenService,
+        *,
+        session_factory: SessionFactoryType | None = None,
     ) -> None:
         self._session = session
         self._credential_cipher = credential_cipher
         self._access_token_service = access_token_service
+        # When set, ACCESS_TOKEN acquire uses independent short Units of Work so OAuth/network
+        # never runs while the request Session still holds Mailbox/Lease/claim row locks.
+        self._session_factory = session_factory
 
     def acquire_lease(
         self,
@@ -152,6 +178,8 @@ class LeaseService:
         use_plus_alias: bool = False,
         preferred_alias_suffix: str | None = None,
         usage_site: str | None = None,
+        provider: str | None = None,
+        explicit_provider_request: bool = False,
     ) -> LeaseAcquireResult:
         """Reserve one active mailbox that has no other unexpired lease."""
         if mode == LeaseMode.MAIL_READ:
@@ -169,9 +197,24 @@ class LeaseService:
             if usage_site:
                 raise LeaseModeError("仅 mail_read 租约支持 usage_site")
 
+        try:
+            resolved_provider = normalize_provider_type(provider) if provider else DEFAULT_PROVIDER_TYPE
+        except ValueError as error:
+            raise ProviderUnsupportedError(str(error)) from error
+        if mode != LeaseMode.MAIL_READ and resolved_provider != DEFAULT_PROVIDER_TYPE:
+            raise ProviderUnsupportedError("非 mail_read 租约本轮仅支持 microsoft")
+        if mode in (LeaseMode.ACCESS_TOKEN, LeaseMode.REFRESH_TOKEN) and resolved_provider != DEFAULT_PROVIDER_TYPE:
+            raise ProviderUnsupportedError("AT/RT 租约仅支持 microsoft")
+        if explicit_provider_request and resolved_provider != DEFAULT_PROVIDER_TYPE:
+            principal.require_scope(provider_acquire_scope(resolved_provider))
+        if resolved_provider not in ALL_PROVIDER_TYPES:
+            raise ProviderUnsupportedError(f"不支持的 provider：{resolved_provider}")
+
         wants_plus_alias = bool(use_plus_alias or preferred_alias_suffix)
+        if resolved_provider != DEFAULT_PROVIDER_TYPE and wants_plus_alias:
+            raise LeaseModeError("非 microsoft provider 本轮不支持 plus alias")
         resolved_usage_site: str | None = None
-        if mode == LeaseMode.MAIL_READ:
+        if mode == LeaseMode.MAIL_READ and resolved_provider == DEFAULT_PROVIDER_TYPE:
             if not wants_plus_alias:
                 # Primary path must declare the registration site so the pool can exclude it later.
                 if not usage_site or not usage_site.strip():
@@ -180,39 +223,217 @@ class LeaseService:
             elif usage_site and usage_site.strip():
                 resolved_usage_site = self._resolve_enabled_usage_site(usage_site)
 
-        # ACCESS_TOKEN 路径含 OAuth 短事务，不能整体重放；仅对纯 DB 抢占做 1205/1213 重试。
+        # ACCESS_TOKEN: short DB reserve (claim) -> network/CAS outside locks -> compensate on failure.
+        # Pure DB modes: 1205/1213 retry with rollback so each attempt re-reads on a clean transaction.
         from mailbox_service.transaction_retry import run_with_mysql_lock_retry
 
         if mode == LeaseMode.ACCESS_TOKEN:
-            return self._acquire_lease_body(
+            return self._acquire_access_token_lease(
                 principal,
-                mode=mode,
                 ttl_seconds=ttl_seconds,
                 preferred_email=preferred_email,
                 client_tag=client_tag,
                 purpose=purpose,
-                wants_plus_alias=wants_plus_alias,
-                preferred_alias_suffix=preferred_alias_suffix,
-                resolved_usage_site=resolved_usage_site,
+            )
+
+        if mode == LeaseMode.MAIL_READ and resolved_provider in ON_DEMAND_PROVIDER_TYPES:
+            return self._acquire_on_demand_mail_read_lease(
+                principal,
+                provider_type=resolved_provider,
+                ttl_seconds=ttl_seconds,
+                client_tag=client_tag,
+                purpose=purpose,
+                usage_site=resolved_usage_site if usage_site and usage_site.strip() else None,
             )
 
         def _acquire_once() -> LeaseAcquireResult:
-            return self._acquire_lease_body(
-                principal,
-                mode=mode,
-                ttl_seconds=ttl_seconds,
-                preferred_email=preferred_email,
-                client_tag=client_tag,
-                purpose=purpose,
-                wants_plus_alias=wants_plus_alias,
-                preferred_alias_suffix=preferred_alias_suffix,
-                resolved_usage_site=resolved_usage_site,
-            )
+            try:
+                return self._acquire_lease_body(
+                    principal,
+                    mode=mode,
+                    ttl_seconds=ttl_seconds,
+                    preferred_email=preferred_email,
+                    client_tag=client_tag,
+                    purpose=purpose,
+                    wants_plus_alias=wants_plus_alias,
+                    preferred_alias_suffix=preferred_alias_suffix,
+                    resolved_usage_site=resolved_usage_site,
+                    provider_type=resolved_provider,
+                )
+            except Exception as error:
+                # Only roll back for lock-retryable failures. Domain errors
+                # (conflict / unavailable) must not wipe caller session state
+                # (e.g. uncommitted fixtures on SQLite StaticPool tests).
+                from mailbox_service.transaction_retry import is_retryable_mysql_lock_error
+
+                if is_retryable_mysql_lock_error(error):
+                    self._safe_rollback_session(self._session)
+                raise
 
         return run_with_mysql_lock_retry(
             _acquire_once,
             operation_name="lease.acquire",
         )
+
+    def _acquire_access_token_lease(
+        self,
+        principal: ClientPrincipal,
+        *,
+        ttl_seconds: int,
+        preferred_email: str | None,
+        client_tag: str | None,
+        purpose: str | None,
+    ) -> LeaseAcquireResult:
+        """Reserve lease/claim, then obtain AT without holding business row locks.
+
+        When ``session_factory`` is available the reserve step commits in an independent
+        Session so FOR UPDATE locks are released before OAuth. On Token failure a second
+        short Session compensates by releasing the claim.
+        """
+        if self._session_factory is not None:
+            reserved = self._reserve_access_token_lease_committed(
+                principal,
+                ttl_seconds=ttl_seconds,
+                preferred_email=preferred_email,
+                client_tag=client_tag,
+                purpose=purpose,
+            )
+            try:
+                access_token_result = self._access_token_service.ensure_access_token(
+                    reserved.mailbox_id
+                )
+            except Exception:
+                self._compensate_release_access_token_lease(
+                    principal,
+                    lease_id=reserved.lease_id,
+                )
+                raise
+            return LeaseAcquireResult(
+                lease_id=reserved.lease_id,
+                mailbox_id=reserved.mailbox_id,
+                primary_email=reserved.primary_email,
+                mode=LeaseMode.ACCESS_TOKEN,
+                expires_at=reserved.expires_at,
+                created_at=reserved.created_at,
+                access_token=access_token_result.access_token,
+                access_token_expires_at=access_token_result.expires_at,
+                access_token_refreshed=access_token_result.refreshed,
+                token_version=access_token_result.token_version,
+            )
+
+        # Test / legacy path without independent SessionFactory: reserve then token on caller session.
+        reserved = self._acquire_lease_body(
+            principal,
+            mode=LeaseMode.ACCESS_TOKEN,
+            ttl_seconds=ttl_seconds,
+            preferred_email=preferred_email,
+            client_tag=client_tag,
+            purpose=purpose,
+            wants_plus_alias=False,
+            preferred_alias_suffix=None,
+            resolved_usage_site=None,
+            defer_access_token=True,
+            provider_type=DEFAULT_PROVIDER_TYPE,
+        )
+        try:
+            access_token_result = self._access_token_service.ensure_access_token(reserved.mailbox_id)
+        except Exception:
+            self._release_lease_internal(principal, reserved.lease_id)
+            raise
+        return LeaseAcquireResult(
+            lease_id=reserved.lease_id,
+            mailbox_id=reserved.mailbox_id,
+            primary_email=reserved.primary_email,
+            mode=LeaseMode.ACCESS_TOKEN,
+            expires_at=reserved.expires_at,
+            created_at=reserved.created_at,
+            access_token=access_token_result.access_token,
+            access_token_expires_at=access_token_result.expires_at,
+            access_token_refreshed=access_token_result.refreshed,
+            token_version=access_token_result.token_version,
+        )
+
+    def _reserve_access_token_lease_committed(
+        self,
+        principal: ClientPrincipal,
+        *,
+        ttl_seconds: int,
+        preferred_email: str | None,
+        client_tag: str | None,
+        purpose: str | None,
+    ) -> LeaseAcquireResult:
+        """Create ACCESS_TOKEN lease+claim in a short committed transaction with lock retry."""
+        from mailbox_service.transaction_retry import run_with_mysql_lock_retry
+
+        assert self._session_factory is not None
+
+        def _reserve_once() -> LeaseAcquireResult:
+            reserve_session = self._session_factory()
+            try:
+                reserve_service = LeaseService(
+                    reserve_session,
+                    self._credential_cipher,
+                    self._access_token_service,
+                    session_factory=self._session_factory,
+                )
+                reserved = reserve_service._acquire_lease_body(
+                    principal,
+                    mode=LeaseMode.ACCESS_TOKEN,
+                    ttl_seconds=ttl_seconds,
+                    preferred_email=preferred_email,
+                    client_tag=client_tag,
+                    purpose=purpose,
+                    wants_plus_alias=False,
+                    preferred_alias_suffix=None,
+                    resolved_usage_site=None,
+                    defer_access_token=True,
+                )
+                reserve_session.commit()
+                return reserved
+            except Exception:
+                self._safe_rollback_session(reserve_session)
+                raise
+            finally:
+                reserve_session.close()
+
+        return run_with_mysql_lock_retry(
+            _reserve_once,
+            operation_name="lease.acquire.access_token.reserve",
+        )
+
+    def _compensate_release_access_token_lease(
+        self,
+        principal: ClientPrincipal,
+        *,
+        lease_id: str,
+    ) -> None:
+        """Release a just-created ACCESS_TOKEN lease after Token failure (best-effort compensate)."""
+        if self._session_factory is None:
+            self._release_lease_internal(principal, lease_id)
+            return
+        compensate_session = self._session_factory()
+        try:
+            compensate_service = LeaseService(
+                compensate_session,
+                self._credential_cipher,
+                self._access_token_service,
+                session_factory=self._session_factory,
+            )
+            compensate_service._release_lease_internal(principal, lease_id)
+            compensate_session.commit()
+        except Exception:
+            self._safe_rollback_session(compensate_session)
+            raise
+        finally:
+            compensate_session.close()
+
+    @staticmethod
+    def _safe_rollback_session(session: Session) -> None:
+        """Rollback when a transaction is open; ignore sessions already closed/clean."""
+        try:
+            session.rollback()
+        except Exception:
+            return
 
     def _acquire_lease_body(
         self,
@@ -226,6 +447,8 @@ class LeaseService:
         wants_plus_alias: bool,
         preferred_alias_suffix: str | None,
         resolved_usage_site: str | None,
+        defer_access_token: bool = False,
+        provider_type: str = DEFAULT_PROVIDER_TYPE,
     ) -> LeaseAcquireResult:
         current_time = utc_now()
         # MySQL DATETIME is typically naive; compare with a naive UTC value in SQL.
@@ -246,12 +469,16 @@ class LeaseService:
         )
         mailbox_query = select(Mailbox).where(
             Mailbox.status == MailboxStatus.ACTIVE,
-            Mailbox.client_id.is_not(None),
-            Mailbox.refresh_token_ciphertext.is_not(None),
+            Mailbox.provider_type == provider_type,
             ~active_lease_exists,
             ~active_claim_exists,
         )
-        if mode == LeaseMode.MAIL_READ:
+        if provider_type == DEFAULT_PROVIDER_TYPE:
+            mailbox_query = mailbox_query.where(
+                Mailbox.client_id.is_not(None),
+                Mailbox.refresh_token_ciphertext.is_not(None),
+            )
+        if mode == LeaseMode.MAIL_READ and provider_type == DEFAULT_PROVIDER_TYPE:
             # Only hand out mailboxes with a proven mail channel; skip unprobed/unknown/unusable.
             mailbox_query = mailbox_query.where(
                 Mailbox.capability.in_((MailboxCapability.IMAP, MailboxCapability.GRAPH))
@@ -277,6 +504,18 @@ class LeaseService:
                     )
                 )
                 mailbox_query = mailbox_query.where(~mailbox_used_for_site)
+        if mode == LeaseMode.MAIL_READ and provider_type == "smsbower_gmail":
+            # Resource must be available and ready; releasing/cooldown/unknown excluded.
+            available_resource = exists(
+                select(MailboxProviderResource.mailbox_id).where(
+                    MailboxProviderResource.mailbox_id == Mailbox.id,
+                    MailboxProviderResource.provider_type == "smsbower_gmail",
+                    MailboxProviderResource.lifecycle_state
+                    == ProviderResourceLifecycle.AVAILABLE.value,
+                    MailboxProviderResource.readiness == ProviderResourceReadiness.READY.value,
+                )
+            )
+            mailbox_query = mailbox_query.where(available_resource)
         normalized_preferred_email = preferred_email.strip().lower() if preferred_email else None
         if normalized_preferred_email:
             mailbox_query = mailbox_query.where(Mailbox.primary_email == normalized_preferred_email)
@@ -317,6 +556,26 @@ class LeaseService:
         # Sink recently handed-out mailboxes so the next acquire prefers a colder box (round-robin).
         mailbox.updated_at = current_time
 
+        provider_instance_id = None
+        provider_resource = None
+        if provider_type == "smsbower_gmail":
+            provider_resource = self._session.scalar(
+                select(MailboxProviderResource)
+                .where(MailboxProviderResource.mailbox_id == mailbox.id)
+                .with_for_update()
+            )
+            if (
+                provider_resource is None
+                or provider_resource.lifecycle_state != ProviderResourceLifecycle.AVAILABLE.value
+                or provider_resource.readiness != ProviderResourceReadiness.READY.value
+            ):
+                raise LeaseUnavailableError("没有可用邮箱")
+            provider_instance_id = provider_resource.provider_instance_id
+            provider_resource.lifecycle_state = ProviderResourceLifecycle.CLAIMED.value
+            provider_resource.resource_generation = int(provider_resource.resource_generation or 0) + 1
+            provider_resource.state_version = int(provider_resource.state_version or 0) + 1
+            provider_resource.updated_at = current_time
+
         lease = Lease(
             mailbox_id=mailbox.id,
             client_key_id=principal.client_key_id,
@@ -324,6 +583,9 @@ class LeaseService:
             purpose=purpose,
             allocated_email=allocated_email,
             mode=mode,
+            provider_type=mailbox.provider_type or provider_type or DEFAULT_PROVIDER_TYPE,
+            provider_instance_id=provider_instance_id,
+            provider_config_revision=None,
             expires_at=current_time + timedelta(seconds=ttl_seconds),
             created_at=current_time,
         )
@@ -355,19 +617,25 @@ class LeaseService:
             "allocated_email": allocated_email,
             "address_kind": address_kind,
             "usage_site": resolved_usage_site,
+            "provider_type": lease.provider_type,
+            "provider_instance_id": lease.provider_instance_id,
             "mode": lease.mode,
             "expires_at": lease.expires_at,
             "created_at": lease.created_at,
         }
         if mode == LeaseMode.ACCESS_TOKEN:
-            access_token_result = self._access_token_service.ensure_access_token(mailbox.id)
-            result = LeaseAcquireResult(
-                **result_arguments,
-                access_token=access_token_result.access_token,
-                access_token_expires_at=access_token_result.expires_at,
-                access_token_refreshed=access_token_result.refreshed,
-                token_version=access_token_result.token_version,
-            )
+            if defer_access_token:
+                # Caller obtains AT after this transaction commits / releases row locks.
+                result = LeaseAcquireResult(**result_arguments)
+            else:
+                access_token_result = self._access_token_service.ensure_access_token(mailbox.id)
+                result = LeaseAcquireResult(
+                    **result_arguments,
+                    access_token=access_token_result.access_token,
+                    access_token_expires_at=access_token_result.expires_at,
+                    access_token_refreshed=access_token_result.refreshed,
+                    token_version=access_token_result.token_version,
+                )
         elif mode == LeaseMode.REFRESH_TOKEN:
             result = LeaseAcquireResult(
                 **result_arguments,
@@ -503,6 +771,9 @@ class LeaseService:
             purpose=purpose,
             allocated_email=allocated_email,
             mode=LeaseMode.MAIL_READ,
+            provider_type=mailbox.provider_type or "microsoft",
+            provider_instance_id=None,
+            provider_config_revision=None,
             expires_at=current_time + timedelta(seconds=ttl_seconds),
             created_at=current_time,
         )
@@ -536,10 +807,189 @@ class LeaseService:
     def release_lease(self, principal: ClientPrincipal, lease_id: str) -> LeaseReleaseResult:
         """Release an owned lease idempotently without deleting its audit trail."""
         principal.require_scope("leases:release")
-        lease = self._load_owned_lease(principal, lease_id, require_active=False)
+        return self._release_lease_internal(principal, lease_id)
+
+    def _acquire_on_demand_mail_read_lease(
+        self,
+        principal: ClientPrincipal,
+        *,
+        provider_type: str,
+        ttl_seconds: int,
+        client_tag: str | None,
+        purpose: str | None,
+        usage_site: str | None,
+    ) -> LeaseAcquireResult:
+        """Provision externally (no DB locks), then create ephemeral mailbox + lease."""
+        import json
+        import uuid
+
+        from mailbox_service.providers.ondemand_adapters import OnDemandProviderError
+        from mailbox_service.providers.ports import OnDemandProvisionRequest
+
+        provision_hook = _ON_DEMAND_PROVISION_HOOK
+        if provision_hook is None:
+            raise ProviderNotConfiguredError(f"provider {provider_type} is not configured")
+        try:
+            provision_result = provision_hook(
+                OnDemandProvisionRequest(
+                    provider_type=provider_type,
+                    provider_instance_id="default",
+                )
+            )
+        except OnDemandProviderError as error:
+            message = str(error)
+            if "not enabled" in message or "missing required" in message or "not configured" in message:
+                raise ProviderNotConfiguredError(message) from error
+            raise LeaseUnavailableError(message) from error
+        except Exception as error:
+            raise LeaseUnavailableError(str(error)) from error
+
+        address = str(provision_result.address or "").strip().lower()
+        if not address or "@" not in address:
+            raise LeaseUnavailableError("on-demand provider returned invalid address")
+
+        current_time = utc_now()
+        mailbox_id = str(uuid.uuid4())
+        encrypted_secret = self._credential_cipher.encrypt(
+            json.dumps(provision_result.secret_payload or {}, ensure_ascii=False)
+        )
+        mailbox = Mailbox(
+            id=mailbox_id,
+            provider_type=provider_type,
+            primary_email=address,
+            status=MailboxStatus.ACTIVE,
+            provider_config_json=provision_result.metadata or None,
+        )
+        resource = MailboxProviderResource(
+            mailbox_id=mailbox_id,
+            provider_type=provider_type,
+            provider_instance_id=getattr(provision_result, "instance_id", None)
+            or "default",
+            external_resource_id=str(provision_result.external_resource_id or address),
+            lifecycle_state=ProviderResourceLifecycle.CLAIMED.value,
+            readiness=ProviderResourceReadiness.READY.value,
+            state_version=1,
+            resource_generation=1,
+            encrypted_secret=encrypted_secret,
+            metadata_json=provision_result.metadata,
+        )
+        # Prefer instance id from runtime if secret carries it.
+        instance_id = "default"
+        if isinstance(provision_result.secret_payload, dict):
+            instance_id = str(provision_result.secret_payload.get("instance_id") or instance_id)
+        resource.provider_instance_id = instance_id
+
+        lease = Lease(
+            mailbox_id=mailbox_id,
+            client_key_id=principal.client_key_id,
+            client_tag=client_tag,
+            purpose=purpose,
+            allocated_email=address,
+            mode=LeaseMode.MAIL_READ,
+            provider_type=provider_type,
+            provider_instance_id=instance_id,
+            provider_config_revision=None,
+            expires_at=current_time + timedelta(seconds=ttl_seconds),
+            created_at=current_time,
+        )
+        try:
+            self._session.add(mailbox)
+            self._session.flush()
+            self._session.add(resource)
+            self._session.add(lease)
+            self._session.flush()
+            self._upsert_lease_claim(lease, allocated_email=address)
+        except IntegrityError as error:
+            self._session.rollback()
+            raise LeaseUnavailableError("on-demand mailbox conflict; retry") from error
+
+        if usage_site:
+            try:
+                resolved_site = self._resolve_enabled_usage_site(usage_site)
+                self._record_email_site_usage(
+                    principal=principal,
+                    allocated_email=address,
+                    usage_site_code=resolved_site,
+                    mailbox_id=mailbox_id,
+                    lease_id=lease.id,
+                )
+            except Exception:
+                # usage_site is optional for on-demand; ignore invalid site after provision.
+                pass
+
+        self._write_audit_log(
+            principal,
+            "lease.acquired",
+            lease.id,
+            {
+                "mailbox_id": mailbox_id,
+                "mode": LeaseMode.MAIL_READ.value,
+                "provider_type": provider_type,
+                "allocated_email": address,
+                "expires_at": lease.expires_at.isoformat(),
+            },
+        )
+        return LeaseAcquireResult(
+            lease_id=lease.id,
+            mailbox_id=mailbox_id,
+            primary_email=address,
+            allocated_email=address,
+            address_kind="primary",
+            usage_site=usage_site,
+            provider_type=provider_type,
+            provider_instance_id=instance_id,
+            mode=LeaseMode.MAIL_READ,
+            expires_at=lease.expires_at,
+            created_at=lease.created_at,
+        )
+
+    def _release_lease_internal(
+        self,
+        principal: ClientPrincipal,
+        lease_id: str,
+    ) -> LeaseReleaseResult:
+        """Mailbox-first release used by public release and ACCESS_TOKEN compensate paths."""
+        lease = self._load_owned_lease_mailbox_first(
+            principal,
+            lease_id,
+            require_active=False,
+        )
         if lease.released_at is None:
             lease.released_at = utc_now()
             self._delete_lease_claim_for_lease(lease)
+            provider_type = lease.provider_type or DEFAULT_PROVIDER_TYPE
+            # SMSBower: local released_at ends client auth only; remote setStatus is async finalize.
+            if provider_type == "smsbower_gmail":
+                resource = self._session.get(MailboxProviderResource, lease.mailbox_id)
+                if resource is not None and resource.lifecycle_state in (
+                    ProviderResourceLifecycle.CLAIMED.value,
+                    ProviderResourceLifecycle.AVAILABLE.value,
+                ):
+                    from mailbox_service.provider_operation_service import ProviderOperationService
+
+                    ProviderOperationService(self._session).begin_release_operation(
+                        lease_id=lease.id,
+                        mailbox_id=lease.mailbox_id,
+                        provider_type=lease.provider_type or "smsbower_gmail",
+                        provider_instance_id=lease.provider_instance_id
+                        or resource.provider_instance_id,
+                        external_resource_id=resource.external_resource_id,
+                        resource_generation=int(resource.resource_generation or 0),
+                        expected_state_version=int(resource.state_version or 0),
+                        principal_id=principal.client_key_id,
+                    )
+            elif provider_type in ON_DEMAND_PROVIDER_TYPES:
+                resource = self._session.get(MailboxProviderResource, lease.mailbox_id)
+                if resource is not None:
+                    resource.lifecycle_state = ProviderResourceLifecycle.RETIRED.value
+                    resource.readiness = ProviderResourceReadiness.NOT_READY.value
+                    resource.state_version = int(resource.state_version or 0) + 1
+                    resource.encrypted_secret = None
+                    resource.updated_at = utc_now()
+                mailbox = self._session.get(Mailbox, lease.mailbox_id)
+                if mailbox is not None:
+                    mailbox.status = MailboxStatus.DISABLED
+                    mailbox.updated_at = utc_now()
             self._write_audit_log(principal, "lease.released", lease.id, {"mailbox_id": lease.mailbox_id})
             self._session.flush()
         return LeaseReleaseResult(
@@ -547,10 +997,12 @@ class LeaseService:
             released_at=self._as_utc(lease.released_at),
         )
 
+
     def get_access_token(self, principal: ClientPrincipal, lease_id: str) -> MailboxAccessTokenResult:
         """Return a cached or refreshed Access Token for an owned active AT lease."""
         principal.require_scope("tokens:access:read")
-        lease = self._load_owned_lease(principal, lease_id, require_active=True)
+        # Do not hold Lease FOR UPDATE across OAuth/network inside ensure_access_token.
+        lease = self._load_owned_lease(principal, lease_id, require_active=True, for_update=False)
         if lease.mode != LeaseMode.ACCESS_TOKEN:
             raise LeaseModeError("该租约不是 access_token mode")
         mailbox = self._session.get(Mailbox, lease.mailbox_id)
@@ -593,11 +1045,16 @@ class LeaseService:
     ) -> RefreshTokenUpdateResult:
         """CAS-update the Refresh Token for an owned active RT lease."""
         principal.require_scope("tokens:refresh:write")
-        lease = self._load_owned_lease(principal, lease_id, require_active=True)
+        # Lock order: Mailbox -> Lease (never Lease -> Mailbox).
+        lease = self._load_owned_lease_mailbox_first(
+            principal,
+            lease_id,
+            require_active=True,
+        )
         if lease.mode != LeaseMode.REFRESH_TOKEN:
             raise LeaseModeError("该租约不是 refresh_token mode")
 
-        mailbox = self._session.scalar(select(Mailbox).where(Mailbox.id == lease.mailbox_id).with_for_update())
+        mailbox = self._session.get(Mailbox, lease.mailbox_id)
         if mailbox is None or mailbox.status != MailboxStatus.ACTIVE:
             raise LeaseInactiveError("租约邮箱当前不可用")
         if mailbox.token_version != expected_token_version:
@@ -663,6 +1120,58 @@ class LeaseService:
             lease_query = lease_query.with_for_update()
         lease = self._session.scalar(lease_query)
         if lease is None:
+            raise LeaseNotFoundError("租约不存在")
+        if require_active and (lease.released_at is not None or self._is_expired(lease.expires_at)):
+            raise LeaseInactiveError("租约已释放或已过期")
+        return lease
+
+    def _load_owned_lease_mailbox_first(
+        self,
+        principal: ClientPrincipal,
+        lease_id: str,
+        *,
+        require_active: bool,
+    ) -> Lease:
+        """Resolve lease ownership using Mailbox -> claim -> Lease lock order.
+
+        1. Unlocked peek of ``mailbox_id`` for routing
+        2. ``FOR UPDATE`` Mailbox
+        3. ``FOR UPDATE`` Lease and re-validate owner / active state
+        """
+        lease_preview = self._session.scalar(
+            select(Lease).where(
+                Lease.id == lease_id,
+                Lease.client_key_id == principal.client_key_id,
+            )
+        )
+        if lease_preview is None:
+            raise LeaseNotFoundError("租约不存在")
+        mailbox_id = lease_preview.mailbox_id
+
+        mailbox = self._session.scalar(
+            select(Mailbox).where(Mailbox.id == mailbox_id).with_for_update()
+        )
+        if mailbox is None:
+            raise LeaseNotFoundError("租约不存在")
+
+        # Optional: lock claim row after mailbox when present (same mailbox_id PK).
+        _claim = self._session.scalar(
+            select(MailboxLeaseClaim)
+            .where(MailboxLeaseClaim.mailbox_id == mailbox_id)
+            .with_for_update()
+        )
+
+        lease = self._session.scalar(
+            select(Lease)
+            .where(
+                Lease.id == lease_id,
+                Lease.client_key_id == principal.client_key_id,
+            )
+            .with_for_update()
+        )
+        if lease is None:
+            raise LeaseNotFoundError("租约不存在")
+        if lease.mailbox_id != mailbox_id:
             raise LeaseNotFoundError("租约不存在")
         if require_active and (lease.released_at is not None or self._is_expired(lease.expires_at)):
             raise LeaseInactiveError("租约已释放或已过期")
@@ -1219,3 +1728,9 @@ def hmac_compare(current_value: str, candidate_value: str) -> bool:
     import hmac
 
     return hmac.compare_digest(current_value, candidate_value)
+
+def set_on_demand_provision_hook(hook) -> None:
+    """Install process-wide on-demand provision callable used by LeaseService."""
+    global _ON_DEMAND_PROVISION_HOOK
+    _ON_DEMAND_PROVISION_HOOK = hook
+

@@ -401,7 +401,7 @@ class ClientKeyCreateRequest(BaseModel):
             "权限列表，可选："
             "leases:acquire、leases:release、tokens:access:read、"
             "tokens:refresh:read、tokens:refresh:write、"
-            "mailboxes:acquire、mailboxes:reacquire、mail:verification-code:read。"
+            "mailboxes:acquire、mailboxes:reacquire、mail:verification-code:read、providers:smsbower_gmail:acquire。"
         ),
     )
     expires_at: datetime | None = Field(default=None, description="过期时间（UTC）；为空表示不过期。")
@@ -457,16 +457,28 @@ class LeaseAcquireRequest(BaseModel):
         max_length=320,
         description="优先领取的邮箱地址；不传则由服务分配可用邮箱。",
     )
+    provider: str | None = Field(
+        default=None,
+        max_length=64,
+        description="本轮仅允许省略或 microsoft；其他 provider 请使用 mailboxes/acquire。",
+    )
     client_tag: str | None = Field(default=None, max_length=100, description="调用方自定义标签，便于排查。")
     purpose: str | None = Field(default=None, max_length=100, description="领取用途说明。")
 
-    @field_validator("preferred_email", "client_tag", "purpose")
+    @field_validator("preferred_email", "client_tag", "purpose", "provider")
     @classmethod
     def normalize_optional_lease_text(cls, value: str | None) -> str | None:
         if value is None:
             return None
         normalized_value = value.strip()
         return normalized_value or None
+
+    @field_validator("provider")
+    @classmethod
+    def normalize_lease_provider(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return value.strip().lower() or None
 
 
 class MailboxAcquireRequest(BaseModel):
@@ -483,11 +495,20 @@ class MailboxAcquireRequest(BaseModel):
         max_length=320,
         description="优先领取的主邮箱地址；不传则由服务分配可用邮箱。",
     )
+    provider: str | None = Field(
+        default=None,
+        max_length=64,
+        description=(
+            "可选 provider_type。省略时仅领取 microsoft；"
+            "显式 smsbower_gmail 需要 Client Key 具备 providers:smsbower_gmail:acquire。"
+        ),
+    )
     use_plus_alias: bool = Field(
         default=False,
         description=(
             "为 true 时为本租约生成主邮箱的 plus alias（如 user+xxxxxxxx@domain），"
             "后续取验证码默认按该别名匹配收件人；OAuth/IMAP 仍使用主邮箱。"
+            "仅 microsoft 支持；SMSBower 本轮不支持。"
         ),
     )
     alias_suffix: str | None = Field(
@@ -503,13 +524,13 @@ class MailboxAcquireRequest(BaseModel):
         max_length=64,
         description=(
             "注册站点白名单 code（如 openai、grok）。"
-            "使用主邮箱时必填；使用 plus alias 时选填，填了才写入占用并参与后续排除。"
+            "使用主邮箱时必填（microsoft）；使用 plus alias 时选填，填了才写入占用并参与后续排除。"
         ),
     )
     client_tag: str | None = Field(default=None, max_length=100, description="调用方自定义标签，便于排查。")
     purpose: str | None = Field(default=None, max_length=100, description="领取用途说明。")
 
-    @field_validator("preferred_email", "client_tag", "purpose", "alias_suffix", "usage_site")
+    @field_validator("preferred_email", "client_tag", "purpose", "alias_suffix", "usage_site", "provider")
     @classmethod
     def normalize_optional_mailbox_acquire_text(cls, value: str | None) -> str | None:
         if value is None:
@@ -517,7 +538,7 @@ class MailboxAcquireRequest(BaseModel):
         normalized_value = value.strip()
         return normalized_value or None
 
-    @field_validator("usage_site")
+    @field_validator("usage_site", "provider")
     @classmethod
     def normalize_usage_site_code(cls, value: str | None) -> str | None:
         if value is None:
@@ -542,12 +563,132 @@ class MailboxAcquireResponse(BaseModel):
         default=None,
         description="本租约声明的注册站点 code；未声明时为空。",
     )
+    provider: str | None = Field(
+        default=None,
+        description="实际领取的 provider_type；省略 provider 的 legacy 请求可不返回该字段。",
+    )
     mode: Literal[LeaseMode.MAIL_READ] = Field(
         default=LeaseMode.MAIL_READ,
         description="固定为 mail_read，不返回 access_token / refresh_token。",
     )
     expires_at: datetime = Field(description="租约到期时间。")
     created_at: datetime = Field(description="租约创建时间。")
+
+
+class SmsbowerReplenishResponse(BaseModel):
+    """Admin SMSBower 补货结果（无 secret）。"""
+
+    operation_id: str = Field(description="durable operation ID")
+    status: str = Field(description="succeeded | failed | unknown")
+    mailbox_id: str | None = Field(default=None, description="写入库存的 mailbox ID")
+    primary_email: str | None = Field(default=None, description="租到的邮箱地址")
+    external_resource_id: str | None = Field(default=None, description="上游 activation / mailId")
+    error_class: str | None = Field(default=None, description="失败分类（无敏感信息）")
+
+
+class ProviderFieldSchemaResponse(BaseModel):
+    """管理台表单字段元数据。"""
+
+    key: str
+    label: str
+    field_type: str
+    required: bool = False
+    secret: bool = False
+    description: str = ""
+    default: object | None = None
+    placeholder: str = ""
+
+
+class ProviderCatalogItemResponse(BaseModel):
+    """管理台 Provider 能力目录条目。"""
+
+    provider_type: str = Field(description="provider_type 稳定键。")
+    display_name: str = Field(description="展示名称。")
+    supply_mode: str = Field(description="供给方式：inventory_import / inventory_replenish / on_demand。")
+    supported_modes: list[str] = Field(description="支持的租约/能力模式。")
+    configurable_in_ui: bool = Field(description="是否可在本页配置实例参数。")
+    enabled: bool | None = Field(default=None, description="是否启用（可配置 Provider）。")
+    has_api_key: bool | None = Field(default=None, description="是否已配置密钥（不回显明文）。")
+    instance_id: str | None = Field(default=None, description="实例 ID。")
+    source: str | None = Field(default=None, description="配置来源：database / environment。")
+    notes: str | None = Field(default=None, description="运维说明。")
+    fields: list[ProviderFieldSchemaResponse] | None = Field(
+        default=None, description="可配置字段 schema。"
+    )
+
+
+class ProviderCatalogResponse(BaseModel):
+    """管理台已注册 Provider 列表。"""
+
+    items: list[ProviderCatalogItemResponse] = Field(description="Provider 目录。")
+
+
+class ProviderInstanceSettingsResponse(BaseModel):
+    """通用 Provider 实例配置（不含密钥明文）。"""
+
+    provider_type: str
+    instance_id: str
+    enabled: bool
+    source: str
+    has_any_secret: bool
+    secret_flags: dict[str, bool] = Field(default_factory=dict)
+    values: dict[str, object] = Field(default_factory=dict)
+    request_timeout_seconds: float | None = None
+    updated_at: datetime | None = None
+    fields: list[ProviderFieldSchemaResponse] | None = None
+
+
+class ProviderInstanceSettingsUpdate(BaseModel):
+    """更新通用 Provider 实例；secrets 写入后不回显。"""
+
+    enabled: bool | None = None
+    values: dict[str, object] | None = None
+    secrets: dict[str, str] | None = None
+    clear_secrets: list[str] | None = None
+
+
+class SmsbowerSettingsResponse(BaseModel):
+    """SMSBower 实例配置（不含 API Key 明文）。"""
+
+    provider_type: str = Field(description="固定为 smsbower_gmail。")
+    instance_id: str = Field(description="实例 ID。")
+    enabled: bool = Field(description="是否启用补货与领取。")
+    api_base: str = Field(description="API 基址。")
+    service: str = Field(description="业务 service 名（如 openai → 上游 dr）。")
+    domain: str = Field(description="邮箱域名，如 gmail.com。")
+    max_price: float | None = Field(default=None, description="最高价格；空表示不限制。")
+    request_timeout_seconds: float = Field(description="上游请求超时（秒）。")
+    has_api_key: bool = Field(description="是否已配置 API Key。")
+    source: str = Field(description="当前生效配置来源：database 或 environment。")
+    env_enabled_default: bool = Field(description="环境变量 SMSBOWER_ENABLED 的默认值。")
+    updated_at: datetime | None = Field(default=None, description="数据库行最近更新时间。")
+
+
+class SmsbowerSettingsUpdate(BaseModel):
+    """更新 SMSBower 实例配置；未传字段保持不变。"""
+
+    enabled: bool | None = Field(default=None, description="是否启用。")
+    api_base: str | None = Field(default=None, max_length=512, description="API 基址。")
+    service: str | None = Field(default=None, max_length=64, description="业务 service 名。")
+    domain: str | None = Field(default=None, max_length=255, description="邮箱域名。")
+    max_price: float | None = Field(default=None, ge=0, description="最高价格；配合 clear_max_price。")
+    clear_max_price: bool = Field(default=False, description="为 true 时清空最高价格限制。")
+    request_timeout_seconds: float | None = Field(
+        default=None, gt=0, le=120, description="上游请求超时（秒）。"
+    )
+    api_key: str | None = Field(
+        default=None,
+        max_length=4096,
+        description="新的 API Key；不传则保留原密钥；传空字符串可清空。",
+    )
+    clear_api_key: bool = Field(default=False, description="为 true 时删除已保存的 API Key。")
+
+    @field_validator("api_base", "service", "domain")
+    @classmethod
+    def normalize_optional_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return value.strip() or None
 
 
 class UsageSiteItemResponse(BaseModel):

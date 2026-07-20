@@ -25,7 +25,7 @@ import {
 
 type ProxyStatus = "healthy" | "cooldown" | "unknown";
 type ProxyProtocol = "http_connect" | "socks5";
-type NavigationSection = "dashboard" | "mailboxes" | "leases" | "usage-sites" | "email-site-usages" | "egress-proxies" | "client-keys";
+type NavigationSection = "dashboard" | "mailboxes" | "leases" | "usage-sites" | "email-site-usages" | "egress-proxies" | "providers" | "client-keys";
 
 const LEGACY_ADMIN_TOKEN_STORAGE_KEY = "mailbox-service.admin-token";
 
@@ -54,6 +54,56 @@ const CLIENT_KEY_SCOPE_OPTIONS = [
     id: "mail:verification-code:read",
     label: "读取收件箱验证码",
     description: "mail:verification-code:read",
+  },
+  {
+    id: "providers:smsbower_gmail:acquire",
+    label: "领取 SMSBower Gmail",
+    description: "providers:smsbower_gmail:acquire",
+  },
+  {
+    id: "providers:cloudflare_temp_email:acquire",
+    label: "领取 Cloudflare Temp Email",
+    description: "providers:cloudflare_temp_email:acquire",
+  },
+  {
+    id: "providers:ddg_mail:acquire",
+    label: "领取 DDG Mail",
+    description: "providers:ddg_mail:acquire",
+  },
+  {
+    id: "providers:cloudmail_gen:acquire",
+    label: "领取 CloudMail Gen",
+    description: "providers:cloudmail_gen:acquire",
+  },
+  {
+    id: "providers:tempmail_lol:acquire",
+    label: "领取 TempMail.lol",
+    description: "providers:tempmail_lol:acquire",
+  },
+  {
+    id: "providers:duckmail:acquire",
+    label: "领取 DuckMail",
+    description: "providers:duckmail:acquire",
+  },
+  {
+    id: "providers:gptmail:acquire",
+    label: "领取 GPTMail",
+    description: "providers:gptmail:acquire",
+  },
+  {
+    id: "providers:moemail:acquire",
+    label: "领取 MoeMail",
+    description: "providers:moemail:acquire",
+  },
+  {
+    id: "providers:inbucket:acquire",
+    label: "领取 Inbucket",
+    description: "providers:inbucket:acquire",
+  },
+  {
+    id: "providers:yyds_mail:acquire",
+    label: "领取 YYDS Mail",
+    description: "providers:yyds_mail:acquire",
   },
 ] as const;
 
@@ -127,6 +177,59 @@ interface ConnectivityResult {
   successful: boolean;
   error_code?: string;
   error_summary?: string;
+}
+
+interface ProviderFieldSchema {
+  key: string;
+  label: string;
+  field_type: string;
+  required?: boolean;
+  secret?: boolean;
+  description?: string;
+  default?: unknown;
+  placeholder?: string;
+}
+
+interface ProviderCatalogItem {
+  provider_type: string;
+  display_name: string;
+  supply_mode: string;
+  supported_modes: string[];
+  configurable_in_ui: boolean;
+  enabled?: boolean | null;
+  has_api_key?: boolean | null;
+  instance_id?: string | null;
+  source?: string | null;
+  notes?: string | null;
+  fields?: ProviderFieldSchema[] | null;
+}
+
+interface ProviderInstanceSettings {
+  provider_type: string;
+  instance_id: string;
+  enabled: boolean;
+  source: string;
+  has_any_secret: boolean;
+  secret_flags: Record<string, boolean>;
+  values: Record<string, unknown>;
+  request_timeout_seconds?: number | null;
+  updated_at: string | null;
+  fields?: ProviderFieldSchema[] | null;
+}
+
+interface SmsbowerSettings {
+  provider_type: string;
+  instance_id: string;
+  enabled: boolean;
+  api_base: string;
+  service: string;
+  domain: string;
+  max_price: number | null;
+  request_timeout_seconds: number;
+  has_api_key: boolean;
+  source: string;
+  env_enabled_default: boolean;
+  updated_at: string | null;
 }
 
 interface DashboardSummary {
@@ -1226,6 +1329,648 @@ function SummaryRow({ label, value }: { label: string; value: number }): JSX.Ele
   return <div className="summary-row"><span>{label}</span><strong>{value}</strong></div>;
 }
 
+
+function providerStatusBadge(item: ProviderCatalogItem): { className: string; label: string } {
+  if (!item.configurable_in_ui) {
+    return { className: "badge badge-unknown", label: "导入维护" };
+  }
+  if (!item.enabled) {
+    return { className: "badge badge-disabled", label: "未启用" };
+  }
+  if (item.has_api_key) {
+    return { className: "badge badge-enabled", label: "已启用 · 密钥已配置" };
+  }
+  return { className: "badge badge-cooldown", label: "已启用 · 缺密钥" };
+}
+
+function supplyModeLabel(supplyMode: string): string {
+  if (supplyMode === "inventory_import") {
+    return "库存导入";
+  }
+  if (supplyMode === "inventory_replenish") {
+    return "库存补货";
+  }
+  if (supplyMode === "on_demand") {
+    return "即时开箱";
+  }
+  return supplyMode;
+}
+
+function ProvidersPage({
+  catalog,
+  smsbower,
+  apiKeyDraft,
+  isSaving,
+  isReplenishing,
+  adminToken,
+  onApiKeyDraftChange,
+  onRefresh,
+  onToggleEnabled,
+  onSaveBasics,
+  onSaveApiKey,
+  onClearApiKey,
+  onReplenish,
+  onError,
+  onNotice,
+}: {
+  catalog: ProviderCatalogItem[];
+  smsbower: SmsbowerSettings | null;
+  apiKeyDraft: string;
+  isSaving: boolean;
+  isReplenishing: boolean;
+  adminToken: string;
+  onApiKeyDraftChange: (value: string) => void;
+  onRefresh: () => void;
+  onToggleEnabled: (enabled: boolean) => void;
+  onSaveBasics: (fields: {
+    api_base?: string;
+    service?: string;
+    domain?: string;
+    max_price?: number | null;
+    clear_max_price?: boolean;
+    request_timeout_seconds?: number;
+  }) => void;
+  onSaveApiKey: () => void;
+  onClearApiKey: () => void;
+  onReplenish: () => void;
+  onError: (message: string) => void;
+  onNotice: (message: string) => void;
+}): JSX.Element {
+  const [apiBaseDraft, setApiBaseDraft] = useState(smsbower?.api_base ?? "");
+  const [serviceDraft, setServiceDraft] = useState(smsbower?.service ?? "openai");
+  const [domainDraft, setDomainDraft] = useState(smsbower?.domain ?? "gmail.com");
+  const [maxPriceDraft, setMaxPriceDraft] = useState(
+    smsbower?.max_price != null ? String(smsbower.max_price) : "",
+  );
+  const [timeoutDraft, setTimeoutDraft] = useState(
+    String(smsbower?.request_timeout_seconds ?? 30),
+  );
+  const [selectedProviderType, setSelectedProviderType] = useState<string>("smsbower_gmail");
+  const [instanceSettings, setInstanceSettings] = useState<ProviderInstanceSettings | null>(null);
+  const [valueDrafts, setValueDrafts] = useState<Record<string, string>>({});
+  const [secretDrafts, setSecretDrafts] = useState<Record<string, string>>({});
+  const [isSavingGeneric, setIsSavingGeneric] = useState(false);
+  const [isLoadingInstance, setIsLoadingInstance] = useState(false);
+  const [enabledDraft, setEnabledDraft] = useState(false);
+
+  const configurableProviders = useMemo(
+    () => catalog.filter((item) => item.configurable_in_ui),
+    [catalog],
+  );
+  const selectedCatalogItem = catalog.find((item) => item.provider_type === selectedProviderType) ?? null;
+  const isSmsbowerSelected = selectedProviderType === "smsbower_gmail";
+
+  const enabledCount = catalog.filter((item) => item.enabled).length;
+  const missingKeyCount = catalog.filter(
+    (item) => item.configurable_in_ui && item.enabled && !item.has_api_key,
+  ).length;
+  const onDemandCount = catalog.filter((item) => item.supply_mode === "on_demand").length;
+
+  useEffect(() => {
+    if (!smsbower) {
+      return;
+    }
+    setApiBaseDraft(smsbower.api_base);
+    setServiceDraft(smsbower.service);
+    setDomainDraft(smsbower.domain);
+    setMaxPriceDraft(smsbower.max_price != null ? String(smsbower.max_price) : "");
+    setTimeoutDraft(String(smsbower.request_timeout_seconds));
+  }, [smsbower]);
+
+  useEffect(() => {
+    if (selectedProviderType) {
+      return;
+    }
+    if (configurableProviders.length > 0) {
+      setSelectedProviderType(configurableProviders[0].provider_type);
+    }
+  }, [configurableProviders, selectedProviderType]);
+
+  useEffect(() => {
+    if (!selectedProviderType || !adminToken || isSmsbowerSelected) {
+      setInstanceSettings(null);
+      return;
+    }
+    const catalogItem = catalog.find((item) => item.provider_type === selectedProviderType);
+    const instanceId = catalogItem?.instance_id || "default";
+    let cancelled = false;
+    setIsLoadingInstance(true);
+    void (async () => {
+      try {
+        const view = await requestApi<ProviderInstanceSettings>(
+          adminToken,
+          `/api/v1/admin/providers/${selectedProviderType}/instances/${instanceId}`,
+        );
+        if (cancelled) {
+          return;
+        }
+        setInstanceSettings(view);
+        setEnabledDraft(view.enabled);
+        const nextValues: Record<string, string> = {};
+        for (const [key, value] of Object.entries(view.values || {})) {
+          if (Array.isArray(value)) {
+            nextValues[key] = value.join("\n");
+          } else if (value == null) {
+            nextValues[key] = "";
+          } else if (typeof value === "boolean") {
+            nextValues[key] = value ? "true" : "false";
+          } else {
+            nextValues[key] = String(value);
+          }
+        }
+        setValueDrafts(nextValues);
+        setSecretDrafts({});
+      } catch (error) {
+        if (!cancelled) {
+          onError(error instanceof Error ? error.message : "无法加载 Provider 实例配置。");
+        }
+      } finally {
+        if (!cancelled) {
+          setIsLoadingInstance(false);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [adminToken, catalog, isSmsbowerSelected, onError, selectedProviderType]);
+
+  async function saveGenericProvider(): Promise<void> {
+    if (!selectedProviderType || !instanceSettings || isSmsbowerSelected) {
+      return;
+    }
+    const fields =
+      instanceSettings.fields ||
+      catalog.find((item) => item.provider_type === selectedProviderType)?.fields ||
+      [];
+    const values: Record<string, unknown> = {};
+    const secrets: Record<string, string> = {};
+    for (const field of fields) {
+      if (field.secret) {
+        const draft = (secretDrafts[field.key] || "").trim();
+        if (draft) {
+          secrets[field.key] = draft;
+        }
+        continue;
+      }
+      if (!(field.key in valueDrafts)) {
+        continue;
+      }
+      const raw = valueDrafts[field.key];
+      if (field.field_type === "string_list") {
+        values[field.key] = raw
+          .split(/[\n,]/)
+          .map((part) => part.trim())
+          .filter(Boolean);
+      } else if (field.field_type === "boolean") {
+        values[field.key] = raw === "true" || raw === "1" || raw === "on";
+      } else if (field.field_type === "number") {
+        values[field.key] = raw.trim() === "" ? null : Number(raw);
+      } else {
+        values[field.key] = raw;
+      }
+    }
+    try {
+      setIsSavingGeneric(true);
+      const updated = await requestApi<ProviderInstanceSettings>(
+        adminToken,
+        `/api/v1/admin/providers/${selectedProviderType}/instances/${instanceSettings.instance_id}`,
+        {
+          method: "PUT",
+          body: JSON.stringify({
+            enabled: enabledDraft,
+            values,
+            secrets: Object.keys(secrets).length > 0 ? secrets : undefined,
+          }),
+        },
+      );
+      setInstanceSettings(updated);
+      setSecretDrafts({});
+      onNotice(`${selectedCatalogItem?.display_name ?? selectedProviderType} 配置已保存。`);
+      onRefresh();
+    } catch (error) {
+      onError(error instanceof Error ? error.message : "保存 Provider 配置失败。");
+    } finally {
+      setIsSavingGeneric(false);
+    }
+  }
+
+  function renderGenericField(field: ProviderFieldSchema): JSX.Element {
+    if (field.secret) {
+      const hasSecret = Boolean(instanceSettings?.secret_flags?.[field.key]);
+      return (
+        <label key={field.key} className="form-field">
+          <span>
+            {field.label}
+            {field.required ? " *" : ""}
+            <span className="muted-copy"> · {hasSecret ? "已配置，填写则覆盖" : "未配置"}</span>
+          </span>
+          <input
+            className="input"
+            type="password"
+            autoComplete="off"
+            placeholder={hasSecret ? "••••••••" : field.placeholder || ""}
+            value={secretDrafts[field.key] || ""}
+            onChange={(event) =>
+              setSecretDrafts((previous) => ({
+                ...previous,
+                [field.key]: event.target.value,
+              }))
+            }
+          />
+        </label>
+      );
+    }
+    if (field.field_type === "string_list" || field.field_type === "textarea") {
+      return (
+        <label key={field.key} className="form-field full-width">
+          <span>
+            {field.label}
+            {field.required ? " *" : ""}
+          </span>
+          <textarea
+            className="textarea"
+            rows={3}
+            value={valueDrafts[field.key] || ""}
+            placeholder={field.description || field.placeholder || "每行一个，也可用逗号分隔"}
+            onChange={(event) =>
+              setValueDrafts((previous) => ({
+                ...previous,
+                [field.key]: event.target.value,
+              }))
+            }
+          />
+        </label>
+      );
+    }
+    if (field.field_type === "boolean") {
+      const checked = (valueDrafts[field.key] || String(field.default ?? false)) === "true";
+      return (
+        <label key={field.key} className="form-field checkbox-label">
+          <input
+            type="checkbox"
+            checked={checked}
+            onChange={(event) =>
+              setValueDrafts((previous) => ({
+                ...previous,
+                [field.key]: event.target.checked ? "true" : "false",
+              }))
+            }
+          />
+          {field.label}
+        </label>
+      );
+    }
+    return (
+      <label key={field.key} className="form-field">
+        <span>
+          {field.label}
+          {field.required ? " *" : ""}
+        </span>
+        <input
+          className="input"
+          type={field.field_type === "number" ? "number" : "text"}
+          value={valueDrafts[field.key] ?? ""}
+          placeholder={field.placeholder || ""}
+          onChange={(event) =>
+            setValueDrafts((previous) => ({
+              ...previous,
+              [field.key]: event.target.value,
+            }))
+          }
+        />
+      </label>
+    );
+  }
+
+  return (
+    <>
+      <header className="page-header">
+        <div>
+          <h1 className="page-title">邮箱 Provider</h1>
+          <p className="page-subtitle">
+            维护邮箱来源启停与实例参数。Microsoft 通过邮箱导入；其余类型在此配置密钥后，外部调用需显式传 provider 与对应 scope。
+          </p>
+        </div>
+        <div className="page-header-actions">
+          <button className="button" type="button" onClick={onRefresh}>
+            <RefreshCw size={14} /> 刷新
+          </button>
+        </div>
+      </header>
+
+      <section className="metric-grid" aria-label="Provider 指标">
+        <MetricCard label="全部类型" value={catalog.length} />
+        <MetricCard label="已启用" value={enabledCount} />
+        <MetricCard label="缺密钥" value={missingKeyCount} />
+        <MetricCard label="即时开箱" value={onDemandCount} />
+      </section>
+
+      <section className="panel">
+        <div className="section-header">
+          <div>
+            <h2 className="section-title">Provider 目录</h2>
+            <p className="page-subtitle">点击可配置行进入下方编辑区；Microsoft 仅展示状态，凭证走邮箱导入。</p>
+          </div>
+        </div>
+        <div className="table-wrapper">
+          <table>
+            <thead>
+              <tr>
+                <th>类型</th>
+                <th>名称</th>
+                <th>供给</th>
+                <th>模式</th>
+                <th>状态</th>
+                <th>说明</th>
+              </tr>
+            </thead>
+            <tbody>
+              {catalog.map((item) => {
+                const status = providerStatusBadge(item);
+                const isSelected = item.provider_type === selectedProviderType;
+                const isSelectable = item.configurable_in_ui;
+                return (
+                  <tr
+                    key={item.provider_type}
+                    className={isSelected ? "provider-row-selected" : undefined}
+                    onClick={() => {
+                      if (isSelectable) {
+                        setSelectedProviderType(item.provider_type);
+                      }
+                    }}
+                    style={isSelectable ? { cursor: "pointer" } : undefined}
+                  >
+                    <td>
+                      <code className="provider-type-code">{item.provider_type}</code>
+                    </td>
+                    <td>
+                      <strong>{item.display_name}</strong>
+                    </td>
+                    <td>
+                      <span className="badge badge-unknown">{supplyModeLabel(item.supply_mode)}</span>
+                    </td>
+                    <td>
+                      <span className="muted-copy">{item.supported_modes.join(" · ")}</span>
+                    </td>
+                    <td>
+                      <span className={status.className}>{status.label}</span>
+                    </td>
+                    <td>
+                      <span className="muted-copy">{item.notes ?? "—"}</span>
+                    </td>
+                  </tr>
+                );
+              })}
+              {catalog.length === 0 && (
+                <tr>
+                  <td colSpan={6}>
+                    <div className="empty-state">暂无 Provider 数据，请点击右上角刷新。</div>
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section className="panel">
+        <div className="section-header">
+          <div>
+            <h2 className="section-title">实例配置</h2>
+            <p className="page-subtitle">
+              密钥加密保存，页面只显示是否已配置，不回显明文。外部领取需 Client Key 具备{" "}
+              <code>providers:&#123;type&#125;:acquire</code>。
+            </p>
+          </div>
+        </div>
+
+        <div className="form-grid">
+          <label className="form-field">
+            选择 Provider
+            <select
+              className="select"
+              value={selectedProviderType}
+              onChange={(event) => setSelectedProviderType(event.target.value)}
+            >
+              {configurableProviders.map((item) => (
+                <option key={item.provider_type} value={item.provider_type}>
+                  {item.display_name} ({item.provider_type})
+                </option>
+              ))}
+            </select>
+          </label>
+          <div className="form-field">
+            <span>当前实例</span>
+            <div className="provider-instance-meta">
+              <code>{selectedCatalogItem?.instance_id || (isSmsbowerSelected ? smsbower?.instance_id : "default") || "default"}</code>
+              <span className="muted-copy">
+                {isSmsbowerSelected
+                  ? smsbower
+                    ? `来源：${smsbower.source === "database" ? "数据库" : "环境变量"}`
+                    : "加载中…"
+                  : instanceSettings
+                    ? `来源：${instanceSettings.source === "database" ? "数据库" : "默认"}`
+                    : isLoadingInstance
+                      ? "加载中…"
+                      : "—"}
+              </span>
+            </div>
+          </div>
+        </div>
+
+        {isSmsbowerSelected ? (
+          !smsbower ? (
+            <div className="empty-state">正在加载 SMSBower 配置…</div>
+          ) : (
+            <>
+              <div className="form-grid">
+                <label className="form-field checkbox-label">
+                  <input
+                    type="checkbox"
+                    checked={smsbower.enabled}
+                    disabled={isSaving}
+                    onChange={(event) => onToggleEnabled(event.target.checked)}
+                  />
+                  启用 SMSBower（补货与显式领取）
+                </label>
+                <label className="form-field">
+                  Instance ID
+                  <input className="input" value={smsbower.instance_id} readOnly />
+                </label>
+                <label className="form-field">
+                  API Base
+                  <input
+                    className="input"
+                    value={apiBaseDraft}
+                    onChange={(event) => setApiBaseDraft(event.target.value)}
+                    onBlur={() => {
+                      if (apiBaseDraft.trim() && apiBaseDraft.trim() !== smsbower.api_base) {
+                        onSaveBasics({ api_base: apiBaseDraft.trim() });
+                      }
+                    }}
+                  />
+                </label>
+                <label className="form-field">
+                  Service（如 openai）
+                  <input
+                    className="input"
+                    value={serviceDraft}
+                    onChange={(event) => setServiceDraft(event.target.value)}
+                    onBlur={() => {
+                      if (serviceDraft.trim() && serviceDraft.trim() !== smsbower.service) {
+                        onSaveBasics({ service: serviceDraft.trim() });
+                      }
+                    }}
+                  />
+                </label>
+                <label className="form-field">
+                  Domain
+                  <input
+                    className="input"
+                    value={domainDraft}
+                    onChange={(event) => setDomainDraft(event.target.value)}
+                    onBlur={() => {
+                      if (domainDraft.trim() && domainDraft.trim() !== smsbower.domain) {
+                        onSaveBasics({ domain: domainDraft.trim() });
+                      }
+                    }}
+                  />
+                </label>
+                <label className="form-field">
+                  最高价格（空=不限）
+                  <input
+                    className="input"
+                    value={maxPriceDraft}
+                    onChange={(event) => setMaxPriceDraft(event.target.value)}
+                    onBlur={() => {
+                      const raw = maxPriceDraft.trim();
+                      if (!raw) {
+                        if (smsbower.max_price != null) {
+                          onSaveBasics({ clear_max_price: true });
+                        }
+                        return;
+                      }
+                      const parsed = Number(raw);
+                      if (!Number.isFinite(parsed)) {
+                        return;
+                      }
+                      if (parsed !== smsbower.max_price) {
+                        onSaveBasics({ max_price: parsed });
+                      }
+                    }}
+                  />
+                </label>
+                <label className="form-field">
+                  请求超时（秒）
+                  <input
+                    className="input"
+                    type="number"
+                    min={1}
+                    max={120}
+                    value={timeoutDraft}
+                    onChange={(event) => setTimeoutDraft(event.target.value)}
+                    onBlur={() => {
+                      const parsed = Number(timeoutDraft);
+                      if (!Number.isFinite(parsed) || parsed <= 0) {
+                        return;
+                      }
+                      if (parsed !== smsbower.request_timeout_seconds) {
+                        onSaveBasics({ request_timeout_seconds: parsed });
+                      }
+                    }}
+                  />
+                </label>
+                <label className="form-field">
+                  <span>
+                    API Key
+                    <span className="muted-copy">
+                      {" "}
+                      · {smsbower.has_api_key ? "已配置，填写则覆盖" : "未配置"}
+                    </span>
+                  </span>
+                  <input
+                    className="input"
+                    type="password"
+                    autoComplete="off"
+                    placeholder={smsbower.has_api_key ? "••••••••（留空表示不修改）" : "粘贴 SMSBower API Key"}
+                    value={apiKeyDraft}
+                    onChange={(event) => onApiKeyDraftChange(event.target.value)}
+                  />
+                </label>
+              </div>
+              <div className="dialog-actions provider-config-actions">
+                <button className="button" type="button" disabled={isSaving} onClick={onSaveApiKey}>
+                  保存 API Key
+                </button>
+                <button
+                  className="button"
+                  type="button"
+                  disabled={isSaving || !smsbower.has_api_key}
+                  onClick={onClearApiKey}
+                >
+                  清除密钥
+                </button>
+                <button
+                  className="button button-primary"
+                  type="button"
+                  disabled={isReplenishing || !smsbower.enabled || !smsbower.has_api_key}
+                  onClick={onReplenish}
+                >
+                  <Plus size={14} /> {isReplenishing ? "补货中…" : "立即补货 1 个"}
+                </button>
+              </div>
+              <div className="import-format-help">
+                <strong>调用说明</strong>
+                <span>
+                  Client Key 需同时具备 <code>mailboxes:acquire</code> 与{" "}
+                  <code>providers:smsbower_gmail:acquire</code>，并在 acquire 时传{" "}
+                  <code>provider=smsbower_gmail</code>。
+                </span>
+              </div>
+            </>
+          )
+        ) : isLoadingInstance ? (
+          <div className="empty-state">正在加载实例配置…</div>
+        ) : !instanceSettings ? (
+          <div className="empty-state">请选择可配置的 Provider。</div>
+        ) : (
+          <>
+            <div className="form-grid">
+              <label className="form-field checkbox-label">
+                <input
+                  type="checkbox"
+                  checked={enabledDraft}
+                  disabled={isSavingGeneric}
+                  onChange={(event) => setEnabledDraft(event.target.checked)}
+                />
+                启用该 Provider
+              </label>
+              {(instanceSettings.fields || []).map((field) => renderGenericField(field))}
+            </div>
+            <div className="dialog-actions provider-config-actions">
+              <button
+                className="button button-primary"
+                type="button"
+                disabled={isSavingGeneric}
+                onClick={() => void saveGenericProvider()}
+              >
+                {isSavingGeneric ? "保存中…" : "保存配置"}
+              </button>
+            </div>
+            {selectedCatalogItem?.notes ? (
+              <div className="import-format-help">
+                <strong>说明</strong>
+                <span>{selectedCatalogItem.notes}</span>
+              </div>
+            ) : null}
+          </>
+        )}
+      </section>
+    </>
+  );
+}
+
 function ClientKeysPage({
   clientKeys,
   createdApiKey,
@@ -1531,6 +2276,11 @@ function App(): JSX.Element {
   const [isRevokingUsageId, setIsRevokingUsageId] = useState<string | null>(null);
   const [proxies, setProxies] = useState<EgressProxy[]>([]);
   const [policy, setPolicy] = useState<ProxyPolicy | null>(null);
+  const [providerCatalog, setProviderCatalog] = useState<ProviderCatalogItem[]>([]);
+  const [smsbowerSettings, setSmsbowerSettings] = useState<SmsbowerSettings | null>(null);
+  const [smsbowerApiKeyDraft, setSmsbowerApiKeyDraft] = useState("");
+  const [isSavingSmsbower, setIsSavingSmsbower] = useState(false);
+  const [isReplenishingSmsbower, setIsReplenishingSmsbower] = useState(false);
   const [clientKeys, setClientKeys] = useState<ClientKeyListItem[]>([]);
   const [clientKeyFilterText, setClientKeyFilterText] = useState("");
   const [isClientKeyCreateDialogOpen, setIsClientKeyCreateDialogOpen] = useState(false);
@@ -1677,6 +2427,99 @@ function App(): JSX.Element {
     }
   }
 
+
+  async function loadProviders(tokenOverride?: string): Promise<boolean> {
+    const tokenForRequest = resolveAdminToken(tokenOverride);
+    if (!tokenForRequest) {
+      setErrorMessage("输入管理员 Token 后才能读取管理台数据。");
+      return false;
+    }
+    setIsLoading(true);
+    setErrorMessage(null);
+    try {
+      const [catalog, settings] = await Promise.all([
+        requestApi<{ items: ProviderCatalogItem[] }>(tokenForRequest, "/api/v1/admin/providers"),
+        requestApi<SmsbowerSettings>(
+          tokenForRequest,
+          "/api/v1/admin/providers/smsbower_gmail/settings",
+        ),
+      ]);
+      setProviderCatalog(catalog.items);
+      setSmsbowerSettings(settings);
+      return true;
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : "无法加载 Provider 配置。");
+      return false;
+    } finally {
+      setIsLoading(false);
+    }
+  }
+
+  async function updateSmsbowerSettings(
+    changes: Partial<{
+      enabled: boolean;
+      api_base: string;
+      service: string;
+      domain: string;
+      max_price: number | null;
+      clear_max_price: boolean;
+      request_timeout_seconds: number;
+      api_key: string;
+      clear_api_key: boolean;
+    }>,
+  ): Promise<void> {
+    try {
+      setIsSavingSmsbower(true);
+      setErrorMessage(null);
+      const updated = await requestApi<SmsbowerSettings>(
+        adminToken,
+        "/api/v1/admin/providers/smsbower_gmail/settings",
+        {
+          method: "PATCH",
+          body: JSON.stringify(changes),
+        },
+      );
+      setSmsbowerSettings(updated);
+      if (changes.api_key !== undefined || changes.clear_api_key) {
+        setSmsbowerApiKeyDraft("");
+      }
+      setNotice("SMSBower 配置已更新。");
+      void loadProviders();
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : "无法更新 SMSBower 配置。");
+    } finally {
+      setIsSavingSmsbower(false);
+    }
+  }
+
+  async function replenishSmsbower(): Promise<void> {
+    try {
+      setIsReplenishingSmsbower(true);
+      setErrorMessage(null);
+      const result = await requestApi<{
+        operation_id: string;
+        status: string;
+        mailbox_id: string | null;
+        primary_email: string | null;
+        error_class: string | null;
+      }>(adminToken, "/api/v1/admin/providers/smsbower_gmail/replenish", {
+        method: "POST",
+        body: JSON.stringify({}),
+      });
+      if (result.status === "succeeded") {
+        setNotice(`补货成功：${result.primary_email ?? result.mailbox_id ?? result.operation_id}`);
+      } else {
+        setErrorMessage(
+          `补货未成功：status=${result.status}${result.error_class ? ` (${result.error_class})` : ""}`,
+        );
+      }
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : "补货失败。");
+    } finally {
+      setIsReplenishingSmsbower(false);
+    }
+  }
+
   async function loadClientKeys(tokenOverride?: string): Promise<boolean> {
     const tokenForRequest = resolveAdminToken(tokenOverride);
     if (!tokenForRequest) {
@@ -1796,6 +2639,8 @@ function App(): JSX.Element {
         return loadEmailSiteUsages(emailSiteUsagePagination.page, tokenOverride);
       case "egress-proxies":
         return loadEgressProxies(tokenOverride);
+      case "providers":
+        return loadProviders(tokenOverride);
       case "client-keys":
         return loadClientKeys(tokenOverride);
       default: {
@@ -2619,6 +3464,7 @@ function App(): JSX.Element {
           <button className={`navigation-item ${activeNavigationSection === "usage-sites" ? "active" : ""}`} type="button" onClick={() => navigateToSection("usage-sites")} aria-current={activeNavigationSection === "usage-sites" ? "page" : undefined}><Globe2 size={16} /> 注册站点</button>
           <button className={`navigation-item ${activeNavigationSection === "email-site-usages" ? "active" : ""}`} type="button" onClick={() => navigateToSection("email-site-usages")} aria-current={activeNavigationSection === "email-site-usages" ? "page" : undefined}><ListFilter size={16} /> 站点占用</button>
           <button className={`navigation-item ${activeNavigationSection === "egress-proxies" ? "active" : ""}`} type="button" onClick={() => navigateToSection("egress-proxies")} aria-current={activeNavigationSection === "egress-proxies" ? "page" : undefined}><Settings2 size={16} /> 出口代理</button>
+          <button className={`navigation-item ${activeNavigationSection === "providers" ? "active" : ""}`} type="button" onClick={() => navigateToSection("providers")} aria-current={activeNavigationSection === "providers" ? "page" : undefined}><Globe2 size={16} /> 邮箱 Provider</button>
           <button className={`navigation-item ${activeNavigationSection === "client-keys" ? "active" : ""}`} type="button" onClick={() => navigateToSection("client-keys")} aria-current={activeNavigationSection === "client-keys" ? "page" : undefined}><KeyRound size={16} /> Client Key</button>
           <a className="navigation-item" href={`${apiBaseUrl}/redoc`} target="_blank" rel="noreferrer">
             <BookOpen size={16} /> API 文档
@@ -2749,6 +3595,35 @@ function App(): JSX.Element {
             onSearch={() => void loadEmailSiteUsages(1)}
             onPageChange={(nextPage) => void changeEmailSiteUsagePage(nextPage)}
             onRevoke={(usage) => void revokeEmailSiteUsage(usage)}
+          />
+        ) : activeNavigationSection === "providers" ? (
+          <ProvidersPage
+            catalog={providerCatalog}
+            smsbower={smsbowerSettings}
+            apiKeyDraft={smsbowerApiKeyDraft}
+            isSaving={isSavingSmsbower}
+            isReplenishing={isReplenishingSmsbower}
+            adminToken={adminToken}
+            onApiKeyDraftChange={setSmsbowerApiKeyDraft}
+            onRefresh={() => void loadProviders()}
+            onToggleEnabled={(enabled) => void updateSmsbowerSettings({ enabled })}
+            onSaveBasics={(fields) => void updateSmsbowerSettings(fields)}
+            onSaveApiKey={() => {
+              if (!smsbowerApiKeyDraft.trim()) {
+                setErrorMessage("请输入 API Key，或使用「清除密钥」。");
+                return;
+              }
+              void updateSmsbowerSettings({ api_key: smsbowerApiKeyDraft.trim() });
+            }}
+            onClearApiKey={() => {
+              if (!window.confirm("确定清除已保存的 SMSBower API Key？")) {
+                return;
+              }
+              void updateSmsbowerSettings({ clear_api_key: true });
+            }}
+            onReplenish={() => void replenishSmsbower()}
+            onError={setErrorMessage}
+            onNotice={setNotice}
           />
         ) : activeNavigationSection === "client-keys" ? (
           <ClientKeysPage

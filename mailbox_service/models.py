@@ -7,7 +7,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import JSON, Boolean, DateTime, Enum, ForeignKey, Index, Integer, String, Text, UniqueConstraint
+from sqlalchemy import JSON, Boolean, DateTime, Enum, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from mailbox_service.database import Base
@@ -89,12 +89,54 @@ class LeaseStatus(str, enum.Enum):
     EXPIRED = "expired"
 
 
+class ProviderResourceLifecycle(str, enum.Enum):
+    """Lifecycle of a non-Microsoft inventory provider resource."""
+
+    AVAILABLE = "available"
+    CLAIMED = "claimed"
+    RELEASING = "releasing"
+    COOLDOWN = "cooldown"
+    RELEASE_UNKNOWN = "release_unknown"
+    RETIRED = "retired"
+
+
+class ProviderResourceReadiness(str, enum.Enum):
+    """Whether a provider resource can accept mail_read (independent of MailboxCapability)."""
+
+    READY = "ready"
+    NOT_READY = "not_ready"
+    UNKNOWN = "unknown"
+
+
+class ProviderOperationType(str, enum.Enum):
+    """Durable external side-effect categories."""
+
+    REPLENISH = "replenish"
+    RELEASE = "release"
+    RECONCILE = "reconcile"
+
+
+class ProviderOperationStatus(str, enum.Enum):
+    """Durable operation status machine."""
+
+    PENDING = "pending"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    UNKNOWN = "unknown"
+
+
 class Mailbox(Base):
     """A mailbox credential record with an optional sticky egress proxy binding."""
 
     __tablename__ = "mailboxes"
+    __table_args__ = (
+        Index("ix_mailboxes_provider_status", "provider_type", "status", "capability"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    # microsoft | smsbower_gmail | future inventory providers. Not MailboxCapability.
+    provider_type: Mapped[str] = mapped_column(String(64), nullable=False, default="microsoft")
     primary_email: Mapped[str] = mapped_column(String(320), unique=True, nullable=False)
     status: Mapped[MailboxStatus] = mapped_column(
         Enum(MailboxStatus, values_callable=enum_values), nullable=False, default=MailboxStatus.ACTIVE
@@ -117,6 +159,8 @@ class Mailbox(Base):
     )
     capability_probed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     capability_probe_error: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    # Non-sensitive provider metadata only; secrets live in encrypted fields / resource table.
+    provider_config_json: Mapped[dict[str, Any] | list[Any] | None] = mapped_column(JSON, nullable=True)
     token_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     # Single-flight refresh claim; expired claims may be taken over by another worker.
     token_refresh_claim_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
@@ -252,6 +296,7 @@ class Lease(Base):
     __table_args__ = (
         Index("ix_leases_mailbox_active", "mailbox_id", "released_at", "expires_at"),
         Index("ix_leases_client_created", "client_key_id", "created_at"),
+        Index("ix_leases_provider_type", "provider_type", "released_at", "expires_at"),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
@@ -268,11 +313,106 @@ class Lease(Base):
     mode: Mapped[LeaseMode] = mapped_column(
         Enum(LeaseMode, values_callable=enum_values), nullable=False, default=LeaseMode.ACCESS_TOKEN
     )
+    # Immutable Provider binding written at acquire; verification/release must not re-infer.
+    provider_type: Mapped[str] = mapped_column(String(64), nullable=False, default="microsoft")
+    provider_instance_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    provider_config_revision: Mapped[str | None] = mapped_column(String(64), nullable=True)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     released_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
 
     mailbox: Mapped[Mailbox] = relationship()
+
+
+class MailboxProviderResource(Base):
+    """External inventory resource attached to one mailbox (SMSBower activation, etc.)."""
+
+    __tablename__ = "mailbox_provider_resources"
+    __table_args__ = (
+        UniqueConstraint(
+            "provider_instance_id",
+            "external_resource_id",
+            name="uq_provider_instance_external",
+        ),
+        Index("ix_provider_resources_lifecycle", "provider_type", "lifecycle_state", "readiness"),
+    )
+
+    mailbox_id: Mapped[str] = mapped_column(
+        ForeignKey("mailboxes.id", ondelete="CASCADE"), primary_key=True
+    )
+    provider_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    provider_instance_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    external_resource_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    lifecycle_state: Mapped[str] = mapped_column(String(32), nullable=False)
+    readiness: Mapped[str] = mapped_column(String(32), nullable=False)
+    state_version: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    resource_generation: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    encrypted_secret: Mapped[str | None] = mapped_column(Text, nullable=True)
+    secret_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    metadata_json: Mapped[dict[str, Any] | list[Any] | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
+
+
+class MailboxProviderOperation(Base):
+    """Durable external operation with idempotency and fencing metadata."""
+
+    __tablename__ = "mailbox_provider_operations"
+    __table_args__ = (
+        UniqueConstraint("idempotency_key", name="uq_provider_ops_idempotency"),
+        Index("ix_provider_ops_status", "status", "updated_at"),
+        Index("ix_provider_ops_mailbox", "mailbox_id", "status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    operation_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    provider_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    provider_instance_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    mailbox_id: Mapped[str | None] = mapped_column(
+        ForeignKey("mailboxes.id", ondelete="SET NULL"), nullable=True
+    )
+    lease_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    external_resource_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    resource_generation: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    expected_state_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_error_class: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    result_summary_json: Mapped[dict[str, Any] | list[Any] | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
+
+
+class ProviderInstanceSettings(Base):
+    """Admin-editable Provider instance settings (DB overrides env defaults).
+
+    Secrets are stored only in encrypted columns (e.g. api_key_ciphertext).
+    Non-secret knobs may live in typed columns or config_json.
+    """
+
+    __tablename__ = "provider_instance_settings"
+
+    provider_type: Mapped[str] = mapped_column(String(64), primary_key=True)
+    instance_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    api_base: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    api_key_ciphertext: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Encrypted JSON bag for secondary secrets (admin_password, ddg_token, cf_inbox_jwt, ...).
+    secrets_ciphertext: Mapped[str | None] = mapped_column(Text, nullable=True)
+    service_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    domain: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    max_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    request_timeout_seconds: Mapped[float] = mapped_column(Float, nullable=False, default=30.0)
+    config_json: Mapped[dict[str, Any] | list[Any] | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
 
 
 class UsageSite(Base):

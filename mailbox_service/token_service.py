@@ -195,8 +195,21 @@ class MailboxAccessTokenService:
         Production injects the process-wide ``SessionFactory``. Unit tests inject a private
         sessionmaker over SQLite StaticPool and share uncommitted rows with the request
         session — those paths must keep working on ``self._session``.
+
+        MySQL integration tests inject a multi-connection sessionmaker that is not the
+        process-wide singleton; they still need short Units of Work so network I/O never
+        holds business row locks on the caller Session.
         """
-        return self._session_factory is SessionFactory
+        if self._session_factory is SessionFactory:
+            return True
+        if self._session_factory is None:
+            return False
+        try:
+            bind = self._session.get_bind()
+        except Exception:
+            return False
+        dialect_name = getattr(getattr(bind, "dialect", None), "name", "")
+        return dialect_name == "mysql"
 
     def ensure_access_token_in_short_transaction(
         self,
@@ -825,15 +838,22 @@ class MailboxAccessTokenService:
         return access_token, build_token_diagnostic_summary(access_token)
 
     def _load_mailbox(self, mailbox_id: str) -> Mailbox:
+        from mailbox_service.providers.microsoft_guards import require_microsoft_mailbox
+
         mailbox = self._session.scalar(select(Mailbox).where(Mailbox.id == mailbox_id).with_for_update())
         if mailbox is None:
             raise LookupError("邮箱不存在")
-        return mailbox
+        return require_microsoft_mailbox(mailbox, operation="token_service")
 
     def _load_all_active_mailbox_ids(self) -> list[str]:
         return list(
             self._session.scalars(
-                select(Mailbox.id).where(Mailbox.status == MailboxStatus.ACTIVE).order_by(Mailbox.primary_email.asc())
+                select(Mailbox.id)
+                .where(
+                    Mailbox.status == MailboxStatus.ACTIVE,
+                    Mailbox.provider_type == "microsoft",
+                )
+                .order_by(Mailbox.primary_email.asc())
             )
         )
 
@@ -888,6 +908,7 @@ class MailboxAccessTokenService:
                 select(Mailbox.id)
                 .where(
                     Mailbox.status == MailboxStatus.ACTIVE,
+                    Mailbox.provider_type == "microsoft",
                     Mailbox.client_id.is_not(None),
                     Mailbox.refresh_token_ciphertext.is_not(None),
                     ~active_lease_exists,
@@ -962,6 +983,7 @@ class MailboxAccessTokenService:
             Mailbox.status == MailboxStatus.ACTIVE,
             Mailbox.client_id.is_not(None),
             Mailbox.refresh_token_ciphertext.is_not(None),
+            Mailbox.provider_type == "microsoft",
             (Mailbox.capability.is_(None)) | (Mailbox.capability == MailboxCapability.UNKNOWN),
         )
 

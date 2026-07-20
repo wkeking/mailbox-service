@@ -1,9 +1,18 @@
-# Single-host app deployment. MySQL is external: local mysql-host on infra_default.
+# Single-host app deployment. MySQL comes from the shared Docker infra stack:
+#   /path/to/infra/docker-compose.yml
+#
+# That stack exposes:
+#   - network: external_network  (compose project "infra", network name "infra")
+#   - MySQL:   mysql-host  (root / change-me, host port 3306)
 #
 # Prerequisites:
-#   1. mysql-host is running and joined to network infra_default
-#   2. Create app database and least-privilege accounts (see README)
-#   3. cp .env.production.example .env  # fill secrets; never use root:root
+#   1. cd /path/to/infra && docker compose up -d
+#   2. Create app database (once):
+#        docker exec -i mysql-host mysql -uroot -pchange-me \
+#          -e "CREATE DATABASE IF NOT EXISTS mailbox_service CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+#   3. cp .env.example .env  # fill secrets
+#      Docker Compose 内 DATABASE_URL 主机名必须用 mysql-host，不要写 127.0.0.1
+#   4. docker compose up -d
 #
 # Usage:
 #   docker compose up -d
@@ -13,21 +22,21 @@ services:
     image: ${MAILBOX_IMAGE:-registry.example.com/mailbox-service:latest}
     container_name: mailbox-service
     restart: unless-stopped
-    # Production default: do not publish the app port to the public host interface.
-    # Prefer an external reverse proxy on the same Docker network, or bind loopback only.
+    # Prefer loopback publish for local/dev; reverse-proxy peers can share infra network.
     ports:
       - "${HOST_BIND_ADDRESS:-127.0.0.1}:${HOST_PORT:-8000}:8000"
     env_file:
       - .env
     environment:
-      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}
+      # Compose-internal default targets shared infra MySQL; .env may override for host uvicorn.
+      DATABASE_URL: ${DATABASE_URL:-mysql+pymysql://root:change-me@mysql-host:3306/mailbox_service}
       APP_ENV: ${APP_ENV:-production}
-      CORS_ALLOW_ORIGINS: ${CORS_ALLOW_ORIGINS:?CORS_ALLOW_ORIGINS is required}
+      CORS_ALLOW_ORIGINS: ${CORS_ALLOW_ORIGINS:-*}
       FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS:-127.0.0.1}
       TLS_MODE: ${TLS_MODE:-terminated_at_proxy}
-      AUTO_MIGRATE_ON_STARTUP: ${AUTO_MIGRATE_ON_STARTUP:-false}
+      AUTO_MIGRATE_ON_STARTUP: ${AUTO_MIGRATE_ON_STARTUP:-true}
     networks:
-      - infra_default
+      - infra
     read_only: true
     tmpfs:
       - /tmp
@@ -38,6 +47,11 @@ services:
     init: true
     pids_limit: 256
     mem_limit: 512m
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/ready"]
       interval: 30s
@@ -60,14 +74,20 @@ services:
       - caddy_data:/data
       - caddy_config:/config
     networks:
-      - infra_default
+      - infra
     depends_on:
       - mailbox-service
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 networks:
-  infra_default:
+  # Matches Docker/infra compose network "infra" (external name: external_network).
+  infra:
     external: true
-    name: infra_default
+    name: external_network
 
 volumes:
   caddy_data:

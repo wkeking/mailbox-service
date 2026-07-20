@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from base64 import urlsafe_b64encode
+from contextlib import contextmanager
 from datetime import timedelta
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
@@ -14,7 +16,7 @@ from mailbox_service.client_key_service import ClientKeyService
 from mailbox_service.config import Settings, get_settings
 from mailbox_service.database import Base, get_session
 from mailbox_service.lease_service import LeaseService
-from mailbox_service.main import app, get_lease_service
+from mailbox_service.main import app, get_access_token_service, get_lease_service
 from mailbox_service.models import Mailbox, utc_now
 from mailbox_service.security import CredentialCipher
 from mailbox_service.token_service import MailboxAccessTokenService
@@ -81,50 +83,58 @@ def test_external_api_uses_client_key_and_rejects_admin_token() -> None:
     app.dependency_overrides[get_session] = override_session
     app.dependency_overrides[get_settings] = lambda: settings
     app.dependency_overrides[get_lease_service] = lambda: lease_service
-    http_client = TestClient(app)
-    try:
-        missing_client_key_response = http_client.post(
-            "/api/v1/leases/acquire",
-            headers={"X-Admin-Token": "admin-secret"},
-            json={"mode": "access_token", "lease_ttl_seconds": 600},
-        )
-        assert missing_client_key_response.status_code == 401
+    app.dependency_overrides[get_access_token_service] = lambda: access_token_service
 
-        acquire_response = http_client.post(
-            "/api/v1/leases/acquire",
-            headers={"X-API-Key": client_key_creation.api_key},
-            json={"mode": "access_token", "lease_ttl_seconds": 600},
-        )
-        assert acquire_response.status_code == 201
-        assert acquire_response.headers["cache-control"] == "no-store"
-        assert acquire_response.json()["credential"]["access_token"] == "cached-access-token"
+    @contextmanager
+    def _noop_lifespan(_application):
+        yield
 
-        sensitive_invalid_refresh_token = "sensitive-refresh-token-marker\n"
-        invalid_refresh_token_response = http_client.post(
-            "/api/v1/leases/not-a-real-lease/refresh-token",
-            headers={"X-API-Key": client_key_creation.api_key},
-            json={
-                "expected_token_version": 1,
-                "refresh_token": sensitive_invalid_refresh_token,
-            },
-        )
-        assert invalid_refresh_token_response.status_code == 422
-        assert sensitive_invalid_refresh_token.strip() not in invalid_refresh_token_response.text
-        assert invalid_refresh_token_response.headers["cache-control"] == "no-store"
+    # Patch lifespan so developer .env MySQL is not touched by TestClient startup.
+    with patch.object(app.router, "lifespan_context", _noop_lifespan):
+        http_client = TestClient(app)
+        try:
+            missing_client_key_response = http_client.post(
+                "/api/v1/leases/acquire",
+                headers={"X-Admin-Token": "admin-secret"},
+                json={"mode": "access_token", "lease_ttl_seconds": 600},
+            )
+            assert missing_client_key_response.status_code == 401
 
-        admin_response = http_client.get(
-            "/api/v1/admin/client-keys",
-            headers={"X-API-Key": client_key_creation.api_key},
-        )
-        assert admin_response.status_code == 401
+            acquire_response = http_client.post(
+                "/api/v1/leases/acquire",
+                headers={"X-API-Key": client_key_creation.api_key},
+                json={"mode": "access_token", "lease_ttl_seconds": 600},
+            )
+            assert acquire_response.status_code == 201
+            assert acquire_response.headers["cache-control"] == "no-store"
+            assert acquire_response.json()["credential"]["access_token"] == "cached-access-token"
 
-        admin_access_token_response = http_client.post(
-            "/api/v1/admin/mailboxes/missing-mailbox/access-token",
-            headers={"X-Admin-Token": "admin-secret"},
-        )
-        assert admin_access_token_response.status_code == 404
-        assert admin_access_token_response.headers["cache-control"] == "no-store"
-    finally:
-        http_client.close()
-        app.dependency_overrides.clear()
-        session.close()
+            sensitive_invalid_refresh_token = "sensitive-refresh-token-marker\n"
+            invalid_refresh_token_response = http_client.post(
+                "/api/v1/leases/not-a-real-lease/refresh-token",
+                headers={"X-API-Key": client_key_creation.api_key},
+                json={
+                    "expected_token_version": 1,
+                    "refresh_token": sensitive_invalid_refresh_token,
+                },
+            )
+            assert invalid_refresh_token_response.status_code == 422
+            assert sensitive_invalid_refresh_token.strip() not in invalid_refresh_token_response.text
+            assert invalid_refresh_token_response.headers["cache-control"] == "no-store"
+
+            admin_response = http_client.get(
+                "/api/v1/admin/client-keys",
+                headers={"X-API-Key": client_key_creation.api_key},
+            )
+            assert admin_response.status_code == 401
+
+            admin_access_token_response = http_client.post(
+                "/api/v1/admin/mailboxes/missing-mailbox/access-token",
+                headers={"X-Admin-Token": "admin-secret"},
+            )
+            assert admin_access_token_response.status_code == 404
+            assert admin_access_token_response.headers["cache-control"] == "no-store"
+        finally:
+            http_client.close()
+            app.dependency_overrides.clear()
+            session.close()
