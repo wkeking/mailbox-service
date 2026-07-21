@@ -51,10 +51,11 @@ class SmsBowerNotConfiguredError(Exception):
 class SmsBowerReplenishOutcome:
     operation_id: str
     status: str
-    mailbox_id: str | None
+    mailbox_id: str | None  # legacy: always None (no mailboxes write)
     primary_email: str | None
     external_resource_id: str | None
     error_class: str | None
+    provider_resource_id: str | None = None
 
 
 class SmsBowerGmailProvider:
@@ -171,7 +172,7 @@ class SmsBowerGmailProvider:
         session = self._session_factory()
         try:
             ops = ProviderOperationService(session, session_factory=self._session_factory)
-            mailbox_id = ops.finalize_smsbower_replenish_success(
+            provider_resource_id = ops.finalize_smsbower_replenish_success(
                 operation_id=operation_id,
                 provider_instance_id=runtime.instance_id,
                 external_resource_id=external_resource_id,
@@ -184,10 +185,11 @@ class SmsBowerGmailProvider:
             return SmsBowerReplenishOutcome(
                 operation_id=operation_id,
                 status=ProviderOperationStatus.SUCCEEDED.value,
-                mailbox_id=mailbox_id,
+                mailbox_id=None,
                 primary_email=primary_email,
                 external_resource_id=external_resource_id,
                 error_class=None,
+                provider_resource_id=provider_resource_id,
             )
         except Exception:
             session.rollback()

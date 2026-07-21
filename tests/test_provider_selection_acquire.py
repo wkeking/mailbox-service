@@ -76,30 +76,21 @@ def _seed_microsoft(session, cipher, email: str = "ms@example.com") -> Mailbox:
     return mailbox
 
 
-def _seed_smsbower(session, cipher, email: str = "sms@gmail.com") -> Mailbox:
-    mailbox = Mailbox(
-        primary_email=email,
+def _seed_smsbower(session, cipher, email: str = "sms@gmail.com") -> MailboxProviderResource:
+    resource = MailboxProviderResource(
         provider_type="smsbower_gmail",
-        status=MailboxStatus.ACTIVE,
-        token_version=1,
+        provider_instance_id="default",
+        external_resource_id="act-1",
+        primary_email=email,
+        lifecycle_state=ProviderResourceLifecycle.AVAILABLE.value,
+        readiness=ProviderResourceReadiness.READY.value,
+        state_version=0,
+        resource_generation=0,
+        encrypted_secret=cipher.encrypt('{"mail_id":"act-1"}'),
     )
-    session.add(mailbox)
+    session.add(resource)
     session.flush()
-    session.add(
-        MailboxProviderResource(
-            mailbox_id=mailbox.id,
-            provider_type="smsbower_gmail",
-            provider_instance_id="default",
-            external_resource_id="act-1",
-            lifecycle_state=ProviderResourceLifecycle.AVAILABLE.value,
-            readiness=ProviderResourceReadiness.READY.value,
-            state_version=0,
-            resource_generation=0,
-            encrypted_secret=cipher.encrypt('{"mail_id":"act-1"}'),
-        )
-    )
-    session.flush()
-    return mailbox
+    return resource
 
 
 def test_schema_normalizes_provider_all_and_lists() -> None:

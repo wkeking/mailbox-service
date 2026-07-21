@@ -59,27 +59,28 @@ def _context(http_client):
     return factory, provider
 
 
-def test_replenish_success_writes_mailbox_and_resource() -> None:
+def test_replenish_success_writes_resource_not_mailbox() -> None:
     http_client = FakeHttp("ACCESS:90001:sms.user@gmail.com")
     factory, provider = _context(http_client)
     outcome = provider.replenish_one(actor_id="admin")
     assert outcome.status == "succeeded"
     assert outcome.primary_email == "sms.user@gmail.com"
     assert outcome.external_resource_id == "90001"
+    assert outcome.mailbox_id is None
+    assert outcome.provider_resource_id is not None
     session = factory()
     try:
-        mailbox = session.get(Mailbox, outcome.mailbox_id)
-        assert mailbox is not None
-        assert mailbox.provider_type == "smsbower_gmail"
-        assert mailbox.client_id is None
-        assert mailbox.refresh_token_ciphertext is None
-        resource = session.get(MailboxProviderResource, mailbox.id)
+        assert session.scalars(select(Mailbox)).first() is None
+        resource = session.get(MailboxProviderResource, outcome.provider_resource_id)
         assert resource is not None
+        assert resource.provider_type == "smsbower_gmail"
+        assert resource.primary_email == "sms.user@gmail.com"
         assert resource.lifecycle_state == "available"
         assert resource.external_resource_id == "90001"
         ops = list(session.scalars(select(MailboxProviderOperation)))
         assert len(ops) == 1
         assert ops[0].status == "succeeded"
+        assert ops[0].provider_resource_id == resource.id
     finally:
         session.close()
 
@@ -95,9 +96,11 @@ def test_replenish_timeout_marks_unknown_not_second_purchase() -> None:
     outcome = provider.replenish_one()
     assert outcome.status == "unknown"
     assert outcome.mailbox_id is None
+    assert outcome.provider_resource_id is None
     session = factory()
     try:
         assert session.scalars(select(Mailbox)).first() is None
+        assert session.scalars(select(MailboxProviderResource)).first() is None
         op = session.scalars(select(MailboxProviderOperation)).first()
         assert op is not None
         assert op.status == "unknown"

@@ -106,11 +106,14 @@ class LeaseAcquireResult:
     """Lease metadata plus the credential selected by its mode."""
 
     lease_id: str
-    mailbox_id: str
     primary_email: str
     mode: LeaseMode
     expires_at: datetime
     created_at: datetime
+    # Owned microsoft mailbox id; null for non-owned provider resources.
+    mailbox_id: str | None = None
+    # Non-owned provider resource id (smsbower / on-demand).
+    provider_resource_id: str | None = None
     # Business address for this lease (primary or plus alias). mail_read only.
     allocated_email: str | None = None
     # primary | plus_alias when the lease has a business recipient address.
@@ -688,6 +691,19 @@ class LeaseService:
         defer_access_token: bool = False,
         provider_type: str = DEFAULT_PROVIDER_TYPE,
     ) -> LeaseAcquireResult:
+        if provider_type == "smsbower_gmail":
+            if mode != LeaseMode.MAIL_READ:
+                raise LeaseModeError("smsbower_gmail 仅支持 mail_read")
+            if wants_plus_alias:
+                raise LeaseModeError("非 microsoft provider 本轮不支持 plus alias")
+            return self._acquire_smsbower_mail_read_lease(
+                principal,
+                ttl_seconds=ttl_seconds,
+                preferred_email=preferred_email,
+                client_tag=client_tag,
+                purpose=purpose,
+                usage_site=resolved_usage_site,
+            )
         current_time = utc_now()
         # MySQL DATETIME is typically naive; compare with a naive UTC value in SQL.
         sql_current_time = current_time.replace(tzinfo=None)
@@ -739,18 +755,6 @@ class LeaseService:
                 mailbox_query = mailbox_query.where(~primary_used_for_site)
             # Plus path: do not exclude the whole mailbox for prior site usage; uniqueness is
             # per allocated_email (+ optional site) when generating the alias.
-        if mode == LeaseMode.MAIL_READ and provider_type == "smsbower_gmail":
-            # Resource must be available and ready; releasing/cooldown/unknown excluded.
-            available_resource = exists(
-                select(MailboxProviderResource.mailbox_id).where(
-                    MailboxProviderResource.mailbox_id == Mailbox.id,
-                    MailboxProviderResource.provider_type == "smsbower_gmail",
-                    MailboxProviderResource.lifecycle_state
-                    == ProviderResourceLifecycle.AVAILABLE.value,
-                    MailboxProviderResource.readiness == ProviderResourceReadiness.READY.value,
-                )
-            )
-            mailbox_query = mailbox_query.where(available_resource)
         normalized_preferred_email = preferred_email.strip().lower() if preferred_email else None
         if normalized_preferred_email:
             mailbox_query = mailbox_query.where(Mailbox.primary_email == normalized_preferred_email)
@@ -787,35 +791,16 @@ class LeaseService:
         # Sink recently handed-out mailboxes so the next acquire prefers a colder box (round-robin).
         mailbox.updated_at = current_time
 
-        provider_instance_id = None
-        provider_resource = None
-        if provider_type == "smsbower_gmail":
-            provider_resource = self._session.scalar(
-                select(MailboxProviderResource)
-                .where(MailboxProviderResource.mailbox_id == mailbox.id)
-                .with_for_update()
-            )
-            if (
-                provider_resource is None
-                or provider_resource.lifecycle_state != ProviderResourceLifecycle.AVAILABLE.value
-                or provider_resource.readiness != ProviderResourceReadiness.READY.value
-            ):
-                raise LeaseUnavailableError("没有可用邮箱")
-            provider_instance_id = provider_resource.provider_instance_id
-            provider_resource.lifecycle_state = ProviderResourceLifecycle.CLAIMED.value
-            provider_resource.resource_generation = int(provider_resource.resource_generation or 0) + 1
-            provider_resource.state_version = int(provider_resource.state_version or 0) + 1
-            provider_resource.updated_at = current_time
-
         lease = Lease(
             mailbox_id=mailbox.id,
+            provider_resource_id=None,
             client_key_id=principal.client_key_id,
             client_tag=client_tag,
             purpose=purpose,
             allocated_email=allocated_email,
             mode=mode,
             provider_type=mailbox.provider_type or provider_type or DEFAULT_PROVIDER_TYPE,
-            provider_instance_id=provider_instance_id,
+            provider_instance_id=None,
             provider_config_revision=None,
             expires_at=current_time + timedelta(seconds=ttl_seconds),
             created_at=current_time,
@@ -1049,7 +1034,104 @@ class LeaseService:
         principal.require_scope("leases:release")
         return self._release_lease_internal(principal, lease_id)
 
+    def _acquire_smsbower_mail_read_lease(
+        self,
+        principal: ClientPrincipal,
+        *,
+        ttl_seconds: int,
+        preferred_email: str | None,
+        client_tag: str | None,
+        purpose: str | None,
+        usage_site: str | None,
+    ) -> LeaseAcquireResult:
+        """Claim one available SMSBower provider resource (never writes mailboxes)."""
+        current_time = utc_now()
+        resource_query = select(MailboxProviderResource).where(
+            MailboxProviderResource.provider_type == "smsbower_gmail",
+            MailboxProviderResource.lifecycle_state == ProviderResourceLifecycle.AVAILABLE.value,
+            MailboxProviderResource.readiness == ProviderResourceReadiness.READY.value,
+        )
+        normalized_preferred_email = preferred_email.strip().lower() if preferred_email else None
+        if normalized_preferred_email:
+            resource_query = resource_query.where(
+                MailboxProviderResource.primary_email == normalized_preferred_email
+            )
+        resource_query = resource_query.order_by(
+            MailboxProviderResource.updated_at.asc(),
+            MailboxProviderResource.primary_email.asc(),
+        ).with_for_update(skip_locked=True)
+        resource = self._session.scalar(resource_query)
+        if resource is None:
+            raise LeaseUnavailableError("没有可用邮箱")
+
+        resource.lifecycle_state = ProviderResourceLifecycle.CLAIMED.value
+        resource.resource_generation = int(resource.resource_generation or 0) + 1
+        resource.state_version = int(resource.state_version or 0) + 1
+        resource.updated_at = current_time
+        allocated_email = resource.primary_email.strip().lower()
+        lease = Lease(
+            mailbox_id=None,
+            provider_resource_id=resource.id,
+            client_key_id=principal.client_key_id,
+            client_tag=client_tag,
+            purpose=purpose,
+            allocated_email=allocated_email,
+            mode=LeaseMode.MAIL_READ,
+            provider_type="smsbower_gmail",
+            provider_instance_id=resource.provider_instance_id,
+            provider_config_revision=None,
+            expires_at=current_time + timedelta(seconds=ttl_seconds),
+            created_at=current_time,
+        )
+        self._session.add(lease)
+        self._session.flush()
+        try:
+            self._upsert_lease_claim(lease, allocated_email=allocated_email)
+        except IntegrityError as error:
+            raise LeaseUnavailableError("没有可用邮箱") from error
+
+        if usage_site:
+            try:
+                resolved_site = self._resolve_enabled_usage_site(usage_site)
+                self._record_email_site_usage(
+                    principal=principal,
+                    allocated_email=allocated_email,
+                    usage_site_code=resolved_site,
+                    mailbox_id=None,
+                    lease_id=lease.id,
+                )
+            except Exception:
+                pass
+
+        self._write_audit_log(
+            principal,
+            "lease.acquired",
+            lease.id,
+            {
+                "provider_resource_id": resource.id,
+                "mode": LeaseMode.MAIL_READ.value,
+                "provider_type": "smsbower_gmail",
+                "allocated_email": allocated_email,
+                "expires_at": lease.expires_at.isoformat(),
+            },
+        )
+        return LeaseAcquireResult(
+            lease_id=lease.id,
+            mailbox_id=None,
+            provider_resource_id=resource.id,
+            primary_email=allocated_email,
+            allocated_email=allocated_email,
+            address_kind="primary",
+            usage_site=usage_site,
+            provider_type="smsbower_gmail",
+            provider_instance_id=resource.provider_instance_id,
+            mode=LeaseMode.MAIL_READ,
+            expires_at=lease.expires_at,
+            created_at=lease.created_at,
+        )
+
     def _acquire_on_demand_mail_read_lease(
+
         self,
         principal: ClientPrincipal,
         *,
@@ -1089,23 +1171,19 @@ class LeaseService:
             raise LeaseUnavailableError("on-demand provider returned invalid address")
 
         current_time = utc_now()
-        mailbox_id = str(uuid.uuid4())
+        resource_id = str(uuid.uuid4())
         encrypted_secret = self._credential_cipher.encrypt(
             json.dumps(provision_result.secret_payload or {}, ensure_ascii=False)
         )
-        mailbox = Mailbox(
-            id=mailbox_id,
-            provider_type=provider_type,
-            primary_email=address,
-            status=MailboxStatus.ACTIVE,
-            provider_config_json=provision_result.metadata or None,
-        )
+        instance_id = "default"
+        if isinstance(provision_result.secret_payload, dict):
+            instance_id = str(provision_result.secret_payload.get("instance_id") or instance_id)
         resource = MailboxProviderResource(
-            mailbox_id=mailbox_id,
+            id=resource_id,
             provider_type=provider_type,
-            provider_instance_id=getattr(provision_result, "instance_id", None)
-            or "default",
+            provider_instance_id=instance_id,
             external_resource_id=str(provision_result.external_resource_id or address),
+            primary_email=address,
             lifecycle_state=ProviderResourceLifecycle.CLAIMED.value,
             readiness=ProviderResourceReadiness.READY.value,
             state_version=1,
@@ -1113,14 +1191,10 @@ class LeaseService:
             encrypted_secret=encrypted_secret,
             metadata_json=provision_result.metadata,
         )
-        # Prefer instance id from runtime if secret carries it.
-        instance_id = "default"
-        if isinstance(provision_result.secret_payload, dict):
-            instance_id = str(provision_result.secret_payload.get("instance_id") or instance_id)
-        resource.provider_instance_id = instance_id
 
         lease = Lease(
-            mailbox_id=mailbox_id,
+            mailbox_id=None,
+            provider_resource_id=resource_id,
             client_key_id=principal.client_key_id,
             client_tag=client_tag,
             purpose=purpose,
@@ -1133,9 +1207,8 @@ class LeaseService:
             created_at=current_time,
         )
         try:
-            self._session.add(mailbox)
-            self._session.flush()
             self._session.add(resource)
+            self._session.flush()
             self._session.add(lease)
             self._session.flush()
             self._upsert_lease_claim(lease, allocated_email=address)
@@ -1150,7 +1223,7 @@ class LeaseService:
                     principal=principal,
                     allocated_email=address,
                     usage_site_code=resolved_site,
-                    mailbox_id=mailbox_id,
+                    mailbox_id=None,
                     lease_id=lease.id,
                 )
             except Exception:
@@ -1162,7 +1235,7 @@ class LeaseService:
             "lease.acquired",
             lease.id,
             {
-                "mailbox_id": mailbox_id,
+                "provider_resource_id": resource_id,
                 "mode": LeaseMode.MAIL_READ.value,
                 "provider_type": provider_type,
                 "allocated_email": address,
@@ -1171,7 +1244,8 @@ class LeaseService:
         )
         return LeaseAcquireResult(
             lease_id=lease.id,
-            mailbox_id=mailbox_id,
+            mailbox_id=None,
+            provider_resource_id=resource_id,
             primary_email=address,
             allocated_email=address,
             address_kind="primary",
@@ -1200,7 +1274,12 @@ class LeaseService:
             provider_type = lease.provider_type or DEFAULT_PROVIDER_TYPE
             # SMSBower: local released_at ends client auth only; remote setStatus is async finalize.
             if provider_type == "smsbower_gmail":
-                resource = self._session.get(MailboxProviderResource, lease.mailbox_id)
+                resource_id = lease.provider_resource_id
+                resource = (
+                    self._session.get(MailboxProviderResource, resource_id)
+                    if resource_id
+                    else None
+                )
                 if resource is not None and resource.lifecycle_state in (
                     ProviderResourceLifecycle.CLAIMED.value,
                     ProviderResourceLifecycle.AVAILABLE.value,
@@ -1209,7 +1288,7 @@ class LeaseService:
 
                     ProviderOperationService(self._session).begin_release_operation(
                         lease_id=lease.id,
-                        mailbox_id=lease.mailbox_id,
+                        provider_resource_id=resource.id,
                         provider_type=lease.provider_type or "smsbower_gmail",
                         provider_instance_id=lease.provider_instance_id
                         or resource.provider_instance_id,
@@ -1219,18 +1298,27 @@ class LeaseService:
                         principal_id=principal.client_key_id,
                     )
             elif provider_type in ON_DEMAND_PROVIDER_TYPES:
-                resource = self._session.get(MailboxProviderResource, lease.mailbox_id)
+                resource_id = lease.provider_resource_id
+                resource = (
+                    self._session.get(MailboxProviderResource, resource_id)
+                    if resource_id
+                    else None
+                )
                 if resource is not None:
                     resource.lifecycle_state = ProviderResourceLifecycle.RETIRED.value
                     resource.readiness = ProviderResourceReadiness.NOT_READY.value
                     resource.state_version = int(resource.state_version or 0) + 1
                     resource.encrypted_secret = None
                     resource.updated_at = utc_now()
-                mailbox = self._session.get(Mailbox, lease.mailbox_id)
-                if mailbox is not None:
-                    mailbox.status = MailboxStatus.DISABLED
-                    mailbox.updated_at = utc_now()
-            self._write_audit_log(principal, "lease.released", lease.id, {"mailbox_id": lease.mailbox_id})
+            self._write_audit_log(
+                principal,
+                "lease.released",
+                lease.id,
+                {
+                    "mailbox_id": lease.mailbox_id,
+                    "provider_resource_id": lease.provider_resource_id,
+                },
+            )
             self._session.flush()
         return LeaseReleaseResult(
             lease_id=lease.id,
@@ -1255,11 +1343,11 @@ class LeaseService:
         principal: ClientPrincipal,
         lease_id: str,
     ) -> tuple[Lease, Mailbox]:
-        """Return an owned active mail_read lease and its mailbox row.
+        """Return an active mail_read lease and a mailbox-like object for verification.
 
-        Intentionally loads without ``FOR UPDATE`` so verification-code polling can
-        release the request transaction before long waits and avoid blocking admin
-        cleanup (e.g. delete-invalid) for the whole timeout window.
+        Microsoft leases load the real Mailbox row. Non-owned provider leases return a
+        detached stand-in Mailbox instance (not persisted) carrying provider_type and
+        primary_email so verification can route without polluting mailboxes table.
         """
         principal.require_scope("mail:verification-code:read")
         lease = self._load_owned_lease(
@@ -1270,10 +1358,25 @@ class LeaseService:
         )
         if lease.mode != LeaseMode.MAIL_READ:
             raise LeaseModeError("该租约不是 mail_read mode")
-        mailbox = self._session.get(Mailbox, lease.mailbox_id)
-        if mailbox is None or mailbox.status != MailboxStatus.ACTIVE:
+        if lease.mailbox_id:
+            mailbox = self._session.get(Mailbox, lease.mailbox_id)
+            if mailbox is None or mailbox.status != MailboxStatus.ACTIVE:
+                raise LeaseInactiveError("租约邮箱当前不可用")
+            return lease, mailbox
+        if not lease.provider_resource_id:
             raise LeaseInactiveError("租约邮箱当前不可用")
-        return lease, mailbox
+        resource = self._session.get(MailboxProviderResource, lease.provider_resource_id)
+        if resource is None or resource.lifecycle_state != ProviderResourceLifecycle.CLAIMED.value:
+            raise LeaseInactiveError("租约邮箱当前不可用")
+        stand_in = Mailbox(
+            id=resource.id,
+            provider_type=resource.provider_type,
+            primary_email=resource.primary_email,
+            status=MailboxStatus.ACTIVE,
+            token_version=1,
+        )
+        # Detached: do not add to session.
+        return lease, stand_in
 
     def update_refresh_token(
         self,
@@ -1387,19 +1490,34 @@ class LeaseService:
         if lease_preview is None:
             raise LeaseNotFoundError("租约不存在")
         mailbox_id = lease_preview.mailbox_id
+        provider_resource_id = lease_preview.provider_resource_id
 
-        mailbox = self._session.scalar(
-            select(Mailbox).where(Mailbox.id == mailbox_id).with_for_update()
-        )
-        if mailbox is None:
+        if mailbox_id:
+            mailbox = self._session.scalar(
+                select(Mailbox).where(Mailbox.id == mailbox_id).with_for_update()
+            )
+            if mailbox is None:
+                raise LeaseNotFoundError("租约不存在")
+            _claim = self._session.scalar(
+                select(MailboxLeaseClaim)
+                .where(MailboxLeaseClaim.mailbox_id == mailbox_id)
+                .with_for_update()
+            )
+        elif provider_resource_id:
+            resource = self._session.scalar(
+                select(MailboxProviderResource)
+                .where(MailboxProviderResource.id == provider_resource_id)
+                .with_for_update()
+            )
+            if resource is None:
+                raise LeaseNotFoundError("租约不存在")
+            _claim = self._session.scalar(
+                select(MailboxLeaseClaim)
+                .where(MailboxLeaseClaim.provider_resource_id == provider_resource_id)
+                .with_for_update()
+            )
+        else:
             raise LeaseNotFoundError("租约不存在")
-
-        # Optional: lock claim row after mailbox when present (same mailbox_id PK).
-        _claim = self._session.scalar(
-            select(MailboxLeaseClaim)
-            .where(MailboxLeaseClaim.mailbox_id == mailbox_id)
-            .with_for_update()
-        )
 
         lease = self._session.scalar(
             select(Lease)
@@ -1411,7 +1529,9 @@ class LeaseService:
         )
         if lease is None:
             raise LeaseNotFoundError("租约不存在")
-        if lease.mailbox_id != mailbox_id:
+        if mailbox_id and lease.mailbox_id != mailbox_id:
+            raise LeaseNotFoundError("租约不存在")
+        if provider_resource_id and lease.provider_resource_id != provider_resource_id:
             raise LeaseNotFoundError("租约不存在")
         if require_active and (lease.released_at is not None or self._is_expired(lease.expires_at)):
             raise LeaseInactiveError("租约已释放或已过期")
@@ -1872,21 +1992,33 @@ class LeaseService:
         """Insert or replace the claim row for this lease_id.
 
         Plus-alias mail_read claims may coexist on one mailbox. Exclusive claims
-        (AT / RT / primary mail_read) conflict with any other live exclusive claim
-        on the same mailbox. Expired claims for this mailbox are purged first.
+        conflict with any other live claim on the same mailbox or provider resource.
         """
         current_time = utc_now()
         sql_current_time = current_time.replace(tzinfo=None)
-        self._session.execute(
-            delete(MailboxLeaseClaim).where(
-                MailboxLeaseClaim.mailbox_id == lease.mailbox_id,
-                MailboxLeaseClaim.expires_at <= sql_current_time,
+        if lease.mailbox_id:
+            self._session.execute(
+                delete(MailboxLeaseClaim).where(
+                    MailboxLeaseClaim.mailbox_id == lease.mailbox_id,
+                    MailboxLeaseClaim.expires_at <= sql_current_time,
+                )
             )
-        )
+        elif lease.provider_resource_id:
+            self._session.execute(
+                delete(MailboxLeaseClaim).where(
+                    MailboxLeaseClaim.provider_resource_id == lease.provider_resource_id,
+                    MailboxLeaseClaim.expires_at <= sql_current_time,
+                )
+            )
         self._session.flush()
 
-        mailbox = self._session.get(Mailbox, lease.mailbox_id)
-        primary_email = (mailbox.primary_email if mailbox is not None else "") or ""
+        primary_email = ""
+        if lease.mailbox_id:
+            mailbox = self._session.get(Mailbox, lease.mailbox_id)
+            primary_email = (mailbox.primary_email if mailbox is not None else "") or ""
+        elif lease.provider_resource_id:
+            resource = self._session.get(MailboxProviderResource, lease.provider_resource_id)
+            primary_email = (resource.primary_email if resource is not None else "") or ""
         new_is_plus = (
             lease.mode == LeaseMode.MAIL_READ
             and allocated_email is not None
@@ -1899,15 +2031,26 @@ class LeaseService:
             self._session.flush()
 
         if not new_is_plus:
-            # Exclusive claim cannot coexist with any other live claim on this mailbox.
-            conflicting_claim = self._session.scalar(
-                select(MailboxLeaseClaim.lease_id).where(
-                    MailboxLeaseClaim.mailbox_id == lease.mailbox_id,
-                    MailboxLeaseClaim.lease_id != lease.id,
-                    MailboxLeaseClaim.expires_at > sql_current_time,
+            if lease.mailbox_id:
+                conflicting_claim = self._session.scalar(
+                    select(MailboxLeaseClaim.lease_id).where(
+                        MailboxLeaseClaim.mailbox_id == lease.mailbox_id,
+                        MailboxLeaseClaim.lease_id != lease.id,
+                        MailboxLeaseClaim.expires_at > sql_current_time,
+                    )
+                    .limit(1)
                 )
-                .limit(1)
-            )
+            elif lease.provider_resource_id:
+                conflicting_claim = self._session.scalar(
+                    select(MailboxLeaseClaim.lease_id).where(
+                        MailboxLeaseClaim.provider_resource_id == lease.provider_resource_id,
+                        MailboxLeaseClaim.lease_id != lease.id,
+                        MailboxLeaseClaim.expires_at > sql_current_time,
+                    )
+                    .limit(1)
+                )
+            else:
+                conflicting_claim = None
             if conflicting_claim is not None:
                 raise IntegrityError(
                     "mailbox_lease_claims conflict",
@@ -1926,6 +2069,7 @@ class LeaseService:
             MailboxLeaseClaim(
                 lease_id=lease.id,
                 mailbox_id=lease.mailbox_id,
+                provider_resource_id=lease.provider_resource_id,
                 client_key_id=lease.client_key_id,
                 mode=lease.mode,
                 allocated_email=allocated_email,

@@ -119,3 +119,84 @@ def test_inbucket_provision_local_only() -> None:
     assert result.address.endswith("@local.test")
     assert result.address.startswith("alice@")
     assert result.secret_payload["mailbox_name"] == "alice"
+
+
+def test_ondemand_acquire_does_not_write_mailboxes() -> None:
+    """On-demand provision binds lease to provider resource only."""
+    from base64 import urlsafe_b64encode
+    from sqlalchemy import create_engine, select
+    from sqlalchemy.orm import sessionmaker
+    from sqlalchemy.pool import StaticPool
+
+    from mailbox_service.client_key_service import ClientKeyService
+    from mailbox_service.config import Settings
+    from mailbox_service.database import Base
+    from mailbox_service.lease_service import LeaseService, set_on_demand_provision_hook
+    from mailbox_service.models import Lease, LeaseMode, Mailbox, MailboxProviderResource
+    from mailbox_service.providers.ports import OnDemandProvisionResult
+    from mailbox_service.proxy_service import MicrosoftTokenResponse
+    from mailbox_service.security import CredentialCipher
+    from mailbox_service.token_service import MailboxAccessTokenService
+
+    class NoopOAuth:
+        def refresh_access_token(self, mailbox, refresh_token, *, scope=None):
+            return MicrosoftTokenResponse(access_token="x", expires_in=3600)
+
+    engine = create_engine(
+        "sqlite+pysqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+        future=True,
+    )
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False)
+    session = factory()
+    key = urlsafe_b64encode(b"o" * 32).decode()
+    settings = Settings(database_url="sqlite+pysqlite:///:memory:", app_env="test", credential_encryption_key=key)
+    cipher = CredentialCipher(key)
+    token = MailboxAccessTokenService(session, settings, cipher, NoopOAuth(), session_factory=factory)
+    lease_service = LeaseService(session, cipher, token, session_factory=factory)
+
+    def _hook(request):
+        return OnDemandProvisionResult(
+            address="temp@provider.example",
+            external_resource_id="ext-1",
+            secret_payload={"token": "t"},
+            metadata={"source": "test"},
+        )
+
+    set_on_demand_provision_hook(_hook)
+    try:
+        principal = ClientKeyService(session).authenticate(
+            ClientKeyService(session)
+            .create_client_key(
+                name="od",
+                scopes=["mailboxes:acquire", "providers:cloudflare_temp_email:acquire", "leases:release"],
+            )
+            .api_key
+        )
+        result = lease_service.acquire_lease(
+            principal,
+            mode=LeaseMode.MAIL_READ,
+            ttl_seconds=300,
+            provider="cloudflare_temp_email",
+            explicit_provider_request=True,
+        )
+        assert result.mailbox_id is None
+        assert result.provider_resource_id is not None
+        assert result.primary_email == "temp@provider.example"
+        assert session.scalars(select(Mailbox)).first() is None
+        resource = session.get(MailboxProviderResource, result.provider_resource_id)
+        assert resource is not None
+        assert resource.lifecycle_state == "claimed"
+        lease = session.get(Lease, result.lease_id)
+        assert lease is not None
+        assert lease.mailbox_id is None
+        assert lease.provider_resource_id == resource.id
+        lease_service.release_lease(principal, result.lease_id)
+        session.flush()
+        resource = session.get(MailboxProviderResource, result.provider_resource_id)
+        assert resource.lifecycle_state == "retired"
+        assert session.scalars(select(Mailbox)).first() is None
+    finally:
+        set_on_demand_provision_hook(None)

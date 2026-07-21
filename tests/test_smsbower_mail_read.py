@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from base64 import urlsafe_b64encode
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -48,32 +48,27 @@ def _build():
     return session, cipher, lease
 
 
+def _seed_resource(session, cipher, email: str = "sms.a@gmail.com", external_id: str = "act-1") -> MailboxProviderResource:
+    resource = MailboxProviderResource(
+        provider_type="smsbower_gmail",
+        provider_instance_id="default",
+        external_resource_id=external_id,
+        primary_email=email,
+        lifecycle_state=ProviderResourceLifecycle.AVAILABLE.value,
+        readiness=ProviderResourceReadiness.READY.value,
+        state_version=0,
+        resource_generation=0,
+        encrypted_secret=cipher.encrypt(f'{{"mail_id":"{external_id}"}}'),
+    )
+    session.add(resource)
+    session.flush()
+    return resource
+
+
 def test_smsbower_acquire_requires_scope_and_claims_resource() -> None:
     session, cipher, lease_service = _build()
-    mailbox = Mailbox(
-        primary_email="sms.a@gmail.com",
-        provider_type="smsbower_gmail",
-        status=MailboxStatus.ACTIVE,
-        token_version=1,
-    )
-    session.add(mailbox)
-    session.flush()
-    session.add(
-        MailboxProviderResource(
-            mailbox_id=mailbox.id,
-            provider_type="smsbower_gmail",
-            provider_instance_id="default",
-            external_resource_id="act-1",
-            lifecycle_state=ProviderResourceLifecycle.AVAILABLE.value,
-            readiness=ProviderResourceReadiness.READY.value,
-            state_version=0,
-            resource_generation=0,
-            encrypted_secret=cipher.encrypt('{"mail_id":"act-1"}'),
-        )
-    )
-    session.flush()
+    resource = _seed_resource(session, cipher)
     key_service = ClientKeyService(session)
-    # Without provider scope -> 403 domain error via ClientKeyScopeError
     creation = key_service.create_client_key(name="no-scope", scopes=["mailboxes:acquire"])
     principal = key_service.authenticate(creation.api_key)
     try:
@@ -103,13 +98,16 @@ def test_smsbower_acquire_requires_scope_and_claims_resource() -> None:
         explicit_provider_request=True,
     )
     assert result.provider_type == "smsbower_gmail"
+    assert result.mailbox_id is None
+    assert result.provider_resource_id == resource.id
     assert result.allocated_email == "sms.a@gmail.com"
-    resource = session.get(MailboxProviderResource, mailbox.id)
-    assert resource is not None
-    assert resource.lifecycle_state == "claimed"
-    assert resource.resource_generation == 1
+    # must not pollute mailboxes
+    assert session.scalars(select(Mailbox)).first() is None
+    stored = session.get(MailboxProviderResource, resource.id)
+    assert stored is not None
+    assert stored.lifecycle_state == "claimed"
+    assert stored.resource_generation == 1
 
-    # Second acquire blocked while claimed
     try:
         lease_service.acquire_lease(
             principal2,
@@ -123,52 +121,29 @@ def test_smsbower_acquire_requires_scope_and_claims_resource() -> None:
         blocked = True
     assert blocked
 
-    # Release begins releasing + operation
     lease_service.release_lease(principal2, result.lease_id)
     session.flush()
-    resource = session.get(MailboxProviderResource, mailbox.id)
-    assert resource is not None
-    assert resource.lifecycle_state == "releasing"
+    stored = session.get(MailboxProviderResource, resource.id)
+    assert stored is not None
+    assert stored.lifecycle_state == "releasing"
 
 
 def test_omitted_provider_with_scope_can_select_smsbower() -> None:
     """Omit/all pools authorized types; smsbower is eligible when scoped and inventory exists."""
     session, cipher, lease_service = _build()
-    session.add(
-        Mailbox(
-            primary_email="sms.only@gmail.com",
-            provider_type="smsbower_gmail",
-            status=MailboxStatus.ACTIVE,
-            token_version=1,
-        )
-    )
-    session.flush()
-    from sqlalchemy import select
-
-    mailbox = session.scalar(select(Mailbox))
-    session.add(
-        MailboxProviderResource(
-            mailbox_id=mailbox.id,
-            provider_type="smsbower_gmail",
-            provider_instance_id="default",
-            external_resource_id="act-2",
-            lifecycle_state=ProviderResourceLifecycle.AVAILABLE.value,
-            readiness=ProviderResourceReadiness.READY.value,
-            state_version=0,
-            resource_generation=0,
-        )
-    )
-    session.flush()
-    creation = ClientKeyService(session).create_client_key(
-        name="with-sms",
+    _seed_resource(session, cipher, email="sms.only@gmail.com", external_id="act-only")
+    key_service = ClientKeyService(session)
+    creation = key_service.create_client_key(
+        name="with-scope",
         scopes=["mailboxes:acquire", "providers:smsbower_gmail:acquire"],
     )
-    principal = ClientKeyService(session).authenticate(creation.api_key)
+    principal = key_service.authenticate(creation.api_key)
     result = lease_service.acquire_lease(
         principal,
         mode=LeaseMode.MAIL_READ,
         ttl_seconds=300,
-        usage_site=None,
     )
     assert result.provider_type == "smsbower_gmail"
-    assert result.primary_email == "sms.only@gmail.com"
+    assert result.mailbox_id is None
+    assert result.provider_resource_id is not None
+    assert session.scalars(select(Mailbox)).first() is None

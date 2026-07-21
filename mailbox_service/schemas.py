@@ -619,7 +619,14 @@ class MailboxAcquireResponse(BaseModel):
     """可用邮箱账号领取结果，仅返回邮箱身份与 mail_read 租约。"""
 
     lease_id: str = Field(description="mail_read 租约 ID，后续取验证码 / 释放时使用。")
-    mailbox_id: str = Field(description="被领取邮箱的 ID。")
+    mailbox_id: str | None = Field(
+        default=None,
+        description="有所有权邮箱 ID（microsoft）；临时/付费租赁邮箱为 null。",
+    )
+    provider_resource_id: str | None = Field(
+        default=None,
+        description="非所有权 provider 资源 ID（smsbower / on-demand）；所有权邮箱为 null。",
+    )
     primary_email: str = Field(description="主邮箱地址（OAuth / IMAP 登录身份）。")
     allocated_email: str = Field(
         description="本租约分配的业务收件地址：主邮箱或 plus alias，用于注册与验证码匹配。",
@@ -649,7 +656,8 @@ class SmsbowerReplenishResponse(BaseModel):
 
     operation_id: str = Field(description="durable operation ID")
     status: str = Field(description="succeeded | failed | unknown")
-    mailbox_id: str | None = Field(default=None, description="写入库存的 mailbox ID")
+    mailbox_id: str | None = Field(default=None, description="兼容字段：始终为 null（不再写入 mailboxes）")
+    provider_resource_id: str | None = Field(default=None, description="写入 provider 资源表的 ID")
     primary_email: str | None = Field(default=None, description="租到的邮箱地址")
     external_resource_id: str | None = Field(default=None, description="上游 activation / mailId")
     error_class: str | None = Field(default=None, description="失败分类（无敏感信息）")

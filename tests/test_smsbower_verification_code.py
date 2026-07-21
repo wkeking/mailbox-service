@@ -61,28 +61,27 @@ def test_smsbower_get_code_returns_direct_code(monkeypatch) -> None:
         smsbower_api_key="k",
     )
     cipher = CredentialCipher(key)
+    resource = MailboxProviderResource(
+        provider_type="smsbower_gmail",
+        provider_instance_id="default",
+        external_resource_id="mid-9",
+        primary_email="code@gmail.com",
+        lifecycle_state=ProviderResourceLifecycle.CLAIMED.value,
+        readiness=ProviderResourceReadiness.READY.value,
+        state_version=1,
+        resource_generation=1,
+        encrypted_secret=cipher.encrypt('{"mail_id":"mid-9"}'),
+    )
+    session.add(resource)
+    session.commit()
+    # Stand-in mailbox for verification routing (not persisted as ownership inventory).
     mailbox = Mailbox(
+        id=resource.id,
         primary_email="code@gmail.com",
         provider_type="smsbower_gmail",
         status=MailboxStatus.ACTIVE,
         token_version=1,
     )
-    session.add(mailbox)
-    session.flush()
-    session.add(
-        MailboxProviderResource(
-            mailbox_id=mailbox.id,
-            provider_type="smsbower_gmail",
-            provider_instance_id="default",
-            external_resource_id="mid-9",
-            lifecycle_state=ProviderResourceLifecycle.CLAIMED.value,
-            readiness=ProviderResourceReadiness.READY.value,
-            state_version=1,
-            resource_generation=1,
-            encrypted_secret=cipher.encrypt('{"mail_id":"mid-9"}'),
-        )
-    )
-    session.commit()
 
     token_service = MailboxAccessTokenService(
         session, settings, cipher, NoopOAuth(), session_factory=factory

@@ -270,20 +270,27 @@ class MailboxLeaseClaim(Base):
 
     Primary key is lease_id so multiple plus-alias mail_read claims may share one
     mailbox. Exclusive modes still enforce at most one exclusive claim per mailbox
-    in LeaseService application logic.
+    (or provider resource) in LeaseService application logic.
+
+    Owned Microsoft leases set mailbox_id; non-owned (smsbower / on-demand) set
+    provider_resource_id only.
     """
 
     __tablename__ = "mailbox_lease_claims"
     __table_args__ = (
         UniqueConstraint("allocated_email", name="uq_mailbox_lease_claims_allocated_email"),
         Index("ix_mailbox_lease_claims_mailbox_id", "mailbox_id"),
+        Index("ix_mailbox_lease_claims_provider_resource", "provider_resource_id"),
         Index("ix_mailbox_lease_claims_expires_at", "expires_at"),
         Index("ix_mailbox_lease_claims_client", "client_key_id", "expires_at"),
     )
 
     lease_id: Mapped[str] = mapped_column(String(36), primary_key=True)
-    mailbox_id: Mapped[str] = mapped_column(
-        ForeignKey("mailboxes.id", ondelete="CASCADE"), nullable=False
+    mailbox_id: Mapped[str | None] = mapped_column(
+        ForeignKey("mailboxes.id", ondelete="CASCADE"), nullable=True
+    )
+    provider_resource_id: Mapped[str | None] = mapped_column(
+        ForeignKey("mailbox_provider_resources.id", ondelete="CASCADE"), nullable=True
     )
     client_key_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     mode: Mapped[LeaseMode] = mapped_column(
@@ -295,18 +302,26 @@ class MailboxLeaseClaim(Base):
 
 
 class Lease(Base):
-    """A mailbox lease used by client systems to reserve one credential record."""
+    """A lease for an owned mailbox or a non-owned provider resource."""
 
     __tablename__ = "leases"
     __table_args__ = (
         Index("ix_leases_mailbox_active", "mailbox_id", "released_at", "expires_at"),
+        Index("ix_leases_provider_resource", "provider_resource_id", "released_at", "expires_at"),
         Index("ix_leases_client_created", "client_key_id", "created_at"),
         Index("ix_leases_provider_type", "provider_type", "released_at", "expires_at"),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    mailbox_id: Mapped[str] = mapped_column(
-        ForeignKey("mailboxes.id", ondelete="CASCADE"), nullable=False, index=True
+    # Owned inventory only (microsoft). Null for smsbower / on-demand leases.
+    mailbox_id: Mapped[str | None] = mapped_column(
+        ForeignKey("mailboxes.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    # Non-owned provider inventory / ephemeral resource. Null for microsoft leases.
+    provider_resource_id: Mapped[str | None] = mapped_column(
+        ForeignKey("mailbox_provider_resources.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
     )
     client_key_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     client_tag: Mapped[str | None] = mapped_column(String(100), nullable=True)
@@ -326,11 +341,15 @@ class Lease(Base):
     released_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
 
-    mailbox: Mapped[Mailbox] = relationship()
+    mailbox: Mapped[Mailbox | None] = relationship()
+    provider_resource: Mapped["MailboxProviderResource | None"] = relationship()
 
 
 class MailboxProviderResource(Base):
-    """External inventory resource attached to one mailbox (SMSBower activation, etc.)."""
+    """Non-owned external mailbox resource (SMSBower, on-demand temp, etc.).
+
+    Must never be mirrored into ``mailboxes`` (ownership-only inventory).
+    """
 
     __tablename__ = "mailbox_provider_resources"
     __table_args__ = (
@@ -340,14 +359,14 @@ class MailboxProviderResource(Base):
             name="uq_provider_instance_external",
         ),
         Index("ix_provider_resources_lifecycle", "provider_type", "lifecycle_state", "readiness"),
+        Index("ix_provider_resources_email", "primary_email"),
     )
 
-    mailbox_id: Mapped[str] = mapped_column(
-        ForeignKey("mailboxes.id", ondelete="CASCADE"), primary_key=True
-    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     provider_type: Mapped[str] = mapped_column(String(64), nullable=False)
     provider_instance_id: Mapped[str] = mapped_column(String(64), nullable=False)
     external_resource_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    primary_email: Mapped[str] = mapped_column(String(320), nullable=False)
     lifecycle_state: Mapped[str] = mapped_column(String(32), nullable=False)
     readiness: Mapped[str] = mapped_column(String(32), nullable=False)
     state_version: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
@@ -369,6 +388,7 @@ class MailboxProviderOperation(Base):
         UniqueConstraint("idempotency_key", name="uq_provider_ops_idempotency"),
         Index("ix_provider_ops_status", "status", "updated_at"),
         Index("ix_provider_ops_mailbox", "mailbox_id", "status"),
+        Index("ix_provider_ops_resource", "provider_resource_id", "status"),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
@@ -377,6 +397,9 @@ class MailboxProviderOperation(Base):
     provider_instance_id: Mapped[str] = mapped_column(String(64), nullable=False)
     mailbox_id: Mapped[str | None] = mapped_column(
         ForeignKey("mailboxes.id", ondelete="SET NULL"), nullable=True
+    )
+    provider_resource_id: Mapped[str | None] = mapped_column(
+        ForeignKey("mailbox_provider_resources.id", ondelete="SET NULL"), nullable=True
     )
     lease_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     external_resource_id: Mapped[str | None] = mapped_column(String(255), nullable=True)

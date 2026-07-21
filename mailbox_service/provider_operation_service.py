@@ -10,10 +10,8 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from mailbox_service.models import (
     AuditLog,
-    Mailbox,
     MailboxProviderOperation,
     MailboxProviderResource,
-    MailboxStatus,
     ProviderOperationStatus,
     ProviderOperationType,
     ProviderResourceLifecycle,
@@ -31,6 +29,7 @@ class ProviderOperationSnapshot:
     provider_instance_id: str
     status: str
     mailbox_id: str | None
+    provider_resource_id: str | None
     lease_id: str | None
     external_resource_id: str | None
     resource_generation: int | None
@@ -60,6 +59,7 @@ class ProviderOperationService:
         provider_instance_id: str,
         idempotency_key: str,
         mailbox_id: str | None = None,
+        provider_resource_id: str | None = None,
         lease_id: str | None = None,
         external_resource_id: str | None = None,
         resource_generation: int | None = None,
@@ -79,6 +79,7 @@ class ProviderOperationService:
             provider_type=provider_type,
             provider_instance_id=provider_instance_id,
             mailbox_id=mailbox_id,
+            provider_resource_id=provider_resource_id,
             lease_id=lease_id,
             external_resource_id=external_resource_id,
             resource_generation=resource_generation,
@@ -130,7 +131,7 @@ class ProviderOperationService:
         cost: float | None,
         actor_id: str = "admin",
     ) -> str:
-        """Idempotent insert of mailbox + resource for a successful getActivation."""
+        """Idempotent insert of provider resource only (never writes mailboxes)."""
         existing_resource = self._session.scalar(
             select(MailboxProviderResource).where(
                 MailboxProviderResource.provider_instance_id == provider_instance_id,
@@ -142,37 +143,21 @@ class ProviderOperationService:
                 operation_id,
                 status=ProviderOperationStatus.SUCCEEDED.value,
                 result_summary={
-                    "mailbox_id": existing_resource.mailbox_id,
+                    "provider_resource_id": existing_resource.id,
                     "external_resource_id": external_resource_id,
                     "deduplicated": True,
                     "cost": cost,
                 },
             )
-            return existing_resource.mailbox_id
+            return existing_resource.id
 
-        mailbox_id = str(uuid.uuid4())
-        mailbox = Mailbox(
-            id=mailbox_id,
-            provider_type="smsbower_gmail",
-            primary_email=primary_email.strip().lower(),
-            status=MailboxStatus.ACTIVE,
-            client_id=None,
-            refresh_token_ciphertext=None,
-            access_token_ciphertext=None,
-            capability=None,
-            token_version=1,
-            provider_config_json={
-                "external_resource_id": external_resource_id,
-                "provider_instance_id": provider_instance_id,
-            },
-        )
-        self._session.add(mailbox)
-        self._session.flush()
+        resource_id = str(uuid.uuid4())
         resource = MailboxProviderResource(
-            mailbox_id=mailbox_id,
+            id=resource_id,
             provider_type="smsbower_gmail",
             provider_instance_id=provider_instance_id,
             external_resource_id=external_resource_id,
+            primary_email=primary_email.strip().lower(),
             lifecycle_state=ProviderResourceLifecycle.AVAILABLE.value,
             readiness=ProviderResourceReadiness.READY.value,
             state_version=0,
@@ -186,42 +171,45 @@ class ProviderOperationService:
                 actor_type="admin",
                 actor_id=actor_id,
                 event_type="provider.replenish.succeeded",
-                target_type="mailbox",
-                target_id=mailbox_id,
+                target_type="provider_resource",
+                target_id=resource_id,
                 metadata_json={
                     "operation_id": operation_id,
                     "provider_type": "smsbower_gmail",
                     "provider_instance_id": provider_instance_id,
                     "external_resource_id": external_resource_id,
+                    "primary_email": primary_email.strip().lower(),
                     "cost": cost,
                 },
             )
         )
         operation = self._session.get(MailboxProviderOperation, operation_id)
         if operation is not None:
-            operation.mailbox_id = mailbox_id
+            operation.provider_resource_id = resource_id
+            operation.mailbox_id = None
             operation.external_resource_id = external_resource_id
             operation.status = ProviderOperationStatus.SUCCEEDED.value
             operation.result_summary_json = {
-                "mailbox_id": mailbox_id,
+                "provider_resource_id": resource_id,
                 "external_resource_id": external_resource_id,
                 "cost": cost,
             }
             operation.updated_at = utc_now()
         self._session.flush()
-        return mailbox_id
+        return resource_id
 
     def begin_release_operation(
         self,
         *,
         lease_id: str,
-        mailbox_id: str,
+        provider_resource_id: str,
         provider_type: str,
         provider_instance_id: str,
         external_resource_id: str,
         resource_generation: int,
         expected_state_version: int,
         principal_id: str,
+        mailbox_id: str | None = None,
     ) -> ProviderOperationSnapshot:
         """Mark resource releasing and create pending release operation (same short txn)."""
         idempotency_key = f"release:{lease_id}:{resource_generation}"
@@ -233,7 +221,7 @@ class ProviderOperationService:
         if existing is not None:
             return self._to_snapshot(existing)
 
-        resource = self._session.get(MailboxProviderResource, mailbox_id)
+        resource = self._session.get(MailboxProviderResource, provider_resource_id)
         if resource is None:
             raise RuntimeError("provider resource missing for release")
         if resource.lifecycle_state not in (
@@ -241,7 +229,7 @@ class ProviderOperationService:
             ProviderResourceLifecycle.RELEASING.value,
             ProviderResourceLifecycle.RELEASE_UNKNOWN.value,
         ):
-            # Already terminal or available — still create idempotent no-op snapshot when claimed.
+            # Already terminal or available — still create idempotent pending release.
             pass
         resource.lifecycle_state = ProviderResourceLifecycle.RELEASING.value
         resource.state_version = int(resource.state_version or 0) + 1
@@ -252,6 +240,7 @@ class ProviderOperationService:
             provider_instance_id=provider_instance_id,
             idempotency_key=idempotency_key,
             mailbox_id=mailbox_id,
+            provider_resource_id=provider_resource_id,
             lease_id=lease_id,
             external_resource_id=external_resource_id,
             resource_generation=resource_generation,
@@ -266,7 +255,7 @@ class ProviderOperationService:
                 target_id=lease_id,
                 metadata_json={
                     "operation_id": snapshot.operation_id,
-                    "mailbox_id": mailbox_id,
+                    "provider_resource_id": provider_resource_id,
                     "external_resource_id": external_resource_id,
                     "resource_generation": resource_generation,
                 },
@@ -279,20 +268,21 @@ class ProviderOperationService:
         self,
         *,
         operation_id: str,
-        mailbox_id: str,
+        provider_resource_id: str,
         expected_generation: int,
         expected_state_version: int,
         outcome: str,
         clear_secret: bool = False,
+        mailbox_id: str | None = None,
     ) -> bool:
         """CAS finalize resource lifecycle after setStatus. Returns whether applied."""
-        resource = self._session.get(MailboxProviderResource, mailbox_id)
+        del mailbox_id  # retained for call-site compatibility; lookup is by resource id
+        resource = self._session.get(MailboxProviderResource, provider_resource_id)
         operation = self._session.get(MailboxProviderOperation, operation_id)
         if resource is None or operation is None:
             return False
         if int(resource.resource_generation or 0) != int(expected_generation):
             return False
-        # state_version was already incremented when entering releasing; accept that or +0 race.
         if resource.lifecycle_state not in (
             ProviderResourceLifecycle.RELEASING.value,
             ProviderResourceLifecycle.RELEASE_UNKNOWN.value,
@@ -339,6 +329,7 @@ class ProviderOperationService:
             provider_instance_id=operation.provider_instance_id,
             status=operation.status,
             mailbox_id=operation.mailbox_id,
+            provider_resource_id=getattr(operation, "provider_resource_id", None),
             lease_id=operation.lease_id,
             external_resource_id=operation.external_resource_id,
             resource_generation=operation.resource_generation,

@@ -116,10 +116,11 @@ def test_provider_resource_unique_external_id(
         session.flush()
         session.add(
             MailboxProviderResource(
-                mailbox_id=first.id,
+                id=first.id,
                 provider_type="smsbower_gmail",
                 provider_instance_id="default",
                 external_resource_id=f"activation-{unique}",
+            primary_email="resource@example.com",
                 lifecycle_state=ProviderResourceLifecycle.AVAILABLE.value,
                 readiness=ProviderResourceReadiness.READY.value,
                 state_version=0,
@@ -129,10 +130,11 @@ def test_provider_resource_unique_external_id(
         session.commit()
         session.add(
             MailboxProviderResource(
-                mailbox_id=second.id,
+                id=second.id,
                 provider_type="smsbower_gmail",
                 provider_instance_id="default",
                 external_resource_id=f"activation-{unique}",
+            primary_email="resource@example.com",
                 lifecycle_state=ProviderResourceLifecycle.AVAILABLE.value,
                 readiness=ProviderResourceReadiness.READY.value,
                 state_version=0,

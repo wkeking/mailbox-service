@@ -1224,6 +1224,7 @@ def acquire_mailbox_account(
     return MailboxAcquireResponse(
         lease_id=result.lease_id,
         mailbox_id=result.mailbox_id,
+        provider_resource_id=result.provider_resource_id,
         primary_email=result.primary_email,
         allocated_email=result.allocated_email or result.primary_email,
         address_kind=result.address_kind,
@@ -1744,7 +1745,10 @@ def list_mailboxes(
 ) -> MailboxListResponse:
     """List mailbox operational metadata page by page without returning credentials."""
     current_time = utc_now()
-    total_mailbox_count = session.scalar(select(func.count(Mailbox.id))) or 0
+    ownership_filter = Mailbox.provider_type == "microsoft"
+    total_mailbox_count = session.scalar(
+        select(func.count(Mailbox.id)).where(ownership_filter)
+    ) or 0
     total_pages = max(1, (total_mailbox_count + page_size - 1) // page_size)
     offset = (page - 1) * page_size
     active_lease_count = (
@@ -1757,6 +1761,7 @@ def list_mailboxes(
     rows = session.execute(
         select(Mailbox, EgressProxy.name, active_lease_count.label("active_lease_count"))
         .outerjoin(EgressProxy, Mailbox.egress_proxy_id == EgressProxy.id)
+        .where(ownership_filter)
         .order_by(Mailbox.updated_at.desc(), Mailbox.primary_email.asc())
         .offset(offset)
         .limit(page_size)
@@ -1817,7 +1822,8 @@ def _maybe_finalize_smsbower_release(session, settings: Settings, lease_id: str)
     )
     if operation is None or operation.status not in ("pending", "running", "unknown"):
         return
-    resource = session.get(MailboxProviderResource, lease.mailbox_id)
+    resource_id = lease.provider_resource_id or operation.provider_resource_id
+    resource = session.get(MailboxProviderResource, resource_id) if resource_id else None
     if resource is None:
         return
     # Commit local state before network.
@@ -1852,7 +1858,7 @@ def _maybe_finalize_smsbower_release(session, settings: Settings, lease_id: str)
             ops = ProviderOperationService(finalize_session)
             ops.finalize_release_cas(
                 operation_id=operation.id,
-                mailbox_id=lease.mailbox_id,
+                provider_resource_id=resource.id,
                 expected_generation=int(snapshot.resource_generation),
                 expected_state_version=int(snapshot.expected_state_version),
                 outcome=outcome_status if outcome_status in ("succeeded", "failed", "unknown") else "unknown",
@@ -2084,7 +2090,8 @@ def admin_replenish_smsbower(
     return SmsbowerReplenishResponse(
         operation_id=outcome.operation_id,
         status=outcome.status,
-        mailbox_id=outcome.mailbox_id,
+        mailbox_id=None,
+        provider_resource_id=getattr(outcome, "provider_resource_id", None),
         primary_email=outcome.primary_email,
         external_resource_id=outcome.external_resource_id,
         error_class=outcome.error_class,

@@ -4,9 +4,9 @@
 
 | Provider | 供给 | 能力 | 说明 |
 | --- | --- | --- | --- |
-| `microsoft` | inventory 导入 | AT / RT / mail_read | Outlook/Hotmail OAuth；四段文本导入；无额外 scope 时随机池仅此 |
-| `smsbower_gmail` | inventory 补货 | mail_read | 需 `providers:smsbower_gmail:acquire`；可进随机池或显式指定；管理台可配置与补货 |
-| `cloudflare_temp_email` | on_demand | mail_read | 管理台配置；领取时即时开箱 |
+| `microsoft` | inventory 导入 | AT / RT / mail_read | **有所有权**凭证；写入 `mailboxes`；四段文本导入；无额外 scope 时随机池仅此 |
+| `smsbower_gmail` | inventory 补货 | mail_read | **非所有权**付费租号；只写 `mailbox_provider_resources`，**不**进 `mailboxes`；需 `providers:smsbower_gmail:acquire` |
+| `cloudflare_temp_email` | on_demand | mail_read | **非所有权**临时邮箱；领取时即时开箱，只写 provider 资源表，**不**进 `mailboxes` |
 | `ddg_mail` | on_demand | mail_read | DDG 别名 + CF 兼容收件箱 |
 | `cloudmail_gen` | on_demand | mail_read | 管理台配置 |
 | `tempmail_lol` | on_demand | mail_read | 管理台配置 |
@@ -23,6 +23,8 @@
 | **邮箱 Provider** | 各类型启停、API Base、域名与密钥（加密保存、不回显明文）；SMSBower 补货 |
 | **Client Key** | 创建 / **编辑名称与权限** / 停用；明文仅创建时显示一次；编辑弹窗支持固定高度内滚动 |
 | **邮箱 / 租约 / 注册站点 / 站点占用 / 出口代理** | 见下文管理 API 与管理台说明 |
+
+**`mailboxes` 语义：** 仅维护有所有权的邮箱（当前为 Microsoft OAuth 导入）。临时邮箱（on-demand）与付费租赁（SMSBower）落在 `mailbox_provider_resources`，lease 绑定 `provider_resource_id`，`mailbox_id` 为空。管理台「邮箱管理」只展示所有权邮箱。
 
 非 Microsoft 领取须 Client Key 具备 `providers:{type}:acquire`。  
 `POST /mailboxes/acquire` 多类型与 plus 语义见 [外部服务 API · mail_read 领取](#mail_read-领取可用邮箱账号) 与对接文档 [docs/external-mailboxes-acquire-integration.md](docs/external-mailboxes-acquire-integration.md)。

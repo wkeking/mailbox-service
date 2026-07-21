@@ -101,19 +101,40 @@ def revalidate_verification_authorization(
             message="租约已过期",
         )
 
-    mailbox = session.get(Mailbox, lease.mailbox_id)
-    if mailbox is None or mailbox.status != MailboxStatus.ACTIVE:
+    from mailbox_service.models import MailboxProviderResource, ProviderResourceLifecycle
+
+    if lease.mailbox_id:
+        mailbox = session.get(Mailbox, lease.mailbox_id)
+        if mailbox is None or mailbox.status != MailboxStatus.ACTIVE:
+            raise VerificationAuthorizationError(
+                code="LEASE_INACTIVE",
+                message="租约邮箱当前不可用",
+            )
+        return VerificationLookupAuthorization(
+            lease_id=lease.id,
+            mailbox_id=mailbox.id,
+            client_key_id=principal.client_key_id,
+            primary_email=mailbox.primary_email,
+            allocated_email=lease.allocated_email or mailbox.primary_email,
+        )
+
+    if not lease.provider_resource_id:
         raise VerificationAuthorizationError(
             code="LEASE_INACTIVE",
             message="租约邮箱当前不可用",
         )
-
+    resource = session.get(MailboxProviderResource, lease.provider_resource_id)
+    if resource is None or resource.lifecycle_state != ProviderResourceLifecycle.CLAIMED.value:
+        raise VerificationAuthorizationError(
+            code="LEASE_INACTIVE",
+            message="租约邮箱当前不可用",
+        )
     return VerificationLookupAuthorization(
         lease_id=lease.id,
-        mailbox_id=mailbox.id,
+        mailbox_id=resource.id,
         client_key_id=principal.client_key_id,
-        primary_email=mailbox.primary_email,
-        allocated_email=lease.allocated_email or mailbox.primary_email,
+        primary_email=resource.primary_email,
+        allocated_email=lease.allocated_email or resource.primary_email,
     )
 
 
