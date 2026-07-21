@@ -1977,12 +1977,17 @@ function ClientKeysPage({
   filterText,
   isCreating,
   isCreateDialogOpen,
+  isUpdating,
+  editingClientKey,
   onCloseCreateDialog,
+  onCloseEditDialog,
   onCopyApiKey,
   onCreate,
+  onUpdate,
   onDisable,
   onFilterTextChange,
   onOpenCreateDialog,
+  onOpenEditDialog,
   onDismissCreatedApiKey,
 }: {
   clientKeys: ClientKeyListItem[];
@@ -1990,12 +1995,17 @@ function ClientKeysPage({
   filterText: string;
   isCreating: boolean;
   isCreateDialogOpen: boolean;
+  isUpdating: boolean;
+  editingClientKey: ClientKeyListItem | null;
   onCloseCreateDialog: () => void;
+  onCloseEditDialog: () => void;
   onCopyApiKey: () => void;
   onCreate: (event: FormEvent<HTMLFormElement>) => void;
+  onUpdate: (event: FormEvent<HTMLFormElement>) => void;
   onDisable: (clientKey: ClientKeyListItem) => void;
   onFilterTextChange: (value: string) => void;
   onOpenCreateDialog: () => void;
+  onOpenEditDialog: (clientKey: ClientKeyListItem) => void;
   onDismissCreatedApiKey: () => void;
 }): JSX.Element {
   const visibleClientKeys = useMemo(
@@ -2006,6 +2016,10 @@ function ClientKeysPage({
     [clientKeys, filterText],
   );
   const enabledClientKeyCount = clientKeys.filter((clientKey) => clientKey.enabled).length;
+  const editingScopeSet = useMemo(
+    () => new Set(editingClientKey?.scopes ?? []),
+    [editingClientKey],
+  );
 
   return (
     <>
@@ -2013,7 +2027,7 @@ function ClientKeysPage({
         <div>
           <h1 className="page-title">Client Key 管理</h1>
           <p className="page-subtitle">
-            创建外部调用方 API Key。明文只在创建时显示一次，列表不会回显密钥。
+            创建外部调用方 API Key。明文只在创建时显示一次；已有 Key 可修改名称与权限，密钥明文不可再次查看。
           </p>
         </div>
         <button className="button button-primary" type="button" onClick={onOpenCreateDialog}>
@@ -2105,6 +2119,13 @@ function ClientKeysPage({
                   <td>
                     <div className="cell-actions">
                       <button
+                        className="button"
+                        type="button"
+                        onClick={() => onOpenEditDialog(clientKey)}
+                      >
+                        编辑
+                      </button>
+                      <button
                         className="button button-danger"
                         type="button"
                         disabled={!clientKey.enabled}
@@ -2130,7 +2151,7 @@ function ClientKeysPage({
       {isCreateDialogOpen && (
         <div className="dialog-backdrop" role="presentation">
           <form
-            className="dialog dialog-wide"
+            className="dialog dialog-wide dialog-scrollable"
             role="dialog"
             aria-modal="true"
             aria-labelledby="client-key-create-title"
@@ -2146,38 +2167,40 @@ function ClientKeysPage({
                 </p>
               </div>
             </div>
-            <div className="form-grid">
-              <label className="form-field full-width">
-                名称
-                <input className="input" name="name" required maxLength={100} placeholder="registration-worker" />
-              </label>
-              <label className="form-field full-width">
-                过期时间（可选）
-                <input className="input" name="expires_at" type="datetime-local" />
-              </label>
-              <fieldset className="form-field full-width scope-fieldset">
-                <legend>权限 scopes</legend>
-                <div className="scope-option-list">
-                  {CLIENT_KEY_SCOPE_OPTIONS.map((scopeOption) => (
-                    <label key={scopeOption.id} className="checkbox-label scope-option">
-                      <input
-                        type="checkbox"
-                        name="scopes"
-                        value={scopeOption.id}
-                        defaultChecked={
-                          scopeOption.id === "leases:acquire" ||
-                          scopeOption.id === "leases:release" ||
-                          scopeOption.id === "tokens:access:read"
-                        }
-                      />
-                      <span>
-                        <strong>{scopeOption.label}</strong>
-                        <div className="muted-copy">{scopeOption.description}</div>
-                      </span>
-                    </label>
-                  ))}
-                </div>
-              </fieldset>
+            <div className="dialog-body">
+              <div className="form-grid">
+                <label className="form-field full-width">
+                  名称
+                  <input className="input" name="name" required maxLength={100} placeholder="registration-worker" />
+                </label>
+                <label className="form-field full-width">
+                  过期时间（可选）
+                  <input className="input" name="expires_at" type="datetime-local" />
+                </label>
+                <fieldset className="form-field full-width scope-fieldset">
+                  <legend>权限 scopes</legend>
+                  <div className="scope-option-list">
+                    {CLIENT_KEY_SCOPE_OPTIONS.map((scopeOption) => (
+                      <label key={scopeOption.id} className="checkbox-label scope-option">
+                        <input
+                          type="checkbox"
+                          name="scopes"
+                          value={scopeOption.id}
+                          defaultChecked={
+                            scopeOption.id === "leases:acquire" ||
+                            scopeOption.id === "leases:release" ||
+                            scopeOption.id === "tokens:access:read"
+                          }
+                        />
+                        <span>
+                          <strong>{scopeOption.label}</strong>
+                          <div className="muted-copy">{scopeOption.description}</div>
+                        </span>
+                      </label>
+                    ))}
+                  </div>
+                </fieldset>
+              </div>
             </div>
             <div className="dialog-actions">
               <button className="button" type="button" onClick={onCloseCreateDialog} disabled={isCreating}>
@@ -2185,6 +2208,74 @@ function ClientKeysPage({
               </button>
               <button className="button button-primary" type="submit" disabled={isCreating}>
                 {isCreating ? "创建中" : "创建并显示密钥"}
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+
+      {editingClientKey && (
+        <div className="dialog-backdrop" role="presentation">
+          <form
+            className="dialog dialog-wide dialog-scrollable"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="client-key-edit-title"
+            key={editingClientKey.id}
+            onSubmit={onUpdate}
+          >
+            <div className="section-header">
+              <div>
+                <h2 className="section-title" id="client-key-edit-title">
+                  编辑 Client Key
+                </h2>
+                <p className="page-subtitle">
+                  可修改显示名称与权限。不会轮换 API Key 明文；已停用的 Key 修改后仍保持停用。
+                </p>
+              </div>
+            </div>
+            <div className="dialog-body">
+              <div className="form-grid">
+                <label className="form-field full-width">
+                  名称
+                  <input
+                    className="input"
+                    name="name"
+                    required
+                    maxLength={100}
+                    defaultValue={editingClientKey.name}
+                  />
+                </label>
+                <div className="form-field full-width">
+                  <span className="muted-copy">Key ID：{editingClientKey.id}</span>
+                </div>
+                <fieldset className="form-field full-width scope-fieldset">
+                  <legend>权限 scopes</legend>
+                  <div className="scope-option-list">
+                    {CLIENT_KEY_SCOPE_OPTIONS.map((scopeOption) => (
+                      <label key={scopeOption.id} className="checkbox-label scope-option">
+                        <input
+                          type="checkbox"
+                          name="scopes"
+                          value={scopeOption.id}
+                          defaultChecked={editingScopeSet.has(scopeOption.id)}
+                        />
+                        <span>
+                          <strong>{scopeOption.label}</strong>
+                          <div className="muted-copy">{scopeOption.description}</div>
+                        </span>
+                      </label>
+                    ))}
+                  </div>
+                </fieldset>
+              </div>
+            </div>
+            <div className="dialog-actions">
+              <button className="button" type="button" onClick={onCloseEditDialog} disabled={isUpdating}>
+                取消
+              </button>
+              <button className="button button-primary" type="submit" disabled={isUpdating}>
+                {isUpdating ? "保存中" : "保存修改"}
               </button>
             </div>
           </form>
@@ -2285,6 +2376,8 @@ function App(): JSX.Element {
   const [clientKeyFilterText, setClientKeyFilterText] = useState("");
   const [isClientKeyCreateDialogOpen, setIsClientKeyCreateDialogOpen] = useState(false);
   const [isCreatingClientKey, setIsCreatingClientKey] = useState(false);
+  const [editingClientKey, setEditingClientKey] = useState<ClientKeyListItem | null>(null);
+  const [isUpdatingClientKey, setIsUpdatingClientKey] = useState(false);
   const [createdClientApiKey, setCreatedClientApiKey] = useState<string | null>(null);
   const [filterText, setFilterText] = useState("");
   const [isLoading, setIsLoading] = useState(false);
@@ -2704,6 +2797,8 @@ function App(): JSX.Element {
     setClientKeys([]);
     setClientKeyFilterText("");
     setIsClientKeyCreateDialogOpen(false);
+    setEditingClientKey(null);
+    setIsUpdatingClientKey(false);
     setCreatedClientApiKey(null);
     setIsProxyDialogOpen(false);
     setProxyDialogDraft(null);
@@ -3370,6 +3465,54 @@ function App(): JSX.Element {
     }
   }
 
+  async function updateClientKey(event: FormEvent<HTMLFormElement>): Promise<void> {
+    event.preventDefault();
+    if (!editingClientKey) {
+      return;
+    }
+    const formData = new FormData(event.currentTarget);
+    const name = String(formData.get("name") ?? "").trim();
+    const scopes = formData
+      .getAll("scopes")
+      .map((scopeValue) => String(scopeValue))
+      .filter((scopeValue): scopeValue is ClientKeyScope =>
+        CLIENT_KEY_SCOPE_OPTIONS.some((option) => option.id === scopeValue),
+      );
+    if (!name) {
+      setErrorMessage("Client Key 名称不能为空。");
+      return;
+    }
+    if (scopes.length === 0) {
+      setErrorMessage("请至少选择一个权限 scope。");
+      return;
+    }
+
+    setIsUpdatingClientKey(true);
+    setErrorMessage(null);
+    try {
+      const updatedClientKey = await requestApi<ClientKeyListItem>(
+        adminToken,
+        `/api/v1/admin/client-keys/${editingClientKey.id}`,
+        {
+          method: "PATCH",
+          body: JSON.stringify({ name, scopes }),
+        },
+      );
+      setClientKeys((currentClientKeys) =>
+        currentClientKeys.map((currentClientKey) =>
+          currentClientKey.id === updatedClientKey.id ? updatedClientKey : currentClientKey,
+        ),
+      );
+      setEditingClientKey(null);
+      setNotice(`Client Key「${updatedClientKey.name}」已更新名称与权限。`);
+      void loadClientKeys();
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : "无法更新 Client Key。");
+    } finally {
+      setIsUpdatingClientKey(false);
+    }
+  }
+
   async function disableClientKey(clientKey: ClientKeyListItem): Promise<void> {
     if (!clientKey.enabled) {
       return;
@@ -3632,14 +3775,24 @@ function App(): JSX.Element {
             filterText={clientKeyFilterText}
             isCreating={isCreatingClientKey}
             isCreateDialogOpen={isClientKeyCreateDialogOpen}
+            isUpdating={isUpdatingClientKey}
+            editingClientKey={editingClientKey}
             onCloseCreateDialog={() => setIsClientKeyCreateDialogOpen(false)}
+            onCloseEditDialog={() => setEditingClientKey(null)}
             onCopyApiKey={() => void copyCreatedClientApiKey()}
             onCreate={(event) => void createClientKey(event)}
+            onUpdate={(event) => void updateClientKey(event)}
             onDisable={(clientKey) => void disableClientKey(clientKey)}
             onFilterTextChange={setClientKeyFilterText}
             onOpenCreateDialog={() => {
               setErrorMessage(null);
+              setEditingClientKey(null);
               setIsClientKeyCreateDialogOpen(true);
+            }}
+            onOpenEditDialog={(clientKey) => {
+              setErrorMessage(null);
+              setIsClientKeyCreateDialogOpen(false);
+              setEditingClientKey(clientKey);
             }}
             onDismissCreatedApiKey={() => setCreatedClientApiKey(null)}
           />

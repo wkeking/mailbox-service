@@ -4,8 +4,8 @@
 
 | Provider | 供给 | 能力 | 说明 |
 | --- | --- | --- | --- |
-| `microsoft` | inventory 导入 | AT / RT / mail_read | Outlook/Hotmail OAuth；四段文本导入；默认路径（省略 `provider` 仅此） |
-| `smsbower_gmail` | inventory 补货 | mail_read | 显式 `provider` + `providers:smsbower_gmail:acquire`；管理台可配置与补货 |
+| `microsoft` | inventory 导入 | AT / RT / mail_read | Outlook/Hotmail OAuth；四段文本导入；无额外 scope 时随机池仅此 |
+| `smsbower_gmail` | inventory 补货 | mail_read | 需 `providers:smsbower_gmail:acquire`；可进随机池或显式指定；管理台可配置与补货 |
 | `cloudflare_temp_email` | on_demand | mail_read | 管理台配置；领取时即时开箱 |
 | `ddg_mail` | on_demand | mail_read | DDG 别名 + CF 兼容收件箱 |
 | `cloudmail_gen` | on_demand | mail_read | 管理台配置 |
@@ -16,8 +16,16 @@
 | `inbucket` | on_demand | mail_read | 自建 Inbucket |
 | `yyds_mail` | on_demand | mail_read | 管理台配置 |
 
-管理台 **邮箱 Provider** 页可维护各类型启停、API Base、域名与密钥（密钥加密保存、不回显明文）。  
-非 Microsoft 领取须 Client Key 具备 `providers:{type}:acquire`，且请求显式传 `provider`。
+管理台能力摘要：
+
+| 页面 | 能力 |
+| --- | --- |
+| **邮箱 Provider** | 各类型启停、API Base、域名与密钥（加密保存、不回显明文）；SMSBower 补货 |
+| **Client Key** | 创建 / **编辑名称与权限** / 停用；明文仅创建时显示一次；编辑弹窗支持固定高度内滚动 |
+| **邮箱 / 租约 / 注册站点 / 站点占用 / 出口代理** | 见下文管理 API 与管理台说明 |
+
+非 Microsoft 领取须 Client Key 具备 `providers:{type}:acquire`。  
+`POST /mailboxes/acquire` 多类型与 plus 语义见 [外部服务 API · mail_read 领取](#mail_read-领取可用邮箱账号) 与对接文档 [docs/external-mailboxes-acquire-integration.md](docs/external-mailboxes-acquire-integration.md)。
 
 同时实现了全局出口代理池：OAuth Token 刷新和 XOAUTH2 IMAP 连接按邮箱粘性地复用同一健康代理，并在代理链路失败后切换至备用代理。
 
@@ -92,9 +100,11 @@
 
 项目提供的文档标题、接口分组、接口摘要、接口说明和主要数据模型说明均使用中文。Swagger UI 与 ReDoc 自身的通用按钮文字由对应第三方界面提供，可能仍显示英文。
 
-## 创建外部 Client Key
+## 管理 Client Key（创建 / 修改 / 停用）
 
-使用管理员 Token 创建 Client Key。`api_key` 明文只在创建响应中返回一次，数据库仅保存 SHA-256 摘要：
+使用管理员 Token 管理外部 Client Key。`api_key` **明文只在创建响应中返回一次**，数据库仅保存 SHA-256 摘要；修改名称或权限**不会**轮换密钥明文。
+
+### 创建
 
 ```bash
 curl -X POST http://localhost:8000/api/v1/admin/client-keys \
@@ -103,29 +113,67 @@ curl -X POST http://localhost:8000/api/v1/admin/client-keys \
   -d '{
     "name": "registration-worker",
     "scopes": [
-      "leases:acquire",
       "leases:release",
-      "tokens:access:read",
-      "tokens:refresh:read",
-      "tokens:refresh:write",
       "mailboxes:acquire",
       "mailboxes:reacquire",
-      "mail:verification-code:read"
+      "mail:verification-code:read",
+      "providers:gptmail:acquire",
+      "providers:duckmail:acquire"
     ]
   }'
 ```
 
-可用 scope：
+### 修改名称与权限（不轮换密钥）
 
-- `leases:acquire`：领取租约
-- `leases:release`：释放租约
-- `tokens:access:read`：领取或读取 AT mode 租约
-- `tokens:refresh:read`：领取 RT mode 租约并读取当前 RT
-- `tokens:refresh:write`：在 RT mode 租约内 CAS 回写新 RT
-- `mailboxes:acquire`：领取可用邮箱账号（mail_read 租约，不返回 Token）
-- `mailboxes:reacquire`：按历史主邮箱或 plus 别名重新领取 mail_read 租约
-- `mail:verification-code:read`：在 mail_read 租约下读取收件箱验证码
-- `providers:smsbower_gmail:acquire`：显式领取 SMSBower Gmail 库存（须与 `mailboxes:acquire` 同时授予；默认 Key **不含**此权限）
+```bash
+curl -X PATCH http://localhost:8000/api/v1/admin/client-keys/<client_key_id> \
+  -H 'Content-Type: application/json' \
+  -H 'X-Admin-Token: <ADMIN_API_TOKEN>' \
+  -d '{
+    "name": "registration-worker-v2",
+    "scopes": [
+      "leases:release",
+      "mailboxes:acquire",
+      "mail:verification-code:read",
+      "providers:gptmail:acquire"
+    ]
+  }'
+```
+
+- 名称全局唯一；冲突返回 `409 CLIENT_KEY_NAME_CONFLICT`
+- 至少保留一个合法 scope
+- 已停用的 Key 修改后**仍保持停用**（不会自动启用）
+- 管理台 **Client Key** 页：列表可 **编辑**（名称 + scopes 勾选）/ **停用**；创建与编辑弹窗固定视口高度、中间可滚动、底部按钮常驻
+
+### 可用 scope
+
+| scope | 说明 |
+| --- | --- |
+| `leases:acquire` | 领取 AT / RT mode 租约（`POST /leases/acquire`） |
+| `leases:release` | 释放租约 |
+| `tokens:access:read` | 领取或读取 AT mode 租约 |
+| `tokens:refresh:read` | 领取 RT mode 并读取当前 RT |
+| `tokens:refresh:write` | 在 RT mode 租约内 CAS 回写新 RT |
+| `mailboxes:acquire` | 领取 mail_read 邮箱（`POST /mailboxes/acquire`） |
+| `mailboxes:reacquire` | 按历史业务地址重新领取 |
+| `mail:verification-code:read` | 读取收件箱验证码 |
+| `providers:{type}:acquire` | 允许该 `provider_type` 进入 mail_read 候选池 / 显式领取 |
+
+`providers:{type}:acquire` 中 `{type}` 为非默认类型，例如：
+
+- `providers:smsbower_gmail:acquire`
+- `providers:cloudflare_temp_email:acquire` / `ddg_mail` / `cloudmail_gen` / `tempmail_lol` / `duckmail` / `gptmail` / `moemail` / `inbucket` / `yyds_mail`
+
+**默认新建 Key 不含任何 `providers:*:acquire`。**  
+因此仅有 `mailboxes:acquire` 时，`provider` 省略或 `all` **只会落到 `microsoft`**；要随机/指定临时邮箱等类型，必须在 Key 上勾选对应 provider scope。
+
+读码场景最小建议 scopes：
+
+```text
+mailboxes:acquire + leases:release + mail:verification-code:read
+（需要 reacquire 时再加 mailboxes:reacquire）
+（需要某非 Microsoft 类型时再加 providers:{type}:acquire）
+```
 
 ## 外部服务 API
 
@@ -133,23 +181,120 @@ curl -X POST http://localhost:8000/api/v1/admin/client-keys \
 
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
-| `POST` | `/api/v1/leases/acquire` | 领取 AT 或 RT mode 邮箱租约（Microsoft only） |
+| `POST` | `/api/v1/leases/acquire` | 领取 AT 或 RT mode 邮箱租约（**仅 Microsoft**） |
 | `POST` | `/api/v1/leases/{lease_id}/release` | 幂等释放租约 |
 | `POST` | `/api/v1/leases/{lease_id}/access-token` | 获取未过期缓存 AT，过期时自动刷新 |
 | `POST` | `/api/v1/leases/{lease_id}/refresh-token` | 按 `expected_token_version` CAS 回写 RT |
-| `POST` | `/api/v1/mailboxes/acquire` | 领取可用邮箱账号（mail_read；省略 `provider` 仅 Microsoft；主邮箱须传 `usage_site`；`use_plus_alias=true` 只分配别名且可与同母号并发） |
+| `POST` | `/api/v1/mailboxes/acquire` | 领取 mail_read 可用邮箱（多类型 / 排除 / plus，见下节） |
 | `GET` | `/api/v1/usage-sites` | 查询启用中的注册站点白名单（需 `mailboxes:acquire`） |
 | `POST` | `/api/v1/mailboxes/reacquire` | 按历史业务地址（主邮箱或 plus 别名）重新领取 mail_read 租约 |
 | `POST` | `/api/v1/leases/{lease_id}/verification-code` | 在 mail_read 租约下提取收件箱验证码 |
 
-### Provider 矩阵（本轮已验证）
+调用方完整对接说明（含错误码、示例、适配清单）：  
+**[docs/external-mailboxes-acquire-integration.md](docs/external-mailboxes-acquire-integration.md)**
 
-| provider_type | 供给方式 | 支持模式 | 备注 |
+### mail_read 领取可用邮箱账号
+
+`POST /api/v1/mailboxes/acquire`
+
+#### 请求字段（摘要）
+
+| 字段 | 说明 |
+| --- | --- |
+| `provider` | 省略 / `null` / `"all"`：在 **Client Key 已授权** 的类型中随机；单字符串或字符串数组：仅在列表内随机 |
+| `exclude_providers` | 单值或数组；**优先级最高**，先从候选池剔除再随机 |
+| `lease_ttl_seconds` | 租约秒数，默认 `600`，范围 `60–86400` |
+| `usage_site` | 注册站点 code；**microsoft 主邮箱路径必填**；plus 别名可选；多数非 microsoft 可不传 |
+| `use_plus_alias` | 仅当**实际命中 microsoft** 时生效：分配 `user+xxxx@domain` 作为 `allocated_email`；命中非 microsoft 时**忽略**，不会强制改走 microsoft |
+| `alias_suffix` | 可选 plus 后缀（小写字母数字）；传入时对 microsoft 等价于启用 plus |
+| `preferred_email` / `client_tag` / `purpose` | 优先邮箱、调用方标签、用途说明 |
+
+#### 类型选择规则
+
+1. 构造候选池（`all`/省略 → 全 catalog；显式列表 → 仅列表）  
+2. 减去 `exclude_providers`  
+3. 减去当前 Key **未授权**的类型（`all`/省略时静默跳过；显式写了未授权类型 → `403 CLIENT_SCOPE_REQUIRED`）  
+4. 候选打乱后依次尝试领取；库存空 / 未配置 / 上游失败则跳过下一类型  
+5. 成功则返回实际命中的 `provider`；全部失败 → `409 NO_AVAILABLE_MAILBOX` 等
+
+> 注意：`all` **不是**「管理台已配置的 Provider 均匀轮询」，而是「已授权类型随机尝试 + 首个成功」。  
+> 若 Key 只有 `mailboxes:acquire`，`all` 等价于仅 microsoft。  
+> 若同时授权了多种类型且 microsoft 库存充足，失败的 on-demand 类型会被跳过，可能连续落到 hotmail——需要纯临时邮箱时请 `exclude_providers: ["microsoft"]` 或写死类型列表。
+
+#### 响应字段（摘要）
+
+| 字段 | 说明 |
+| --- | --- |
+| `lease_id` | 后续 verification-code / release 使用 |
+| `allocated_email` | **业务注册地址**（主邮箱或 plus 别名） |
+| `primary_email` | 主邮箱（plus 场景下与 allocated 不同） |
+| `provider` | **实际命中的** `provider_type`（始终返回） |
+| `address_kind` | `primary` / `plus_alias` |
+| `usage_site` / `expires_at` / `created_at` | 站点与租约时间 |
+
+#### 请求示例
+
+```bash
+# 1) 只要 Microsoft 主邮箱（写死，避免误随机构）
+curl -X POST http://localhost:8000/api/v1/mailboxes/acquire \
+  -H 'Content-Type: application/json' \
+  -H 'X-API-Key: <CLIENT_API_KEY>' \
+  -d '{
+    "provider": "microsoft",
+    "usage_site": "openai",
+    "lease_ttl_seconds": 600
+  }'
+
+# 2) 已授权类型中随机（含 microsoft，若已授权）
+curl -X POST http://localhost:8000/api/v1/mailboxes/acquire \
+  -H 'Content-Type: application/json' \
+  -H 'X-API-Key: <CLIENT_API_KEY>' \
+  -d '{
+    "provider": "all",
+    "usage_site": "openai",
+    "lease_ttl_seconds": 600
+  }'
+
+# 3) 排除 microsoft，仅在已授权的临时邮箱等类型中随机
+curl -X POST http://localhost:8000/api/v1/mailboxes/acquire \
+  -H 'Content-Type: application/json' \
+  -H 'X-API-Key: <CLIENT_API_KEY>' \
+  -d '{
+    "provider": "all",
+    "exclude_providers": ["microsoft"],
+    "lease_ttl_seconds": 600,
+    "use_plus_alias": true
+  }'
+# use_plus_alias 对非 microsoft 忽略；不会因此 409 LEASE_MODE_MISMATCH
+
+# 4) Microsoft plus 别名
+curl -X POST http://localhost:8000/api/v1/mailboxes/acquire \
+  -H 'Content-Type: application/json' \
+  -H 'X-API-Key: <CLIENT_API_KEY>' \
+  -d '{
+    "provider": "microsoft",
+    "use_plus_alias": true,
+    "lease_ttl_seconds": 600
+  }'
+```
+
+### Provider 矩阵
+
+| provider_type | 供给方式 | 支持模式 | 领取条件 |
 | --- | --- | --- | --- |
-| `microsoft` | inventory（四段导入） | AT / RT / mail_read | 默认路径；省略 `provider` 仅此 |
-| `smsbower_gmail` | inventory（Admin 补货） | mail_read only | 须显式 `provider` + scope；详见 [docs/smsbower-gmail-phase1a.md](docs/smsbower-gmail-phase1a.md) |
+| `microsoft` | inventory（四段导入） | AT / RT / mail_read | 仅需 `mailboxes:acquire`（AT/RT 另需 token scopes） |
+| `smsbower_gmail` | inventory（Admin 补货） | mail_read | `providers:smsbower_gmail:acquire`；详见 [docs/smsbower-gmail-phase1a.md](docs/smsbower-gmail-phase1a.md) |
+| `cloudflare_temp_email` | on_demand | mail_read | 对应 `providers:*:acquire` + 管理台启用并配置 |
+| `ddg_mail` | on_demand | mail_read | 同上 |
+| `cloudmail_gen` | on_demand | mail_read | 同上 |
+| `tempmail_lol` | on_demand | mail_read | 同上 |
+| `duckmail` | on_demand | mail_read | 同上 |
+| `gptmail` | on_demand | mail_read | 同上 |
+| `moemail` | on_demand | mail_read | 同上 |
+| `inbucket` | on_demand | mail_read | 同上 |
+| `yyds_mail` | on_demand | mail_read | 同上 |
 
-TempMail / DDG / 通用 HTTP profile **未**作为 enabled Provider 暴露。
+on-demand：管理台启用并填写必填字段/密钥后，带 allowlist 的 Client Key 可领取并读验证码。未启用或未配置完整时，显式指定返回 `PROVIDER_NOT_CONFIGURED`；在 `all` 随机中可能被跳过并尝试下一类型。
 
 ### 按历史地址重新领取（reacquire）
 
@@ -197,6 +342,7 @@ curl -X POST http://localhost:8000/api/v1/mailboxes/reacquire \
 | `PUT` | `/api/v1/admin/mailboxes/{id}/egress-proxy` | 手动重绑定或解除邮箱代理 |
 | `POST` | `/api/v1/admin/client-keys` | 创建 Client Key，明文只返回一次 |
 | `GET` | `/api/v1/admin/client-keys` | 查询不含密钥和摘要的 Client Key 元数据 |
+| `PATCH` | `/api/v1/admin/client-keys/{id}` | 修改名称与权限 scopes（不轮换密钥明文） |
 | `POST` | `/api/v1/admin/client-keys/{id}/disable` | 停用 Client Key |
 | `GET` | `/api/v1/admin/usage-sites` | 查询注册站点白名单（含已禁用） |
 | `POST` | `/api/v1/admin/usage-sites` | 创建注册站点（code 不可改） |
@@ -207,9 +353,12 @@ curl -X POST http://localhost:8000/api/v1/mailboxes/reacquire \
 
 管理台：
 
+- **Client Key**：创建（明文仅一次）/ **编辑名称与 scopes** / 停用；编辑与创建弹窗可滚动、底部操作栏固定
+- **邮箱 Provider**：catalog 状态、实例启停与密钥配置；SMSBower 补货入口
 - **注册站点**：新增 / 启停 / 删除（无占用时）白名单
 - **站点占用**：按业务邮箱、站点筛选占用，并可一键撤销
 - **邮箱管理**：行内「站点占用」跳转并按主邮箱筛选占用
+- **出口代理**：添加、启停、测试、恢复、删除与全局策略
 
 ## Refresh Token 保活
 

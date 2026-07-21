@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import random
 import secrets
 import string
 
@@ -29,7 +30,11 @@ from mailbox_service.models import (
     is_expired,
     utc_now,
 )
-from mailbox_service.providers.catalog import ON_DEMAND_PROVIDER_TYPES, ALL_PROVIDER_TYPES
+from mailbox_service.providers.catalog import (
+    ON_DEMAND_PROVIDER_TYPES,
+    ALL_PROVIDER_TYPES,
+    PROVIDER_DEFINITION_BY_TYPE,
+)
 from mailbox_service.providers.registry import DEFAULT_PROVIDER_TYPE, normalize_provider_type
 from mailbox_service.security import CredentialCipher
 from mailbox_service.token_service import MailboxAccessTokenResult, MailboxAccessTokenService
@@ -178,10 +183,17 @@ class LeaseService:
         use_plus_alias: bool = False,
         preferred_alias_suffix: str | None = None,
         usage_site: str | None = None,
-        provider: str | None = None,
+        provider: str | list[str] | None = None,
+        exclude_providers: str | list[str] | None = None,
         explicit_provider_request: bool = False,
     ) -> LeaseAcquireResult:
-        """Reserve one active mailbox that has no other unexpired lease."""
+        """Reserve one active mailbox that has no other unexpired lease.
+
+        For mail_read, ``provider`` may be omitted / ``all`` / a single type / a list of types.
+        Omitted or ``all`` means: randomly pick among every authorized provider type.
+        ``exclude_providers`` is applied with highest priority and always removes types from
+        the candidate pool before random selection.
+        """
         if mode == LeaseMode.MAIL_READ:
             principal.require_scope("mailboxes:acquire")
         else:
@@ -196,35 +208,264 @@ class LeaseService:
                 raise LeaseModeError("仅 mail_read 租约支持 plus alias 分配")
             if usage_site:
                 raise LeaseModeError("仅 mail_read 租约支持 usage_site")
+            if exclude_providers:
+                raise LeaseModeError("仅 mail_read 租约支持 exclude_providers")
 
-        try:
-            resolved_provider = normalize_provider_type(provider) if provider else DEFAULT_PROVIDER_TYPE
-        except ValueError as error:
-            raise ProviderUnsupportedError(str(error)) from error
-        if mode != LeaseMode.MAIL_READ and resolved_provider != DEFAULT_PROVIDER_TYPE:
-            raise ProviderUnsupportedError("非 mail_read 租约本轮仅支持 microsoft")
-        if mode in (LeaseMode.ACCESS_TOKEN, LeaseMode.REFRESH_TOKEN) and resolved_provider != DEFAULT_PROVIDER_TYPE:
-            raise ProviderUnsupportedError("AT/RT 租约仅支持 microsoft")
-        if explicit_provider_request and resolved_provider != DEFAULT_PROVIDER_TYPE:
-            principal.require_scope(provider_acquire_scope(resolved_provider))
+        # Non-mail_read modes stay Microsoft-only (single provider, no multi-type pool).
+        if mode != LeaseMode.MAIL_READ:
+            if isinstance(provider, list):
+                if len(provider) != 1:
+                    raise ProviderUnsupportedError("AT/RT 租约仅支持 microsoft")
+                provider = provider[0]
+            try:
+                resolved_provider = (
+                    normalize_provider_type(provider) if provider else DEFAULT_PROVIDER_TYPE
+                )
+            except ValueError as error:
+                raise ProviderUnsupportedError(str(error)) from error
+            if resolved_provider != DEFAULT_PROVIDER_TYPE:
+                raise ProviderUnsupportedError("非 mail_read 租约本轮仅支持 microsoft")
+            return self._acquire_single_provider_lease(
+                principal,
+                mode=mode,
+                ttl_seconds=ttl_seconds,
+                preferred_email=preferred_email,
+                client_tag=client_tag,
+                purpose=purpose,
+                use_plus_alias=False,
+                preferred_alias_suffix=None,
+                usage_site=None,
+                provider_type=resolved_provider,
+            )
+
+        candidate_providers = self._resolve_mail_read_provider_candidates(
+            principal,
+            provider=provider,
+            exclude_providers=exclude_providers,
+            explicit_provider_request=explicit_provider_request,
+        )
+        # Plus alias is a microsoft-only allocation strategy. Do NOT pin the whole request to
+        # microsoft when use_plus_alias=true: only apply alias options when the selected
+        # candidate is microsoft; ignore them for other providers.
+        wants_plus_alias = bool(use_plus_alias or preferred_alias_suffix)
+
+        def _plus_options_for_provider(provider_type: str) -> tuple[bool, str | None]:
+            if provider_type == DEFAULT_PROVIDER_TYPE and wants_plus_alias:
+                return True, preferred_alias_suffix
+            return False, None
+
+        if preferred_email and len(candidate_providers) > 1:
+            # Preferred address is inventory-addressed; try each candidate type until one matches.
+            last_error: Exception | None = None
+            shuffled = list(candidate_providers)
+            random.shuffle(shuffled)
+            for provider_type in shuffled:
+                apply_plus, alias_suffix = _plus_options_for_provider(provider_type)
+                try:
+                    return self._acquire_single_provider_lease(
+                        principal,
+                        mode=mode,
+                        ttl_seconds=ttl_seconds,
+                        preferred_email=preferred_email,
+                        client_tag=client_tag,
+                        purpose=purpose,
+                        use_plus_alias=apply_plus,
+                        preferred_alias_suffix=alias_suffix,
+                        usage_site=usage_site,
+                        provider_type=provider_type,
+                    )
+                except (
+                    LeaseUnavailableError,
+                    LeaseUsageSiteError,
+                    ProviderNotConfiguredError,
+                ) as error:
+                    last_error = error
+                    continue
+            if last_error is not None:
+                raise last_error
+            raise LeaseUnavailableError("没有可用邮箱")
+
+        if len(candidate_providers) == 1:
+            only_provider = candidate_providers[0]
+            apply_plus, alias_suffix = _plus_options_for_provider(only_provider)
+            return self._acquire_single_provider_lease(
+                principal,
+                mode=mode,
+                ttl_seconds=ttl_seconds,
+                preferred_email=preferred_email,
+                client_tag=client_tag,
+                purpose=purpose,
+                use_plus_alias=apply_plus,
+                preferred_alias_suffix=alias_suffix,
+                usage_site=usage_site,
+                provider_type=only_provider,
+            )
+
+        # Multi-type random: shuffle and try until one succeeds (skip empty / unconfigured).
+        last_error: Exception | None = None
+        shuffled_providers = list(candidate_providers)
+        random.shuffle(shuffled_providers)
+        for attempt_index, provider_type in enumerate(shuffled_providers):
+            apply_plus, alias_suffix = _plus_options_for_provider(provider_type)
+            try:
+                return self._acquire_single_provider_lease(
+                    principal,
+                    mode=mode,
+                    ttl_seconds=ttl_seconds,
+                    preferred_email=preferred_email,
+                    client_tag=client_tag,
+                    purpose=purpose,
+                    use_plus_alias=apply_plus,
+                    preferred_alias_suffix=alias_suffix,
+                    usage_site=usage_site,
+                    provider_type=provider_type,
+                )
+            except (LeaseUnavailableError, ProviderNotConfiguredError) as error:
+                last_error = error
+                continue
+            except LeaseUsageSiteError as error:
+                # usage_site only applies to microsoft primary path; try remaining types first.
+                last_error = error
+                if attempt_index < len(shuffled_providers) - 1:
+                    continue
+                raise
+        if last_error is not None:
+            raise last_error
+        raise LeaseUnavailableError("没有可用邮箱")
+
+    def _resolve_mail_read_provider_candidates(
+        self,
+        principal: ClientPrincipal,
+        *,
+        provider: str | list[str] | None,
+        exclude_providers: str | list[str] | None,
+        explicit_provider_request: bool,
+    ) -> list[str]:
+        """Build ordered candidate provider_type list for mail_read acquire.
+
+        Rules:
+        1. Start from explicit provider list, or all known types when omitted / all.
+        2. Apply exclude_providers with highest priority (always subtract).
+        3. Drop types the Client Key is not allowed to acquire.
+        4. Reject unknown provider_type values early.
+        """
+        excluded = self._normalize_provider_input_list(exclude_providers)
+        for excluded_type in excluded:
+            if excluded_type not in ALL_PROVIDER_TYPES:
+                raise ProviderUnsupportedError(f"不支持的 exclude provider：{excluded_type}")
+
+        if provider is None or (isinstance(provider, list) and len(provider) == 0):
+            # Omitted / all / empty → full catalog, then filter by scope + exclude.
+            base_candidates = list(ALL_PROVIDER_TYPES)
+            # Stable base order: microsoft first, then alphabetical for the rest.
+            base_candidates.sort(key=lambda item: (item != DEFAULT_PROVIDER_TYPE, item))
+        else:
+            raw_list = self._normalize_provider_input_list(provider)
+            if not raw_list:
+                base_candidates = list(ALL_PROVIDER_TYPES)
+                base_candidates.sort(key=lambda item: (item != DEFAULT_PROVIDER_TYPE, item))
+            else:
+                base_candidates = []
+                seen: set[str] = set()
+                for raw_type in raw_list:
+                    try:
+                        normalized = normalize_provider_type(raw_type)
+                    except ValueError as error:
+                        raise ProviderUnsupportedError(str(error)) from error
+                    if normalized not in ALL_PROVIDER_TYPES:
+                        raise ProviderUnsupportedError(f"不支持的 provider：{normalized}")
+                    if normalized not in seen:
+                        seen.add(normalized)
+                        base_candidates.append(normalized)
+
+        exclude_set = set(excluded)
+        # Exclude wins over include / all.
+        filtered = [item for item in base_candidates if item not in exclude_set]
+        if not filtered:
+            raise ProviderUnsupportedError("排除后没有可用的邮箱类型")
+
+        authorized: list[str] = []
+        for provider_type in filtered:
+            definition = PROVIDER_DEFINITION_BY_TYPE.get(provider_type)
+            if definition is None:
+                continue
+            if definition.requires_acquire_scope:
+                required_scope = provider_acquire_scope(provider_type)
+                if required_scope not in principal.scopes:
+                    # Explicit single/list request that includes unauthorized type → hard fail.
+                    # Broad all/omitted pool silently skips unauthorized types.
+                    if explicit_provider_request and provider is not None:
+                        principal.require_scope(required_scope)
+                    continue
+            authorized.append(provider_type)
+
+        if not authorized:
+            # Either nothing authorized, or explicit request listed only unauthorized types.
+            if explicit_provider_request and provider is not None:
+                # require_scope above would have raised; fall through for safety.
+                raise ProviderUnsupportedError("没有已授权的邮箱类型可领取")
+            # Omitted/all with only microsoft authorized is fine; if even microsoft is excluded
+            # and no other scopes, surface a clear error.
+            raise ProviderUnsupportedError(
+                "当前 Client Key 没有可用的邮箱类型（检查 providers:{type}:acquire 与 exclude_providers）"
+            )
+        return authorized
+
+    @staticmethod
+    def _normalize_provider_input_list(value: str | list[str] | None) -> list[str]:
+        """Normalize optional provider / exclude field into a de-duplicated lowercased list."""
+        if value is None:
+            return []
+        if isinstance(value, str):
+            tokens = [value]
+        else:
+            tokens = list(value)
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for raw in tokens:
+            if raw is None:
+                continue
+            token = str(raw).strip().lower()
+            if not token or token == "all":
+                # "all" is only meaningful on the include side (handled by caller as None).
+                continue
+            if token not in seen:
+                seen.add(token)
+                normalized.append(token)
+        return normalized
+
+    def _acquire_single_provider_lease(
+        self,
+        principal: ClientPrincipal,
+        *,
+        mode: LeaseMode,
+        ttl_seconds: int,
+        preferred_email: str | None,
+        client_tag: str | None,
+        purpose: str | None,
+        use_plus_alias: bool,
+        preferred_alias_suffix: str | None,
+        usage_site: str | None,
+        provider_type: str,
+    ) -> LeaseAcquireResult:
+        """Acquire a lease for one concrete provider_type (inventory or on-demand)."""
+        resolved_provider = provider_type
         if resolved_provider not in ALL_PROVIDER_TYPES:
             raise ProviderUnsupportedError(f"不支持的 provider：{resolved_provider}")
 
         wants_plus_alias = bool(use_plus_alias or preferred_alias_suffix)
         if resolved_provider != DEFAULT_PROVIDER_TYPE and wants_plus_alias:
             raise LeaseModeError("非 microsoft provider 本轮不支持 plus alias")
+
         resolved_usage_site: str | None = None
         if mode == LeaseMode.MAIL_READ and resolved_provider == DEFAULT_PROVIDER_TYPE:
             if not wants_plus_alias:
-                # Primary path must declare the registration site so the pool can exclude it later.
                 if not usage_site or not usage_site.strip():
                     raise LeaseUsageSiteError("使用主邮箱时必须提供 usage_site")
                 resolved_usage_site = self._resolve_enabled_usage_site(usage_site)
             elif usage_site and usage_site.strip():
                 resolved_usage_site = self._resolve_enabled_usage_site(usage_site)
 
-        # ACCESS_TOKEN: short DB reserve (claim) -> network/CAS outside locks -> compensate on failure.
-        # Pure DB modes: 1205/1213 retry with rollback so each attempt re-reads on a clean transaction.
         from mailbox_service.transaction_retry import run_with_mysql_lock_retry
 
         if mode == LeaseMode.ACCESS_TOKEN:
@@ -261,9 +502,6 @@ class LeaseService:
                     provider_type=resolved_provider,
                 )
             except Exception as error:
-                # Only roll back for lock-retryable failures. Domain errors
-                # (conflict / unavailable) must not wipe caller session state
-                # (e.g. uncommitted fixtures on SQLite StaticPool tests).
                 from mailbox_service.transaction_retry import is_retryable_mysql_lock_error
 
                 if is_retryable_mysql_lock_error(error):

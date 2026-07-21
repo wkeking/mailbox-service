@@ -131,7 +131,8 @@ def test_smsbower_acquire_requires_scope_and_claims_resource() -> None:
     assert resource.lifecycle_state == "releasing"
 
 
-def test_omitted_provider_never_selects_smsbower() -> None:
+def test_omitted_provider_with_scope_can_select_smsbower() -> None:
+    """Omit/all pools authorized types; smsbower is eligible when scoped and inventory exists."""
     session, cipher, lease_service = _build()
     session.add(
         Mailbox(
@@ -142,7 +143,6 @@ def test_omitted_provider_never_selects_smsbower() -> None:
         )
     )
     session.flush()
-    mb = session.query(Mailbox).first() if hasattr(session, "query") else None
     from sqlalchemy import select
 
     mailbox = session.scalar(select(Mailbox))
@@ -160,19 +160,15 @@ def test_omitted_provider_never_selects_smsbower() -> None:
     )
     session.flush()
     creation = ClientKeyService(session).create_client_key(
-        name="ms-only",
+        name="with-sms",
         scopes=["mailboxes:acquire", "providers:smsbower_gmail:acquire"],
     )
     principal = ClientKeyService(session).authenticate(creation.api_key)
-    try:
-        lease_service.acquire_lease(
-            principal,
-            mode=LeaseMode.MAIL_READ,
-            ttl_seconds=300,
-            usage_site=None,
-        )
-        # microsoft path requires usage_site for primary - expect usage error or unavailable
-        ok = False
-    except Exception:
-        ok = True
-    assert ok
+    result = lease_service.acquire_lease(
+        principal,
+        mode=LeaseMode.MAIL_READ,
+        ttl_seconds=300,
+        usage_site=None,
+    )
+    assert result.provider_type == "smsbower_gmail"
+    assert result.primary_email == "sms.only@gmail.com"

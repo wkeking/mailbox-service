@@ -56,10 +56,12 @@ Header: `X-Admin-Token`
 
 `POST /api/v1/mailboxes/acquire`
 
-- **省略 `provider`**：仅 Microsoft（legacy 兼容）
-- **`provider=smsbower_gmail`**：需要 Client Key 同时具备  
+- **省略 / `all`**：在 Client Key **已授权**类型中随机；具备 `providers:smsbower_gmail:acquire` 时 SMSBower 可进池
+- **`provider=smsbower_gmail`**（或数组包含该类型）：需要 Client Key 同时具备  
   `mailboxes:acquire` + `providers:smsbower_gmail:acquire`
+- 可用 `exclude_providers` 排除（优先级最高）
 - SMSBower **不支持** plus alias；`usage_site` 本轮不强制
+- 对接说明见 [external-mailboxes-acquire-integration.md](./external-mailboxes-acquire-integration.md)
 
 ### 验证码
 

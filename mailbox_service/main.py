@@ -74,6 +74,7 @@ from mailbox_service.schemas import (
     ClientKeyCreateRequest,
     ClientKeyCreatedResponse,
     ClientKeyListItemResponse,
+    ClientKeyUpdateRequest,
     DashboardSummaryResponse,
     EgressProxyCreate,
     EgressProxyResponse,
@@ -185,7 +186,7 @@ OPENAPI_TAGS = [
     {"name": "租约管理", "description": "邮箱租约记录与生命周期查询。"},
     {"name": "出口代理", "description": "出口代理的增删改查、连通性测试和健康恢复。"},
     {"name": "代理策略", "description": "OAuth 与 IMAP 出站流量使用的全局代理策略。"},
-    {"name": "Client Key 管理", "description": "外部调用方 Client API Key 的创建、查询和停用。"},
+    {"name": "Client Key 管理", "description": "外部调用方 Client API Key 的创建、修改、查询和停用。"},
 ]
 
 PUBLIC_OPENAPI_TAG_NAMES = {"服务状态", "外部租约", "外部邮箱"}
@@ -214,10 +215,10 @@ OPENAPI_OPERATION_DOCUMENTATION: dict[tuple[str, str], tuple[str, str, str]] = {
     ),
     ("POST", "/api/v1/mailboxes/acquire"): (
         "领取可用邮箱账号",
-        "领取一个 status=active 且 capability 为 imap/graph 的邮箱并创建 mail_read 租约；"
-        "use_plus_alias=true 时只分配 plus 别名（可与同母号其他租约并发）；"
-        "主邮箱路径必须声明 usage_site，用于全局排除已在该站登记的主邮箱地址；"
-        "只返回邮箱地址与租约信息，不返回 Token。",
+        "领取 mail_read 租约并返回业务邮箱地址（不返回 Token）。"
+        "provider 可省略 / all / 单类型 / 多类型：省略与 all 在已授权类型中随机；"
+        "exclude_providers 排除优先级最高；非 microsoft 须对应 providers:{type}:acquire。"
+        "microsoft 主邮箱路径须声明 usage_site；use_plus_alias=true 时只分配 plus 别名。",
         "外部邮箱",
     ),
     ("GET", "/api/v1/usage-sites"): (
@@ -326,6 +327,11 @@ OPENAPI_OPERATION_DOCUMENTATION: dict[tuple[str, str], tuple[str, str, str]] = {
     ("GET", "/api/v1/admin/client-keys"): (
         "查询 Client Key",
         "返回 Client Key 元数据，不返回密钥明文或摘要。",
+        "Client Key 管理",
+    ),
+    ("PATCH", "/api/v1/admin/client-keys/{client_key_id}"): (
+        "修改 Client Key",
+        "修改已有 Client Key 的显示名称与权限 scopes；不轮换 API Key 明文。",
         "Client Key 管理",
     ),
     ("POST", "/api/v1/admin/client-keys/{client_key_id}/disable"): (
@@ -1197,6 +1203,7 @@ def acquire_mailbox_account(
 ) -> MailboxAcquireResponse:
     """Acquire one usable mailbox account as a mail_read lease without returning tokens."""
     try:
+        # Explicit when caller named one or more concrete types (not omitted / all).
         explicit_provider = payload.provider is not None
         result = lease_service.acquire_lease(
             principal,
@@ -1209,25 +1216,23 @@ def acquire_mailbox_account(
             preferred_alias_suffix=payload.alias_suffix,
             usage_site=payload.usage_site,
             provider=payload.provider,
+            exclude_providers=payload.exclude_providers,
             explicit_provider_request=explicit_provider,
         )
     except Exception as error:
         raise to_external_http_exception(error) from error
-    response = MailboxAcquireResponse(
+    return MailboxAcquireResponse(
         lease_id=result.lease_id,
         mailbox_id=result.mailbox_id,
         primary_email=result.primary_email,
         allocated_email=result.allocated_email or result.primary_email,
         address_kind=result.address_kind,
         usage_site=result.usage_site,
+        provider=result.provider_type,
         mode=LeaseMode.MAIL_READ,
         expires_at=result.expires_at,
         created_at=result.created_at,
     )
-    # Legacy wire shape: omit provider when caller did not request one explicitly.
-    if explicit_provider:
-        response.provider = result.provider_type
-    return response
 
 
 @app.get("/api/v1/usage-sites", response_model=UsageSiteListResponse)
@@ -1581,6 +1586,47 @@ def list_client_keys(
 ) -> list[ClientKeyListItemResponse]:
     """List Client Key metadata without returning plaintext keys or digests."""
     return [build_client_key_response(client_key) for client_key in ClientKeyService(session).list_client_keys()]
+
+
+@app.patch("/api/v1/admin/client-keys/{client_key_id}", response_model=ClientKeyListItemResponse)
+def update_client_key(
+    client_key_id: str,
+    payload: ClientKeyUpdateRequest,
+    session: SessionDependency,
+    admin_id: AdminDependency,
+) -> ClientKeyListItemResponse:
+    """Update one Client Key name and scopes without rotating the secret."""
+    try:
+        client_key = ClientKeyService(session).update_client_key(
+            client_key_id,
+            name=payload.name,
+            scopes=payload.scopes,
+        )
+    except LookupError as error:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "CLIENT_KEY_NOT_FOUND", "message": str(error)},
+        ) from error
+    except ValueError as error:
+        message = str(error)
+        if "名称已存在" in message:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": "CLIENT_KEY_NAME_CONFLICT", "message": message},
+            ) from error
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"code": "CLIENT_KEY_INVALID", "message": message},
+        ) from error
+    create_audit_log(
+        session,
+        admin_id,
+        "client_key.updated",
+        "client_key",
+        client_key.id,
+        {"name": client_key.name, "scopes": client_key.scopes},
+    )
+    return build_client_key_response(client_key)
 
 
 @app.post("/api/v1/admin/client-keys/{client_key_id}/disable", response_model=ClientKeyListItemResponse)

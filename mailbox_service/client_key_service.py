@@ -149,6 +149,49 @@ class ClientKeyService:
         self._session.flush()
         return client_key
 
+    def update_client_key(
+        self,
+        client_key_id: str,
+        *,
+        name: str,
+        scopes: list[str],
+    ) -> ClientKey:
+        """Update display name and scopes without rotating the secret.
+
+        Does not re-enable disabled keys or change expires_at / api_key plaintext.
+        Name must remain globally unique.
+        """
+        client_key = self._session.get(ClientKey, client_key_id)
+        if client_key is None:
+            raise LookupError("Client Key 不存在")
+
+        normalized_name = name.strip()
+        if not normalized_name:
+            raise ValueError("Client Key 名称不能为空")
+
+        normalized_scopes = list(dict.fromkeys(scopes))
+        unsupported_scopes = set(normalized_scopes) - ALLOWED_CLIENT_KEY_SCOPES
+        if unsupported_scopes:
+            raise ValueError(f"不支持的 Client Key 权限：{', '.join(sorted(unsupported_scopes))}")
+        if not normalized_scopes:
+            raise ValueError("Client Key 至少需要一个权限")
+
+        if normalized_name != client_key.name:
+            name_taken = self._session.scalar(
+                select(ClientKey.id).where(
+                    ClientKey.name == normalized_name,
+                    ClientKey.id != client_key_id,
+                )
+            )
+            if name_taken is not None:
+                raise ValueError("Client Key 名称已存在")
+
+        client_key.name = normalized_name
+        client_key.scopes = normalized_scopes
+        client_key.updated_at = utc_now()
+        self._session.flush()
+        return client_key
+
     def list_client_keys(self) -> list[ClientKey]:
         """List metadata without ever returning API Key secret material."""
         return list(self._session.scalars(select(ClientKey).order_by(ClientKey.created_at.desc())))

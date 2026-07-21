@@ -51,3 +51,64 @@ def test_disabled_client_key_cannot_authenticate() -> None:
         pass
     else:
         raise AssertionError("已停用 Client Key 不应通过认证")
+
+
+def test_update_client_key_name_and_scopes() -> None:
+    """Name and scopes can be updated without rotating the secret digest."""
+    session = create_client_key_test_session()
+    service = ClientKeyService(session)
+    creation_result = service.create_client_key(
+        name="worker-a",
+        scopes=["leases:acquire", "leases:release"],
+    )
+    original_digest = creation_result.client_key.secret_digest
+
+    updated = service.update_client_key(
+        creation_result.client_key.id,
+        name="worker-a-renamed",
+        scopes=["mailboxes:acquire", "mail:verification-code:read", "leases:release"],
+    )
+    assert updated.name == "worker-a-renamed"
+    assert updated.scopes == [
+        "mailboxes:acquire",
+        "mail:verification-code:read",
+        "leases:release",
+    ]
+    assert updated.secret_digest == original_digest
+    assert updated.enabled is True
+
+    principal = service.authenticate(creation_result.api_key)
+    assert principal.name == "worker-a-renamed"
+    assert principal.scopes == frozenset(
+        ["mailboxes:acquire", "mail:verification-code:read", "leases:release"]
+    )
+
+
+def test_update_client_key_rejects_duplicate_name() -> None:
+    session = create_client_key_test_session()
+    service = ClientKeyService(session)
+    first = service.create_client_key(name="alpha", scopes=["leases:acquire"])
+    service.create_client_key(name="beta", scopes=["leases:release"])
+    try:
+        service.update_client_key(
+            first.client_key.id,
+            name="beta",
+            scopes=["leases:acquire"],
+        )
+        raised = False
+    except ValueError as error:
+        raised = True
+        assert "名称已存在" in str(error)
+    assert raised
+
+
+def test_update_client_key_rejects_empty_scopes() -> None:
+    session = create_client_key_test_session()
+    service = ClientKeyService(session)
+    creation = service.create_client_key(name="scoped", scopes=["leases:acquire"])
+    try:
+        service.update_client_key(creation.client_key.id, name="scoped", scopes=[])
+        raised = False
+    except ValueError:
+        raised = True
+    assert raised

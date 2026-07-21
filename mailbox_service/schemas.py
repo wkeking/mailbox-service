@@ -401,7 +401,8 @@ class ClientKeyCreateRequest(BaseModel):
             "权限列表，可选："
             "leases:acquire、leases:release、tokens:access:read、"
             "tokens:refresh:read、tokens:refresh:write、"
-            "mailboxes:acquire、mailboxes:reacquire、mail:verification-code:read、providers:smsbower_gmail:acquire。"
+            "mailboxes:acquire、mailboxes:reacquire、mail:verification-code:read、"
+            "providers:{provider_type}:acquire。"
         ),
     )
     expires_at: datetime | None = Field(default=None, description="过期时间（UTC）；为空表示不过期。")
@@ -409,6 +410,24 @@ class ClientKeyCreateRequest(BaseModel):
     @field_validator("name")
     @classmethod
     def normalize_client_key_name(cls, value: str) -> str:
+        normalized_value = value.strip()
+        if not normalized_value:
+            raise ValueError("Client Key 名称不能为空")
+        return normalized_value
+
+
+class ClientKeyUpdateRequest(BaseModel):
+    """管理员修改已有 Client Key 的名称与权限（不轮换密钥明文）。"""
+
+    name: str = Field(min_length=1, max_length=100, description="新的显示名称，全局唯一。")
+    scopes: list[str] = Field(
+        min_length=1,
+        description="新的权限列表；至少一项，取值同创建接口。",
+    )
+
+    @field_validator("name")
+    @classmethod
+    def normalize_client_key_update_name(cls, value: str) -> str:
         normalized_value = value.strip()
         if not normalized_value:
             raise ValueError("Client Key 名称不能为空")
@@ -481,6 +500,39 @@ class LeaseAcquireRequest(BaseModel):
         return value.strip().lower() or None
 
 
+def _normalize_provider_type_list(value: str | list[str] | None) -> list[str] | None:
+    """Normalize provider / exclude_providers input.
+
+    Returns:
+    - None: treat as "all" / unrestricted (only meaningful for ``provider``)
+    - list[str]: explicit provider_type values (lowercased, de-duplicated, order preserved)
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        tokens = [value]
+    elif isinstance(value, list):
+        tokens = value
+    else:
+        raise ValueError("provider 字段须为字符串、字符串数组或省略")
+    normalized_items: list[str] = []
+    seen: set[str] = set()
+    for raw_token in tokens:
+        if raw_token is None:
+            continue
+        if not isinstance(raw_token, str):
+            raise ValueError("provider 列表元素必须是字符串")
+        token = raw_token.strip().lower()
+        if not token:
+            continue
+        if token == "all":
+            return None
+        if token not in seen:
+            seen.add(token)
+            normalized_items.append(token)
+    return normalized_items or None
+
+
 class MailboxAcquireRequest(BaseModel):
     """领取一个可用邮箱账号用于后续读信 / 验证码，不返回 Token。"""
 
@@ -495,21 +547,30 @@ class MailboxAcquireRequest(BaseModel):
         max_length=320,
         description="优先领取的主邮箱地址；不传则由服务分配可用邮箱。",
     )
-    provider: str | None = Field(
+    provider: str | list[str] | None = Field(
         default=None,
-        max_length=64,
         description=(
-            "可选 provider_type。省略时仅领取 microsoft；"
-            "显式 smsbower_gmail 需要 Client Key 具备 providers:smsbower_gmail:acquire。"
+            "邮箱类型（provider_type）。支持：单个字符串、字符串数组、`all`、或省略。"
+            "省略 / `all` / 空：在调用方已授权的全部类型中随机分配；"
+            "显式列表则仅在列表内随机。"
+            "非 microsoft 类型需要 Client Key 具备 `providers:{type}:acquire`。"
+        ),
+    )
+    exclude_providers: str | list[str] | None = Field(
+        default=None,
+        description=(
+            "排除的邮箱类型（provider_type）。支持单个字符串或字符串数组。"
+            "排除优先级最高：从候选池中先剔除这些类型，再做随机分配。"
+            "可与 provider / all 同时使用。"
         ),
     )
     use_plus_alias: bool = Field(
         default=False,
         description=(
-            "为 true 时只分配 plus alias 作为 allocated_email（如 user+xxxxxxxx@domain），"
-            "不占用主邮箱业务地址；后续取验证码默认按该别名匹配收件人；OAuth/IMAP 仍使用主邮箱。"
-            "同一母号可并发多个不同 plus 租约（即使母号已有其他租约）。"
-            "仅 microsoft 支持；SMSBower 本轮不支持。"
+            "为 true 时，在实际命中 microsoft 时分配 plus alias 作为 allocated_email"
+            "（如 user+xxxxxxxx@domain），不占用主邮箱业务地址；后续取验证码默认按该别名匹配收件人；"
+            "OAuth/IMAP 仍使用主邮箱。同一母号可并发多个不同 plus 租约。"
+            "仅对 microsoft 生效；若本次随机/指定到非 microsoft 类型，本字段被忽略，不会强制改走 microsoft。"
         ),
     )
     alias_suffix: str | None = Field(
@@ -531,7 +592,7 @@ class MailboxAcquireRequest(BaseModel):
     client_tag: str | None = Field(default=None, max_length=100, description="调用方自定义标签，便于排查。")
     purpose: str | None = Field(default=None, max_length=100, description="领取用途说明。")
 
-    @field_validator("preferred_email", "client_tag", "purpose", "alias_suffix", "usage_site", "provider")
+    @field_validator("preferred_email", "client_tag", "purpose", "alias_suffix", "usage_site")
     @classmethod
     def normalize_optional_mailbox_acquire_text(cls, value: str | None) -> str | None:
         if value is None:
@@ -539,12 +600,19 @@ class MailboxAcquireRequest(BaseModel):
         normalized_value = value.strip()
         return normalized_value or None
 
-    @field_validator("usage_site", "provider")
+    @field_validator("usage_site")
     @classmethod
     def normalize_usage_site_code(cls, value: str | None) -> str | None:
         if value is None:
             return None
         return value.strip().lower() or None
+
+    @field_validator("provider", "exclude_providers", mode="before")
+    @classmethod
+    def normalize_provider_selection_fields(
+        cls, value: str | list[str] | None
+    ) -> list[str] | None:
+        return _normalize_provider_type_list(value)
 
 
 class MailboxAcquireResponse(BaseModel):
@@ -566,7 +634,7 @@ class MailboxAcquireResponse(BaseModel):
     )
     provider: str | None = Field(
         default=None,
-        description="实际领取的 provider_type；省略 provider 的 legacy 请求可不返回该字段。",
+        description="实际领取的 provider_type（多类型随机时返回命中的类型）。",
     )
     mode: Literal[LeaseMode.MAIL_READ] = Field(
         default=LeaseMode.MAIL_READ,
