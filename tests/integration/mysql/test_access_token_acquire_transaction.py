@@ -229,7 +229,11 @@ def test_access_token_oauth_failure_releases_claim_without_ghost_lease(
 
     verify_session = mysql_session_factory()
     try:
-        claim = verify_session.get(MailboxLeaseClaim, mailbox_id)
+        claim = verify_session.scalar(
+            select(MailboxLeaseClaim)
+            .where(MailboxLeaseClaim.mailbox_id == mailbox_id)
+            .limit(1)
+        )
         assert claim is None
         active_leases = list(
             verify_session.scalars(

@@ -183,12 +183,17 @@ def increment_token_version_under_lock(
 def has_active_refresh_token_lease_claim(session: Session, mailbox_id: str) -> bool:
     """Return whether the mailbox currently has an active refresh_token lease claim."""
     current_time = utc_now()
-    claim = session.get(MailboxLeaseClaim, mailbox_id)
-    if claim is None:
-        return False
-    if claim.mode != LeaseMode.REFRESH_TOKEN:
-        return False
-    return not is_expired(claim.expires_at, current_time=current_time)
+    sql_current_time = current_time.replace(tzinfo=None)
+    claim = session.scalar(
+        select(MailboxLeaseClaim)
+        .where(
+            MailboxLeaseClaim.mailbox_id == mailbox_id,
+            MailboxLeaseClaim.mode == LeaseMode.REFRESH_TOKEN,
+            MailboxLeaseClaim.expires_at > sql_current_time,
+        )
+        .limit(1)
+    )
+    return claim is not None
 
 
 def claim_token_refresh(

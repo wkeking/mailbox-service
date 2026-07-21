@@ -266,20 +266,25 @@ class ClientKey(Base):
 
 
 class MailboxLeaseClaim(Base):
-    """Current exclusive occupancy for one mailbox (history remains in leases)."""
+    """Active lease occupancy row (history remains in leases).
+
+    Primary key is lease_id so multiple plus-alias mail_read claims may share one
+    mailbox. Exclusive modes still enforce at most one exclusive claim per mailbox
+    in LeaseService application logic.
+    """
 
     __tablename__ = "mailbox_lease_claims"
     __table_args__ = (
-        UniqueConstraint("lease_id", name="uq_mailbox_lease_claims_lease_id"),
         UniqueConstraint("allocated_email", name="uq_mailbox_lease_claims_allocated_email"),
+        Index("ix_mailbox_lease_claims_mailbox_id", "mailbox_id"),
         Index("ix_mailbox_lease_claims_expires_at", "expires_at"),
         Index("ix_mailbox_lease_claims_client", "client_key_id", "expires_at"),
     )
 
+    lease_id: Mapped[str] = mapped_column(String(36), primary_key=True)
     mailbox_id: Mapped[str] = mapped_column(
-        ForeignKey("mailboxes.id", ondelete="CASCADE"), primary_key=True
+        ForeignKey("mailboxes.id", ondelete="CASCADE"), nullable=False
     )
-    lease_id: Mapped[str] = mapped_column(String(36), nullable=False)
     client_key_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     mode: Mapped[LeaseMode] = mapped_column(
         Enum(LeaseMode, values_callable=enum_values), nullable=False

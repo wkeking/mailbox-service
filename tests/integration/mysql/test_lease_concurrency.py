@@ -169,7 +169,11 @@ def test_thirty_two_threads_claim_one_mailbox_exactly_once(
         )
         assert mailbox_claim_count == 1
 
-        claim = verify_session.get(MailboxLeaseClaim, mailbox_id)
+        claim = verify_session.scalar(
+            select(MailboxLeaseClaim)
+            .where(MailboxLeaseClaim.mailbox_id == mailbox_id)
+            .limit(1)
+        )
         assert claim is not None
         assert claim.lease_id == winners[0]
         assert claim.mode == LeaseMode.REFRESH_TOKEN
@@ -245,7 +249,11 @@ def test_late_release_does_not_delete_successor_claim(
         second_lease_id = second.lease_id
         assert second_lease_id != first_lease_id
 
-        claim_before_late_release = session.get(MailboxLeaseClaim, mailbox_id)
+        claim_before_late_release = session.scalar(
+            select(MailboxLeaseClaim)
+            .where(MailboxLeaseClaim.mailbox_id == mailbox_id)
+            .limit(1)
+        )
         assert claim_before_late_release is not None
         assert claim_before_late_release.lease_id == second_lease_id
 
@@ -254,7 +262,11 @@ def test_late_release_does_not_delete_successor_claim(
         session.commit()
         assert late_release.lease_id == first_lease_id
 
-        claim_after = session.get(MailboxLeaseClaim, mailbox_id)
+        claim_after = session.scalar(
+            select(MailboxLeaseClaim)
+            .where(MailboxLeaseClaim.mailbox_id == mailbox_id)
+            .limit(1)
+        )
         assert claim_after is not None
         assert claim_after.lease_id == second_lease_id
 
@@ -290,10 +302,24 @@ def test_release_clears_matching_claim_only(
             preferred_email=mailbox.primary_email,
         )
         session.commit()
-        assert session.get(MailboxLeaseClaim, acquired.mailbox_id) is not None
+        assert (
+            session.scalar(
+                select(MailboxLeaseClaim)
+                .where(MailboxLeaseClaim.mailbox_id == acquired.mailbox_id)
+                .limit(1)
+            )
+            is not None
+        )
 
         lease_service.release_lease(principal, acquired.lease_id)
         session.commit()
-        assert session.get(MailboxLeaseClaim, acquired.mailbox_id) is None
+        assert (
+            session.scalar(
+                select(MailboxLeaseClaim)
+                .where(MailboxLeaseClaim.mailbox_id == acquired.mailbox_id)
+                .limit(1)
+            )
+            is None
+        )
     finally:
         session.close()

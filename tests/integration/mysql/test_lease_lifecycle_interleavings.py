@@ -126,7 +126,11 @@ def test_late_release_does_not_delete_successor_claim(
         lease_row = expire_session.get(Lease, first_lease_id)
         assert lease_row is not None
         lease_row.expires_at = past_naive
-        claim_row = expire_session.get(MailboxLeaseClaim, mailbox_id)
+        claim_row = expire_session.scalar(
+            select(MailboxLeaseClaim)
+            .where(MailboxLeaseClaim.mailbox_id == mailbox_id)
+            .limit(1)
+        )
         assert claim_row is not None
         claim_row.expires_at = past_naive
         expire_session.commit()
@@ -163,7 +167,11 @@ def test_late_release_does_not_delete_successor_claim(
 
     verify = mysql_session_factory()
     try:
-        claim = verify.get(MailboxLeaseClaim, mailbox_id)
+        claim = verify.scalar(
+            select(MailboxLeaseClaim)
+            .where(MailboxLeaseClaim.mailbox_id == mailbox_id)
+            .limit(1)
+        )
         assert claim is not None
         assert claim.lease_id == second_lease_id
         first_lease = verify.get(Lease, first_lease_id)
@@ -347,7 +355,11 @@ def test_concurrent_release_and_reacquire_mailbox_first(
         released = verify.get(Lease, lease_id)
         assert released is not None
         assert released.released_at is not None
-        claim = verify.get(MailboxLeaseClaim, mailbox_id)
+        claim = verify.scalar(
+            select(MailboxLeaseClaim)
+            .where(MailboxLeaseClaim.mailbox_id == mailbox_id)
+            .limit(1)
+        )
         if claim is not None:
             assert claim.lease_id != lease_id
     finally:

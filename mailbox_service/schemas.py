@@ -506,8 +506,9 @@ class MailboxAcquireRequest(BaseModel):
     use_plus_alias: bool = Field(
         default=False,
         description=(
-            "为 true 时为本租约生成主邮箱的 plus alias（如 user+xxxxxxxx@domain），"
-            "后续取验证码默认按该别名匹配收件人；OAuth/IMAP 仍使用主邮箱。"
+            "为 true 时只分配 plus alias 作为 allocated_email（如 user+xxxxxxxx@domain），"
+            "不占用主邮箱业务地址；后续取验证码默认按该别名匹配收件人；OAuth/IMAP 仍使用主邮箱。"
+            "同一母号可并发多个不同 plus 租约（即使母号已有其他租约）。"
             "仅 microsoft 支持；SMSBower 本轮不支持。"
         ),
     )

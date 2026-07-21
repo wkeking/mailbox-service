@@ -215,8 +215,9 @@ OPENAPI_OPERATION_DOCUMENTATION: dict[tuple[str, str], tuple[str, str, str]] = {
     ("POST", "/api/v1/mailboxes/acquire"): (
         "领取可用邮箱账号",
         "领取一个 status=active 且 capability 为 imap/graph 的邮箱并创建 mail_read 租约；"
-        "可选择生成 plus alias 作为 allocated_email；主邮箱路径必须声明 usage_site，"
-        "用于全局排除已在该站登记的业务地址；只返回邮箱地址与租约信息，不返回 Token。",
+        "use_plus_alias=true 时只分配 plus 别名（可与同母号其他租约并发）；"
+        "主邮箱路径必须声明 usage_site，用于全局排除已在该站登记的主邮箱地址；"
+        "只返回邮箱地址与租约信息，不返回 Token。",
         "外部邮箱",
     ),
     ("GET", "/api/v1/usage-sites"): (

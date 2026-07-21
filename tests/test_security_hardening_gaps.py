@@ -323,7 +323,12 @@ def test_access_token_acquire_defers_token_until_after_reserve() -> None:
         raised = True
     assert raised
     session.flush()
-    assert session.get(MailboxLeaseClaim, mailbox.id) is None
+    assert (
+        session.scalar(
+            select(MailboxLeaseClaim).where(MailboxLeaseClaim.mailbox_id == mailbox.id).limit(1)
+        )
+        is None
+    )
     active = session.scalars(
         select(Lease).where(Lease.mailbox_id == mailbox.id, Lease.released_at.is_(None))
     ).all()

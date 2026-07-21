@@ -32,6 +32,7 @@ from mailbox_service.models import (
     LeaseMode,
     Mailbox,
     MailboxCapability,
+    MailboxLeaseClaim,
     UsageSite,
     utc_now,
 )
@@ -370,6 +371,114 @@ def test_mail_read_acquire_can_allocate_plus_alias() -> None:
     assert random_result.allocated_email.startswith("second+")
     assert random_result.allocated_email.endswith("@outlook.com")
     assert random_result.allocated_email != "second@outlook.com"
+
+
+def test_plus_alias_can_share_mailbox_with_active_lease_and_site_usage() -> None:
+    """use_plus_alias leases only allocate aliases and may share an occupied mailbox."""
+    session, credential_cipher, client_key_service, lease_service = create_mail_read_context()
+    session.add(
+        Mailbox(
+            primary_email="shared@outlook.com",
+            client_id="client-id",
+            refresh_token_ciphertext=credential_cipher.encrypt("refresh-token"),
+            capability=MailboxCapability.IMAP,
+            access_token_ciphertext=credential_cipher.encrypt("cached-access-token"),
+            access_token_source_version=1,
+            access_token_expires_at=utc_now() + timedelta(minutes=30),
+        )
+    )
+    session.flush()
+    creation = client_key_service.create_client_key(
+        name="plus-share-bot",
+        scopes=["mailboxes:acquire", "mail:verification-code:read"],
+    )
+    principal = client_key_service.authenticate(creation.api_key)
+
+    first = lease_service.acquire_lease(
+        principal,
+        mode=LeaseMode.MAIL_READ,
+        ttl_seconds=600,
+        use_plus_alias=True,
+        preferred_alias_suffix="one",
+        usage_site="grok",
+    )
+    assert first.primary_email == "shared@outlook.com"
+    assert first.allocated_email == "shared+one@outlook.com"
+    assert first.address_kind == "plus_alias"
+
+    second = lease_service.acquire_lease(
+        principal,
+        mode=LeaseMode.MAIL_READ,
+        ttl_seconds=600,
+        use_plus_alias=True,
+        preferred_alias_suffix="two",
+        usage_site="grok",
+    )
+    assert second.primary_email == "shared@outlook.com"
+    assert second.allocated_email == "shared+two@outlook.com"
+    assert second.lease_id != first.lease_id
+
+    claims = list(
+        session.scalars(
+            select(MailboxLeaseClaim).where(MailboxLeaseClaim.mailbox_id == first.mailbox_id)
+        )
+    )
+    assert len(claims) == 2
+    claim_emails = {claim.allocated_email for claim in claims}
+    assert claim_emails == {"shared+one@outlook.com", "shared+two@outlook.com"}
+
+    site_usages = list(
+        session.scalars(
+            select(EmailSiteUsage).where(
+                EmailSiteUsage.mailbox_id == first.mailbox_id,
+                EmailSiteUsage.usage_site_code == "grok",
+                EmailSiteUsage.revoked_at.is_(None),
+            )
+        )
+    )
+    assert len(site_usages) == 2
+
+
+def test_primary_mail_read_still_exclusive_when_plus_leases_exist() -> None:
+    """Primary mail_read must not share a mailbox that already has plus leases."""
+    session, credential_cipher, client_key_service, lease_service = create_mail_read_context()
+    session.add(
+        Mailbox(
+            primary_email="exclusive@outlook.com",
+            client_id="client-id",
+            refresh_token_ciphertext=credential_cipher.encrypt("refresh-token"),
+            capability=MailboxCapability.IMAP,
+            access_token_ciphertext=credential_cipher.encrypt("cached-access-token"),
+            access_token_source_version=1,
+            access_token_expires_at=utc_now() + timedelta(minutes=30),
+        )
+    )
+    session.flush()
+    creation = client_key_service.create_client_key(
+        name="primary-exclusive-bot",
+        scopes=["mailboxes:acquire"],
+    )
+    principal = client_key_service.authenticate(creation.api_key)
+
+    lease_service.acquire_lease(
+        principal,
+        mode=LeaseMode.MAIL_READ,
+        ttl_seconds=600,
+        use_plus_alias=True,
+        preferred_alias_suffix="busy",
+    )
+    try:
+        lease_service.acquire_lease(
+            principal,
+            mode=LeaseMode.MAIL_READ,
+            ttl_seconds=600,
+            preferred_email="exclusive@outlook.com",
+            usage_site="openai",
+        )
+    except LeaseUnavailableError:
+        pass
+    else:
+        raise AssertionError("主邮箱路径不应与同母号 plus 租约并发")
 
 
 def test_mail_read_acquire_requires_scope_and_rejects_unproven_pool() -> None:
@@ -1174,13 +1283,12 @@ def test_mail_read_excludes_primary_already_used_for_site_and_allows_other_site(
     }
 
 
-def test_mail_read_primary_usage_blocks_plus_alias_on_same_site_for_same_mailbox() -> None:
-    """Any active occupancy under a mailbox blocks further plus acquires for that site."""
+def test_mail_read_plus_alias_allowed_after_primary_site_usage_on_same_mailbox() -> None:
+    """Primary site occupancy does not block a new plus alias on the same mailbox/site."""
     session, credential_cipher, client_key_service, lease_service = create_mail_read_context()
     _seed_usable_mailbox(session, credential_cipher, primary_email="alias-block@outlook.com")
-    _seed_usable_mailbox(session, credential_cipher, primary_email="alias-other@outlook.com")
     creation = client_key_service.create_client_key(
-        name="plus-blocked-same-box",
+        name="plus-after-primary-site",
         scopes=["mailboxes:acquire", "leases:release"],
     )
     principal = client_key_service.authenticate(creation.api_key)
@@ -1194,31 +1302,32 @@ def test_mail_read_primary_usage_blocks_plus_alias_on_same_site_for_same_mailbox
     )
     lease_service.release_lease(principal, primary.lease_id)
 
-    try:
-        lease_service.acquire_lease(
-            principal,
-            mode=LeaseMode.MAIL_READ,
-            ttl_seconds=600,
-            preferred_email="alias-block@outlook.com",
-            use_plus_alias=True,
-            preferred_alias_suffix="site01",
-            usage_site="openai",
-        )
-    except LeaseEmailSiteConflictError:
-        pass
-    else:
-        raise AssertionError("同一主邮箱已在该站登记后，plus 路径应拒绝该箱")
-
-    other_plus = lease_service.acquire_lease(
+    plus_result = lease_service.acquire_lease(
         principal,
         mode=LeaseMode.MAIL_READ,
         ttl_seconds=600,
+        preferred_email="alias-block@outlook.com",
         use_plus_alias=True,
+        preferred_alias_suffix="site01",
         usage_site="openai",
     )
-    assert other_plus.primary_email == "alias-other@outlook.com"
-    assert other_plus.allocated_email is not None
-    assert other_plus.allocated_email.startswith("alias-other+")
+    assert plus_result.primary_email == "alias-block@outlook.com"
+    assert plus_result.allocated_email == "alias-block+site01@outlook.com"
+    assert plus_result.address_kind == "plus_alias"
+
+    site_rows = list(
+        session.scalars(
+            select(EmailSiteUsage).where(
+                EmailSiteUsage.mailbox_id == plus_result.mailbox_id,
+                EmailSiteUsage.usage_site_code == "openai",
+                EmailSiteUsage.revoked_at.is_(None),
+            )
+        )
+    )
+    assert {row.allocated_email for row in site_rows} == {
+        "alias-block@outlook.com",
+        "alias-block+site01@outlook.com",
+    }
 
 
 def test_mail_read_revoke_allows_reactivation() -> None:
@@ -1316,13 +1425,12 @@ def test_mail_read_acquire_round_robins_by_updated_at_after_release() -> None:
     assert second.primary_email == "newer@outlook.com"
 
 
-def test_mail_read_plus_with_usage_site_spreads_across_mailboxes() -> None:
-    """With usage_site, sequential plus acquires should not stick to one mailbox."""
+def test_mail_read_plus_with_usage_site_can_reuse_mailbox_for_new_aliases() -> None:
+    """Plus + usage_site keeps allocating distinct aliases; mailbox site history is not a hard cap."""
     session, credential_cipher, client_key_service, lease_service = create_mail_read_context()
     _seed_usable_mailbox(session, credential_cipher, primary_email="box-a@outlook.com")
-    _seed_usable_mailbox(session, credential_cipher, primary_email="box-b@outlook.com")
     creation = client_key_service.create_client_key(
-        name="plus-spread-bot",
+        name="plus-reuse-bot",
         scopes=["mailboxes:acquire", "leases:release"],
     )
     principal = client_key_service.authenticate(creation.api_key)
@@ -1332,8 +1440,11 @@ def test_mail_read_plus_with_usage_site_spreads_across_mailboxes() -> None:
         mode=LeaseMode.MAIL_READ,
         ttl_seconds=600,
         use_plus_alias=True,
+        preferred_alias_suffix="first",
         usage_site="openai",
     )
+    assert first.primary_email == "box-a@outlook.com"
+    assert first.allocated_email == "box-a+first@outlook.com"
     lease_service.release_lease(principal, first.lease_id)
 
     second = lease_service.acquire_lease(
@@ -1341,14 +1452,14 @@ def test_mail_read_plus_with_usage_site_spreads_across_mailboxes() -> None:
         mode=LeaseMode.MAIL_READ,
         ttl_seconds=600,
         use_plus_alias=True,
+        preferred_alias_suffix="second",
         usage_site="openai",
     )
-    assert first.primary_email != second.primary_email
-    assert {first.primary_email, second.primary_email} == {
-        "box-a@outlook.com",
-        "box-b@outlook.com",
-    }
+    assert second.primary_email == "box-a@outlook.com"
+    assert second.allocated_email == "box-a+second@outlook.com"
+    assert second.allocated_email != first.allocated_email
 
+    # Same explicit alias + site after prior occupancy remains unique per address.
     lease_service.release_lease(principal, second.lease_id)
     try:
         lease_service.acquire_lease(
@@ -1356,9 +1467,10 @@ def test_mail_read_plus_with_usage_site_spreads_across_mailboxes() -> None:
             mode=LeaseMode.MAIL_READ,
             ttl_seconds=600,
             use_plus_alias=True,
+            preferred_alias_suffix="first",
             usage_site="openai",
         )
-    except LeaseUnavailableError:
+    except LeaseEmailSiteConflictError:
         pass
     else:
-        raise AssertionError("两箱均已在该站占用后，plus 路径应耗尽")
+        raise AssertionError("同一 plus 地址已在该站登记后应冲突")

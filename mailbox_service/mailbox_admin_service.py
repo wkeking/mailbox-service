@@ -275,8 +275,13 @@ class MailboxAdminService:
         )
         for lease in active_leases:
             lease.released_at = current_time
-        claim = self._session.get(MailboxLeaseClaim, mailbox_id)
-        if claim is not None:
+        # Multiple plus-alias claims may share one mailbox; delete all of them.
+        claims = list(
+            self._session.scalars(
+                select(MailboxLeaseClaim).where(MailboxLeaseClaim.mailbox_id == mailbox_id)
+            )
+        )
+        for claim in claims:
             self._session.delete(claim)
         write_audit_event(
             self._session,

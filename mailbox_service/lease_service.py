@@ -453,16 +453,18 @@ class LeaseService:
         current_time = utc_now()
         # MySQL DATETIME is typically naive; compare with a naive UTC value in SQL.
         sql_current_time = current_time.replace(tzinfo=None)
-        active_lease_exists = exists(
+        # Plus-alias mail_read leases may share a mailbox with other plus leases.
+        # Exclusive modes (AT / RT / primary mail_read) need a fully free mailbox
+        # (no active lease or claim of any kind).
+        any_active_lease_exists = exists(
             select(Lease.id).where(
                 Lease.mailbox_id == Mailbox.id,
                 Lease.released_at.is_(None),
                 Lease.expires_at > sql_current_time,
             )
         )
-        # Claim table is the exclusive occupancy guard (PK = mailbox_id).
-        active_claim_exists = exists(
-            select(MailboxLeaseClaim.mailbox_id).where(
+        any_active_claim_exists = exists(
+            select(MailboxLeaseClaim.lease_id).where(
                 MailboxLeaseClaim.mailbox_id == Mailbox.id,
                 MailboxLeaseClaim.expires_at > sql_current_time,
             )
@@ -470,9 +472,13 @@ class LeaseService:
         mailbox_query = select(Mailbox).where(
             Mailbox.status == MailboxStatus.ACTIVE,
             Mailbox.provider_type == provider_type,
-            ~active_lease_exists,
-            ~active_claim_exists,
         )
+        if not wants_plus_alias:
+            # AT / RT / primary mail_read: mailbox-level exclusive occupancy.
+            mailbox_query = mailbox_query.where(
+                ~any_active_lease_exists,
+                ~any_active_claim_exists,
+            )
         if provider_type == DEFAULT_PROVIDER_TYPE:
             mailbox_query = mailbox_query.where(
                 Mailbox.client_id.is_not(None),
@@ -493,17 +499,8 @@ class LeaseService:
                     )
                 )
                 mailbox_query = mailbox_query.where(~primary_used_for_site)
-            if resolved_usage_site and wants_plus_alias:
-                # Plus path: any prior registration under this mailbox for the site blocks reuse
-                # of the whole asset so sequential plus acquires spread across mailboxes.
-                mailbox_used_for_site = exists(
-                    select(EmailSiteUsage.id).where(
-                        EmailSiteUsage.mailbox_id == Mailbox.id,
-                        EmailSiteUsage.usage_site_code == resolved_usage_site,
-                        EmailSiteUsage.revoked_at.is_(None),
-                    )
-                )
-                mailbox_query = mailbox_query.where(~mailbox_used_for_site)
+            # Plus path: do not exclude the whole mailbox for prior site usage; uniqueness is
+            # per allocated_email (+ optional site) when generating the alias.
         if mode == LeaseMode.MAIL_READ and provider_type == "smsbower_gmail":
             # Resource must be available and ready; releasing/cooldown/unknown excluded.
             available_resource = exists(
@@ -528,17 +525,13 @@ class LeaseService:
                 mode == LeaseMode.MAIL_READ
                 and normalized_preferred_email
                 and resolved_usage_site
-            ):
-                if not wants_plus_alias and self._has_active_email_site_usage(
+                and not wants_plus_alias
+                and self._has_active_email_site_usage(
                     allocated_email=normalized_preferred_email,
                     usage_site_code=resolved_usage_site,
-                ):
-                    raise LeaseEmailSiteConflictError("该邮箱已在此站点登记使用")
-                if wants_plus_alias and self._mailbox_has_active_site_usage(
-                    mailbox_primary_email=normalized_preferred_email,
-                    usage_site_code=resolved_usage_site,
-                ):
-                    raise LeaseEmailSiteConflictError("该邮箱已在此站点登记使用")
+                )
+            ):
+                raise LeaseEmailSiteConflictError("该邮箱已在此站点登记使用")
             raise LeaseUnavailableError("没有可用邮箱")
 
         allocated_email: str | None = None
@@ -723,6 +716,7 @@ class LeaseService:
             )
         )
         matching_owned_lease: Lease | None = None
+        reacquire_is_plus_alias = address_kind == "plus_alias"
         for active_lease in active_leases:
             same_owner = active_lease.client_key_id == principal.client_key_id
             same_mode = active_lease.mode == LeaseMode.MAIL_READ
@@ -730,6 +724,14 @@ class LeaseService:
             if same_owner and same_mode and same_allocated:
                 matching_owned_lease = active_lease
                 continue
+            # Same exact business address held by another active lease → busy.
+            if same_allocated:
+                raise LeaseMailboxBusyError("目标邮箱当前被其他租约占用")
+            # Plus reacquire may coexist with any other lease on the same mailbox
+            # (including exclusive AT/RT/primary and other plus leases).
+            if reacquire_is_plus_alias:
+                continue
+            # Primary reacquire requires the mailbox free of any other active lease.
             raise LeaseMailboxBusyError("目标邮箱当前被其他租约占用")
 
         if matching_owned_lease is not None:
@@ -1629,10 +1631,11 @@ class LeaseService:
 
 
     def _upsert_lease_claim(self, lease: Lease, *, allocated_email: str | None) -> None:
-        """Insert or replace the exclusive claim row for this mailbox.
+        """Insert or replace the claim row for this lease_id.
 
-        Expired claims are purged first. A live claim for a different lease is treated as a
-        concurrency conflict (IntegrityError / caller maps to busy).
+        Plus-alias mail_read claims may coexist on one mailbox. Exclusive claims
+        (AT / RT / primary mail_read) conflict with any other live exclusive claim
+        on the same mailbox. Expired claims for this mailbox are purged first.
         """
         current_time = utc_now()
         sql_current_time = current_time.replace(tzinfo=None)
@@ -1644,17 +1647,35 @@ class LeaseService:
         )
         self._session.flush()
 
-        existing = self._session.get(MailboxLeaseClaim, lease.mailbox_id)
-        if existing is not None:
-            if existing.lease_id != lease.id and not is_expired(existing.expires_at, current_time=current_time):
-                # Another active claim already owns this mailbox.
+        mailbox = self._session.get(Mailbox, lease.mailbox_id)
+        primary_email = (mailbox.primary_email if mailbox is not None else "") or ""
+        new_is_plus = (
+            lease.mode == LeaseMode.MAIL_READ
+            and allocated_email is not None
+            and allocated_email.strip().lower() != primary_email.strip().lower()
+        )
+
+        existing_for_lease = self._session.get(MailboxLeaseClaim, lease.id)
+        if existing_for_lease is not None:
+            self._session.delete(existing_for_lease)
+            self._session.flush()
+
+        if not new_is_plus:
+            # Exclusive claim cannot coexist with any other live claim on this mailbox.
+            conflicting_claim = self._session.scalar(
+                select(MailboxLeaseClaim.lease_id).where(
+                    MailboxLeaseClaim.mailbox_id == lease.mailbox_id,
+                    MailboxLeaseClaim.lease_id != lease.id,
+                    MailboxLeaseClaim.expires_at > sql_current_time,
+                )
+                .limit(1)
+            )
+            if conflicting_claim is not None:
                 raise IntegrityError(
                     "mailbox_lease_claims conflict",
                     params=None,
                     orig=Exception("active claim exists"),
                 )
-            self._session.delete(existing)
-            self._session.flush()
 
         claim_expires_at = lease.expires_at
         if claim_expires_at.tzinfo is not None:
@@ -1665,8 +1686,8 @@ class LeaseService:
 
         self._session.add(
             MailboxLeaseClaim(
-                mailbox_id=lease.mailbox_id,
                 lease_id=lease.id,
+                mailbox_id=lease.mailbox_id,
                 client_key_id=lease.client_key_id,
                 mode=lease.mode,
                 allocated_email=allocated_email,
@@ -1677,11 +1698,9 @@ class LeaseService:
         self._session.flush()
 
     def _delete_lease_claim_for_lease(self, lease: Lease) -> None:
-        """Remove claim only when it still points at this lease_id."""
-        claim = self._session.get(MailboxLeaseClaim, lease.mailbox_id)
+        """Remove the claim row for this lease_id if present."""
+        claim = self._session.get(MailboxLeaseClaim, lease.id)
         if claim is None:
-            return
-        if claim.lease_id != lease.id:
             return
         self._session.delete(claim)
         self._session.flush()

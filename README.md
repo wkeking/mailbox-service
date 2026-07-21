@@ -137,7 +137,7 @@ curl -X POST http://localhost:8000/api/v1/admin/client-keys \
 | `POST` | `/api/v1/leases/{lease_id}/release` | 幂等释放租约 |
 | `POST` | `/api/v1/leases/{lease_id}/access-token` | 获取未过期缓存 AT，过期时自动刷新 |
 | `POST` | `/api/v1/leases/{lease_id}/refresh-token` | 按 `expected_token_version` CAS 回写 RT |
-| `POST` | `/api/v1/mailboxes/acquire` | 领取可用邮箱账号（mail_read；省略 `provider` 仅 Microsoft；主邮箱须传 `usage_site`） |
+| `POST` | `/api/v1/mailboxes/acquire` | 领取可用邮箱账号（mail_read；省略 `provider` 仅 Microsoft；主邮箱须传 `usage_site`；`use_plus_alias=true` 只分配别名且可与同母号并发） |
 | `GET` | `/api/v1/usage-sites` | 查询启用中的注册站点白名单（需 `mailboxes:acquire`） |
 | `POST` | `/api/v1/mailboxes/reacquire` | 按历史业务地址（主邮箱或 plus 别名）重新领取 mail_read 租约 |
 | `POST` | `/api/v1/leases/{lease_id}/verification-code` | 在 mail_read 租约下提取收件箱验证码 |
