@@ -20,7 +20,8 @@
 
 | 页面 | 能力 |
 | --- | --- |
-| **邮箱 Provider** | 各类型启停、API Base、域名与密钥（加密保存、不回显明文）；SMSBower 补货 |
+| **邮箱 Provider** | 各类型启停、API Base、域名与密钥（加密保存、不回显明文）；SMSBower 补货；**检测全部服务 / 域名探测** |
+| **联调工作台** | Admin 对 on-demand Provider 开箱、刷新收件、提取/复制验证码、释放会话（不写 `mailboxes`） |
 | **Client Key** | 创建 / **编辑名称与权限** / 停用；明文仅创建时显示一次；编辑弹窗支持固定高度内滚动 |
 | **邮箱 / 租约 / 注册站点 / 站点占用 / 出口代理** | 见下文管理 API 与管理台说明 |
 
@@ -41,7 +42,7 @@
 - 代理健康探测、冷却、恢复、审计、Dashboard 指标与管理 API。
 - React 管理页提供代理添加、启停、测试、恢复、删除和全局策略配置。
 
-## 本地启动
+## 开发启动
 
 运行时统一为 **Python 3.14**（与 Docker 镜像、`.python-version` 一致）。请使用 3.14 创建虚拟环境，避免与生产 stdlib 行为不一致。
 
@@ -384,11 +385,11 @@ SPA / 某些 OTP 流程可能是 24 小时；个人 Outlook / Hotmail 常见为 
 
 也可在管理台对选中/全部邮箱执行 `POST /api/v1/admin/mailboxes/access-tokens/refresh` 做手动批量刷新。
 
-## Docker 镜像打包与 ARM 服务器部署
+## Docker 镜像构建与部署
 
-镜像为多阶段构建：Node 编译管理台 + **Python 3.14** 运行 FastAPI，**默认目标平台 `linux/arm64`**。  
-基座镜像为 `python:3.14-slim-bookworm`，与本地开发版本对齐。  
-默认镜像名：**`registry.example.com/mailbox-service:latest`**；`./scripts/build-image.sh` **默认构建后自动推送**到该私有仓库。`docker-compose.yml` 默认 `image` 与此一致。
+镜像为多阶段构建：Node 编译管理台 + **Python 3.14** 运行 FastAPI。  
+默认目标平台为 `linux/arm64`（可用参数覆盖为 `linux/amd64`）。  
+基座镜像为 `python:3.14-slim-bookworm`。
 
 **分层缓存（减小 push / pull）：** 依赖与代码严格分 stage / layer：
 
@@ -401,67 +402,64 @@ SPA / 某些 OTP 流程可能是 24 小时；个人 Outlook / Hotmail 常见为 
 | `frontend_dist` | 前端构建产物变更 | 中小 |
 | 前端 `npm ci`（`frontend-deps`） | 仅 `package-lock.json` 变更 | 构建期大，不进最终镜像依赖重装 |
 
-仅改后端代码时，`docker push` / `docker pull` 会跳过仓库里已有的依赖层，服务器通常只需拉取代码层。  
-推送方式：构建完成后执行 `docker push registry.example.com/mailbox-service:<tag>`（仅正式镜像标签）。**不**推送 BuildKit 的 `:buildcache`；跨机器构建加速靠 Dockerfile 分层 + 本机 BuildKit 缓存即可。
+仅改后端代码时，`docker push` / `docker pull` 通常只需传输代码层。
 
 相关文件：
 
 | 路径 | 作用 |
 | --- | --- |
 | `Dockerfile` | 多阶段 / 分层构建定义 |
-| `scripts/build-image.sh` | buildx `--load` 后 `docker push` 正式镜像 |
-| `docker-compose.yml` | 应用部署；默认拉取 `registry.example.com/mailbox-service:latest`，外连共享 infra MySQL |
+| `scripts/build-image.sh` | buildx 构建；可 load / push / 导出 tar |
+| `docker-compose.yml` | 应用部署示例（外连已有 MySQL 网络） |
 | `.dockerignore` | 减小构建上下文 |
 
 ### 前置条件
 
-- 本机已安装 Docker，并支持 `docker buildx`
-- 本机与目标服务器均可访问私有仓库 `registry.example.com`（**无需** `docker login`，直接 pull/push）
-- 在 **x86 开发机交叉构建 arm64** 时，Docker Desktop 需开启 containerd / QEMU
-- 目标服务器已安装 Docker（可选 Docker Compose v2）
+- 已安装 Docker，并支持 `docker buildx`
+- 目标环境可访问你自己的镜像仓库（若需要 `push` / `pull`）
+- 交叉构建其他架构时，需配置 QEMU / buildx 多架构支持
+- 已准备 MySQL 8 实例，并创建业务库
 
-### 1. 打包并推送镜像（推荐）
+### 1. 构建镜像
 
 ```bash
-# 赋予执行权限（首次）
 chmod +x scripts/build-image.sh
 
-# 默认：构建 linux/arm64 并推送 registry.example.com/mailbox-service:latest
-./scripts/build-image.sh
-
-# 仅本机载入、不推仓库（调试）
+# 仅载入本机 Docker（默认，不推送）
 ./scripts/build-image.sh --output load
 
-# 导出 tar（离线场景，不推仓库）
+# 构建并推送到你的镜像仓库
+REGISTRY=registry.example.com ./scripts/build-image.sh --output push
+
+# 导出 tar（离线场景）
 ./scripts/build-image.sh --output tar
 ```
 
-常用参数：
+常用参数 / 环境变量：
 
 ```text
 --platform   默认 linux/arm64；也可 linux/amd64
 --tag        镜像标签，默认 latest
---name       仓库名，默认 mailbox-service
---registry   私有仓库主机，默认 registry.example.com
---output     默认 push；可选 load | tar
+--name       镜像名，默认 mailbox-service
+--registry   镜像仓库主机；push 时必填（也可用环境变量 REGISTRY）
+--output     load | push | tar（默认 load）
 ```
 
-完整镜像引用：`registry.example.com/mailbox-service:latest`
+完整镜像引用示例：`registry.example.com/mailbox-service:latest`
 
 ### 2. 服务器拉取镜像
 
 ```bash
-# 服务器直接拉取（无需 login）
 docker pull registry.example.com/mailbox-service:latest
 docker images | grep mailbox-service
 ```
 
-离线 tar 场景（非默认）：
+离线 tar 场景：
 
 ```bash
-# 开发机
+# 构建机
 ./scripts/build-image.sh --output tar
-scp dist/mailbox-service-*-linux-arm64.tar user@arm-server:/opt/mailbox-service/
+scp dist/mailbox-service-*-linux-arm64.tar user@server:/opt/mailbox-service/
 
 # 服务器
 docker load -i mailbox-service-*-linux-arm64.tar
@@ -469,16 +467,16 @@ docker load -i mailbox-service-*-linux-arm64.tar
 
 ### 3. 准备配置与数据库
 
-在服务器项目目录（或部署目录）准备 `.env`：
+在部署目录准备 `.env`（**不要提交真实 `.env`**）：
 
 ```bash
 cp .env.example .env
-# 编辑至少以下项：
+# 至少填写：
 #   ADMIN_API_TOKEN
 #   CREDENTIAL_ENCRYPTION_KEY   # 32 字节 URL-safe Base64
 #   DATABASE_URL
 #   APP_ENV=production
-#   CORS_ALLOW_ORIGINS=*        # 同源管理台可设 *
+#   CORS_ALLOW_ORIGINS          # 同源管理台可设 *
 #   PROXY_REQUIRED=true/false   # 按出口策略
 ```
 
@@ -491,62 +489,48 @@ python3 -c "import base64, os; print(base64.urlsafe_b64encode(os.urandom(32)).de
 **数据库迁移：**
 
 - **推荐**：保持 `AUTO_MIGRATE_ON_STARTUP=true`（默认）。服务启动时会自动检测版本并执行 `migrations/` 中尚未记录的脚本，结果写入 `schema_migrations`。
-- Compose 使用共享基础设施 `mysql-host`（网络 `external_network`）时，请先创建 `mailbox_service` 库；表结构由应用启动迁移负责。
+- 使用 Compose 外连共享 MySQL 时，请先创建 `mailbox_service` 库；表结构由应用启动迁移负责。
 - 关闭自动迁移时设 `AUTO_MIGRATE_ON_STARTUP=false`，再按序号手动执行：
 
 ```bash
 for migration_file in migrations/*.sql; do
-  mysql -u root -p mailbox_service < "$migration_file"
+  mysql -u <user> -p mailbox_service < "$migration_file"
 done
 ```
 
 - 新增迁移请继续使用 `00N_描述.sql` 命名；**不要修改已上线版本的 SQL 内容**（版本号一旦记录即视为已应用）。
 
-### 4a. 用 Compose 部署（应用 + 外连共享 infra MySQL）
+### 4a. 用 Compose 部署（外连已有 MySQL）
 
-`docker-compose.yml` 默认镜像为 `registry.example.com/mailbox-service:latest`，与打包脚本一致。可覆盖：
+`docker-compose.yml` 默认镜像为 `mailbox-service:latest`，可通过环境变量覆盖：
 
 ```bash
 export MAILBOX_IMAGE=registry.example.com/mailbox-service:latest
-# 或 docker compose pull && docker compose up -d
-```
-
-Compose 默认**不自带 MySQL**，接入本机已运行的共享基础设施（见 `Docker/infra/docker-compose.yml`）：
-
-| 资源 | 值 |
-| --- | --- |
-| 网络 | `external_network`（compose 项目 `infra` 的 `infra` 网络） |
-| MySQL 容器 | `mysql-host` |
-| 默认账号 | `root` / `change-me`（仅本地开发） |
-
-先启动基础设施：
-
-```bash
-cd /path/to/infra
+export INFRA_NETWORK_NAME=your_external_docker_network
+# 在 .env 中配置 DATABASE_URL 等密钥
+docker compose pull   # 若使用远程镜像
 docker compose up -d
 ```
 
-应用侧 `.env` 中容器内主机名须为 `mysql-host`，勿写 `127.0.0.1`：
+Compose **不自带 MySQL**，需接入外部 Docker 网络中的 MySQL（或改 `docker-compose.yml` 以适配你的拓扑）。
+
+应用侧 `.env` 示例（主机名以容器网络可达为准）：
 
 ```env
-DATABASE_URL=mysql+pymysql://root:change-me@mysql-host:3306/mailbox_service
+DATABASE_URL=mysql+pymysql://<user>:<password>@<mysql-host>:3306/mailbox_service
 APP_ENV=production
 CORS_ALLOW_ORIGINS=*
 ```
 
-本机直接跑 uvicorn 时把主机改成 `127.0.0.1` 即可。
-
-首次使用需保证库已创建：
+首次使用需保证库已创建，例如：
 
 ```bash
-docker exec -i mysql-host mysql -uroot -pchange-me \
-  -e "CREATE DATABASE IF NOT EXISTS mailbox_service CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+mysql -u <user> -p -e "CREATE DATABASE IF NOT EXISTS mailbox_service CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
 ```
 
-启动：
+启动与检查：
 
 ```bash
-docker compose pull
 docker compose up -d
 docker compose ps
 curl -fsS http://127.0.0.1:8000/health
@@ -554,9 +538,9 @@ curl -fsS http://127.0.0.1:8000/health
 
 访问：
 
-- 管理台：`http://<服务器IP>:8000/`
-- 公开 API 文档：`http://<服务器IP>:8000/docs`
-- 健康检查：`http://<服务器IP>:8000/health`
+- 管理台：`http://<host>:8000/`
+- 公开 API 文档：`http://<host>:8000/docs`
+- 健康检查：`http://<host>:8000/health`
 
 ### 4b. 仅运行应用容器（外部已有 MySQL）
 
@@ -568,19 +552,19 @@ docker run -d \
   --env-file .env \
   -e APP_ENV=production \
   -e CORS_ALLOW_ORIGINS='*' \
-  --network infra_default \
+  --network <your_external_network> \
   registry.example.com/mailbox-service:latest
 ```
 
-确保 `.env` 中 `DATABASE_URL` 在容器内可达（Compose 场景用 `mysql-host` 主机名，并加入 `infra_default` 网络）。
+确保 `.env` 中 `DATABASE_URL` 在容器网络内可达。
 
 ### 5. 升级镜像
 
 ```bash
-# 开发机：构建并自动推送到私有仓库
-./scripts/build-image.sh
+# 构建机：构建并推送到你的仓库
+REGISTRY=registry.example.com ./scripts/build-image.sh --output push
 
-# 服务器：拉取最新 latest 并滚动
+# 服务器：拉取最新标签并滚动
 docker compose pull
 docker compose up -d
 # 默认会在启动时自动执行尚未记录的 migrations（见 AUTO_MIGRATE_ON_STARTUP）
@@ -590,14 +574,13 @@ docker compose up -d
 
 | 现象 | 处理 |
 | --- | --- |
-| `exec format error` | 镜像架构与服务器不一致；确认用 `linux/arm64` 构建并 `docker image inspect` 查看 `Architecture` |
-| buildx 交叉构建失败 | 升级 Docker Desktop / 安装 qemu；或直接在 ARM 机器上 `--output load` |
+| `exec format error` | 镜像架构与服务器不一致；确认构建平台并用 `docker image inspect` 查看 `Architecture` |
+| buildx 交叉构建失败 | 升级 Docker / 安装 QEMU；或直接在目标架构机器上 `--output load` |
 | 管理台打不开 / 接口跨域 | 同源部署将 `CORS_ALLOW_ORIGINS=*`；分离前端时填实际管理台 Origin |
-| 容器起不来 / DB 连接失败 | 检查 `DATABASE_URL`、MySQL 是否 healthy、安全组/防火墙、是否加入 `infra_default` |
-| 拉取/推送镜像失败 | 确认网络可达 `registry.example.com`；HTTP 仓库时 Docker Desktop/daemon 需配置 `insecure-registries` |
-| 脚本 push 报 `https://101.200...` EOF | 旧版用 `buildx --push` 会强制 HTTPS；已改为 `buildx --load` + `docker push`（与手动 push 一致），请更新脚本后重试 |
-| 迁移未生效 | 查看启动日志中的迁移输出与 `schema_migrations` 表；应用启动迁移会补齐未记录版本 |
-| Compose 仍用旧镜像 | `latest` 可能被本地缓存；执行 `docker compose pull` 后再 `up -d` |
+| 容器起不来 / DB 连接失败 | 检查 `DATABASE_URL`、MySQL 是否 healthy、网络/防火墙、是否加入正确的 Docker 网络 |
+| 拉取/推送镜像失败 | 确认仓库地址、鉴权与网络可达；HTTP 私有仓库需在 daemon 配置 `insecure-registries` |
+| 迁移未生效 | 查看启动日志中的迁移输出与 `schema_migrations` 表 |
+| Compose 仍用旧镜像 | 标签可能被本地缓存；执行 `docker compose pull` 后再 `up -d` |
 
 ## 安全限制
 
@@ -605,16 +588,16 @@ docker compose up -d
 - 代理密码、OAuth 凭证和 API Key 不能写入日志、审计、错误响应或管理台读取接口。
 - 生产环境建议启用 `PROXY_REQUIRED=true`，并仅允许内网访问管理 API。
 - 未实现 Microsoft 交互式 OAuth 首次授权；需导入已经获取的 refresh token。
-- 生产镜像中务必更换默认 MySQL 密码、`ADMIN_API_TOKEN` 与 `CREDENTIAL_ENCRYPTION_KEY`。
+- 生产环境务必使用强随机的 `ADMIN_API_TOKEN` 与 `CREDENTIAL_ENCRYPTION_KEY`，数据库账号使用最小权限。
 
 
 ## 安全加固与测试
 
-本仓库按 `REQ-20260719-001` / `PLN-20260719-001` 落地了 Token claim/CAS、Lease claim、验证码授权复核、生产密钥校验、前端纯内存 Admin Token 等加固。
+本仓库已落地 Token claim/CAS、Lease claim、验证码授权复核、生产密钥校验、前端纯内存 Admin Token 等加固。
 
 生产环境因历史部署**允许** `DATABASE_URL` 使用 root、`CORS_ALLOW_ORIGINS=*`、`TLS_MODE=disabled`；仍要求 `ADMIN_API_TOKEN` 长度大于 10 位（并拒绝常见占位值）、合法 `CREDENTIAL_ENCRYPTION_KEY`，并拒绝 `FORWARDED_ALLOW_IPS=*`。
 
-### 本地可自动跑
+### 自动化测试
 
 ```bash
 ./scripts/smoke-local.sh
@@ -637,3 +620,34 @@ uv run --frozen pytest -q
 - **Admin Token**：仅内存保存，不写 `sessionStorage`。
 - **迁移 CLI**：`uv run python scripts/migrate.py --database-url 'mysql+pymysql://...'`
 
+## 免责声明
+
+1. **按现状提供（AS IS）**  
+   本软件及文档按「现状」提供，不附带任何明示或暗示的担保，包括但不限于适销性、特定用途适用性、不侵权、可用性、安全性或持续维护等。作者与贡献者不对因使用、无法使用、配置错误、依赖升级或第三方服务变更导致的任何直接、间接、附带、特殊、后果性或惩罚性损害承担责任（包括但不限于数据丢失、业务中断、账号封禁、凭证泄露、经济损失等），即使已被告知可能发生此类损害。
+
+2. **合规与合法使用由使用者自行负责**  
+   本项目用于自托管场景下集中管理邮箱凭证、租约与验证码读取等能力。使用者须自行确保其行为符合所在司法辖区的法律法规，以及 Microsoft、Google 及其他邮箱 / 临时邮箱 / 代理 / 上游 API 提供商的服务条款、可接受使用政策与授权范围。  
+   **禁止**将本软件用于未经授权访问他人邮箱、批量滥用注册、绕过平台风控、垃圾信息、欺诈、侵犯隐私或其他违法违规用途。作者与贡献者不认可、不协助此类用途，亦不对使用者的违规后果负责。
+
+3. **密钥与运维风险**  
+   生产环境中的管理员 Token、加密密钥、数据库凭证、OAuth Refresh Token、代理密码与 Client API Key 等均由部署方自行保管。因密钥泄露、错误暴露管理接口、未启用必要访问控制或错误配置导致的损失，由部署方自行承担。
+
+4. **第三方依赖与上游服务**  
+   对第三方库、容器镜像、外部 Provider API 与网络出口的可用性、计费、接口变更或中断，本项目不作保证。对接与排障成本由使用者自行评估。
+
+5. **非官方产品**  
+   本项目为独立开源软件，与 Microsoft、Google 或任何已接入 Provider 的官方产品无关联、无背书、无合作关系。文档中的品牌与产品名仅用于描述兼容性与对接方式。
+
+若你不同意上述条款，请勿下载、使用或分发本软件。
+
+## 开源协议
+
+本项目采用 [MIT License](LICENSE) 开源。
+
+你在遵守 MIT 许可证的前提下，可以自由地使用、复制、修改、合并、发布、分发、再许可和/或销售本软件的副本；但须在所有副本或重要部分中保留版权声明与许可证全文。
+
+**简要说明（非正式文本，以 [LICENSE](LICENSE) 为准）：**
+
+- 允许商用、修改与闭源衍生（仍须保留 MIT 声明）
+- 软件「按现状」提供，作者不承担质量与损害赔偿责任
+- 完整法律文本见仓库根目录 [LICENSE](LICENSE)

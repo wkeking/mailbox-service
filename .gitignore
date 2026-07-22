@@ -1,9 +1,40 @@
-# Secrets and local environment
+# =============================================================================
+# Secrets and local environment (never commit real secrets)
+# =============================================================================
 .env
 .env.*
 !.env.example
+!.env.*.example
 
+# Local compose / deploy overrides
+docker-compose.override.yml
+docker-compose*.local.yml
+deploy/local/
+secrets/
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+id_rsa*
+id_ed25519*
+*.credentials
+*.secret
+credentials.json
+service-account*.json
+
+# =============================================================================
+# Internal agent / private project notes (not for public repositories)
+# =============================================================================
+.agents/
+.cursor/
+*.local.md
+NOTES.local.md
+TODO.local.md
+
+# =============================================================================
 # Python
+# =============================================================================
 .venv/
 venv/
 __pycache__/
@@ -20,19 +51,27 @@ build/
 htmlcov/
 *.sqlite3
 
+# =============================================================================
 # Node / frontend
+# =============================================================================
 node_modules/
 frontend/node_modules/
 frontend/dist/
+frontend/.vite/
 
+# =============================================================================
 # Editors and OS
+# =============================================================================
 .DS_Store
 .idea/
 .vscode/
 *.swp
 *.swo
 
-# Logs and temp
+# =============================================================================
+# Logs, temp, local image exports
+# =============================================================================
 *.log
 tmp/
 .temp/
+dist/

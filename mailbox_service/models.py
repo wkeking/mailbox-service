@@ -159,6 +159,10 @@ class Mailbox(Base):
     )
     capability_probed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     capability_probe_error: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    # Admin-only cache of the last successfully extracted verification code.
+    last_verification_code: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    last_code_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_code_message_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     # Non-sensitive provider metadata only; secrets live in encrypted fields / resource table.
     provider_config_json: Mapped[dict[str, Any] | list[Any] | None] = mapped_column(JSON, nullable=True)
     token_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
@@ -374,6 +378,10 @@ class MailboxProviderResource(Base):
     encrypted_secret: Mapped[str | None] = mapped_column(Text, nullable=True)
     secret_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     metadata_json: Mapped[dict[str, Any] | list[Any] | None] = mapped_column(JSON, nullable=True)
+    # Admin-only cache of the last successfully extracted verification code.
+    last_verification_code: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    last_code_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_code_message_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False

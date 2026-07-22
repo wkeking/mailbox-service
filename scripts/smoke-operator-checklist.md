@@ -38,9 +38,8 @@ uv run python -c 'from mailbox_service.config import Settings; print(Settings().
 
 ## 3. TLS / 反向代理
 
-- `docker compose --profile tls config` 合法
-- HTTP → HTTPS 301/308
-- 应用 8000 不对公网直连
+- 若使用外部反向代理终止 TLS：配置 `TLS_MODE=terminated_at_proxy` 与可信 `FORWARDED_ALLOW_IPS`
+- 应用 8000 不对公网直连（默认绑定 `127.0.0.1`）
 - `/live` `/ready` 正常
 
 ## 4. 前端 Admin Token（浏览器）

@@ -522,6 +522,13 @@ class VerificationCodeService:
                 if match is not None:
                     if authorization_checkpoint is not None:
                         await _maybe_await(authorization_checkpoint())
+                    _persist_last_verification_code(
+                        self._access_token_service._session_factory,
+                        target_id=mailbox.id,
+                        provider_type=provider_type,
+                        code=match.code,
+                        checked_at=self._clock(),
+                    )
                     return VerificationCodeLookupResult(
                         found=True,
                         code=match.code,
@@ -658,6 +665,13 @@ class VerificationCodeService:
             if code and not is_pending:
                 if authorization_checkpoint is not None:
                     await _maybe_await(authorization_checkpoint())
+                _persist_last_verification_code(
+                    session_factory,
+                    target_id=mailbox.id,
+                    provider_type="smsbower_gmail",
+                    code=code,
+                    checked_at=self._clock(),
+                )
                 return VerificationCodeLookupResult(
                     found=True,
                     code=code,
@@ -762,21 +776,37 @@ class VerificationCodeService:
                 evidence = None
             if evidence is not None:
                 if evidence.direct_code:
+                    _persist_last_verification_code(
+                        session_factory,
+                        target_id=mailbox.id,
+                        provider_type=provider_type,
+                        code=evidence.direct_code,
+                        checked_at=self._clock(),
+                    )
                     return VerificationCodeLookupResult(
                         found=True,
                         code=evidence.direct_code,
                         attempts=attempts,
                         channel=None,
                     )
+                found_any_check = False
                 for message in evidence.messages:
                     body = message.body_text or ""
                     subject = message.subject or ""
+                    found_any_check = True
                     code = None
                     if custom_matcher is not None:
-                        code = custom_matcher.extract(f"{subject}\n{body}")
+                        code = custom_matcher.search(subject, body)
                     else:
                         code = extract_verification_code(subject=subject, body_text=body)
                     if code:
+                        _persist_last_verification_code(
+                            session_factory,
+                            target_id=mailbox.id,
+                            provider_type=provider_type,
+                            code=code,
+                            checked_at=self._clock(),
+                        )
                         return VerificationCodeLookupResult(
                             found=True,
                             code=code,
@@ -786,6 +816,14 @@ class VerificationCodeService:
                             channel=None,
                             attempts=attempts,
                         )
+                if found_any_check:
+                    _persist_last_verification_code(
+                        session_factory,
+                        target_id=mailbox.id,
+                        provider_type=provider_type,
+                        code=None,
+                        checked_at=self._clock(),
+                    )
             if self._clock() >= deadline:
                 break
             remaining_seconds = (deadline - self._clock()).total_seconds()
@@ -1112,6 +1150,55 @@ class VerificationCodeService:
         return None, scan_bytes_consumed, request_budget_exhausted
 
 
+def _persist_last_verification_code(
+    session_factory,
+    *,
+    target_id: str,
+    provider_type: str,
+    code: str | None,
+    checked_at: datetime,
+    message_id: str | None = None,
+) -> None:
+    """Best-effort write of last verification code cache for Admin/operator views.
+
+    Never logs the plaintext code. Failures are swallowed so verification responses
+    are not blocked by cache write issues.
+    """
+    from mailbox_service.models import MailboxProviderResource
+    from mailbox_service.providers.catalog import ON_DEMAND_PROVIDER_TYPES
+
+    try:
+        with session_factory() as session:
+            if provider_type in ON_DEMAND_PROVIDER_TYPES or provider_type == "smsbower_gmail":
+                resource = session.get(MailboxProviderResource, target_id)
+                if resource is None:
+                    return
+                if code is not None:
+                    resource.last_verification_code = str(code)[:32]
+                    if message_id:
+                        resource.last_code_message_id = str(message_id)[:255]
+                resource.last_code_checked_at = checked_at
+                resource.updated_at = checked_at
+            else:
+                mailbox = session.get(Mailbox, target_id)
+                if mailbox is None:
+                    return
+                if code is not None:
+                    mailbox.last_verification_code = str(code)[:32]
+                    if message_id:
+                        mailbox.last_code_message_id = str(message_id)[:255]
+                mailbox.last_code_checked_at = checked_at
+                mailbox.updated_at = checked_at
+            session.commit()
+    except Exception as error:  # noqa: BLE001 - cache must not break verification
+        logger.warning(
+            "last_verification_code_persist_failed target_id=%s provider_type=%s error=%s",
+            target_id,
+            provider_type,
+            summarize_exception(error),
+        )
+
+
 def expand_lookback_since_at(since_at: datetime) -> datetime:
     """Return a slightly older lower bound to tolerate clock skew."""
     return ensure_utc(since_at) - timedelta(seconds=TIME_FILTER_CLOCK_SKEW_SECONDS)
@@ -1139,9 +1226,15 @@ def extract_verification_code(
 
     External callers must not supply untrusted Python regex. ``custom_code_pattern`` remains only
     for internal fixed patterns used by legacy tests; production uses SafeVerificationCodeMatcher.
+    Body text is sanitized with fixed rules (header strip / HTML / QP) before matching.
     """
+    from mailbox_service.mail_body_sanitize import sanitize_mail_text
+
     subject_value = subject or ""
-    body_value = truncate_text_to_byte_budget(body_text or "", MAX_MESSAGE_BODY_BYTES)
+    body_value = truncate_text_to_byte_budget(
+        sanitize_mail_text(body_text or ""),
+        MAX_MESSAGE_BODY_BYTES,
+    )
 
     subject_match = XAI_SUBJECT_CODE_REGEX.search(subject_value)
     if subject_match is not None:

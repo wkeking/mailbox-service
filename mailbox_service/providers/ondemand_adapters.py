@@ -74,62 +74,11 @@ def _parse_received_at(value: Any) -> datetime | None:
         return None
 
 
-def _extract_text_html(item: dict[str, Any]) -> tuple[str, str]:
-    text = str(
-        item.get("text")
-        or item.get("text_content")
-        or item.get("content")
-        or item.get("body")
-        or item.get("intro")
-        or ""
-    )
-    html = item.get("html") or item.get("html_content") or item.get("htmlBody") or ""
-    if isinstance(html, list):
-        html = "".join(str(part) for part in html)
-    html_text = str(html or "")
-    if not text and html_text:
-        text = re.sub(r"<[^>]+>", " ", html_text)
-    return text, html_text
-
-
-def _sender_of(item: dict[str, Any]) -> str:
-    sender = item.get("from") or item.get("sender") or item.get("from_address") or item.get("sendEmail") or ""
-    if isinstance(sender, dict):
-        sender = sender.get("address") or sender.get("email") or sender.get("name") or ""
-    return str(sender or "")
-
-
 def _message_to_evidence(item: dict[str, Any], *, address: str) -> InboxMessageEvidence:
-    text, html = _extract_text_html(item)
-    body = text or html
-    recipients: set[str] = {address.lower()}
-    for key in ("to", "toEmail", "mailTo", "recipient"):
-        raw = item.get(key)
-        if isinstance(raw, str) and raw.strip():
-            recipients.add(raw.strip().lower())
-        elif isinstance(raw, list):
-            for entry in raw:
-                if isinstance(entry, str) and entry.strip():
-                    recipients.add(entry.strip().lower())
-                elif isinstance(entry, dict):
-                    email = entry.get("address") or entry.get("email")
-                    if email:
-                        recipients.add(str(email).strip().lower())
-    return InboxMessageEvidence(
-        from_address=_sender_of(item) or None,
-        subject=str(item.get("subject") or "") or None,
-        body_text=body or None,
-        received_at=_parse_received_at(
-            item.get("createdAt")
-            or item.get("created_at")
-            or item.get("receivedAt")
-            or item.get("date")
-            or item.get("timestamp")
-            or item.get("createTime")
-        ),
-        recipient_addresses=frozenset(recipients),
-        channel=None,
-    )
+    """Normalize heterogeneous provider message dicts into inbox evidence."""
+    from mailbox_service.mail_message_normalize import message_dict_to_evidence
+
+    return message_dict_to_evidence(item, address=address)
 
 
 def _filter_messages(

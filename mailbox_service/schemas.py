@@ -724,6 +724,90 @@ class ProviderInstanceSettingsUpdate(BaseModel):
     clear_secrets: list[str] | None = None
 
 
+class ProviderHealthItemResponse(BaseModel):
+    """单个 Provider 实例连通性探测结果。"""
+
+    provider_type: str = Field(description="provider_type。")
+    provider_instance_id: str = Field(description="实例 ID。")
+    enabled: bool = Field(description="是否启用。")
+    status: str = Field(description="ok / degraded / down / skipped / unknown。")
+    latency_ms: int | None = Field(default=None, description="探测耗时（毫秒）。")
+    checked_at: datetime | None = Field(default=None, description="探测时间。")
+    domains_preview: list[str] = Field(default_factory=list, description="域名预览。")
+    error_summary: str | None = Field(default=None, description="脱敏错误摘要。")
+    detail: dict[str, object] = Field(default_factory=dict, description="附加详情。")
+    display_name: str | None = Field(default=None, description="展示名称。")
+    supply_mode: str | None = Field(default=None, description="供给模式。")
+
+
+class ProviderHealthListResponse(BaseModel):
+    """Provider 健康检查列表。"""
+
+    items: list[ProviderHealthItemResponse] = Field(description="探测结果列表。")
+
+
+class ProviderDomainsResponse(BaseModel):
+    """Provider 可用域名列表。"""
+
+    provider_type: str
+    provider_instance_id: str
+    domains: list[str]
+
+
+class OperatorSessionCreateRequest(BaseModel):
+    """创建管理台联调会话。"""
+
+    provider_type: str = Field(min_length=1, max_length=64, description="on-demand provider_type。")
+    provider_instance_id: str | None = Field(default="default", max_length=64)
+    domain: str | None = Field(default=None, max_length=255, description="可选域名提示。")
+    local_part: str | None = Field(default=None, max_length=64, description="可选本地前缀。")
+    label: str | None = Field(default=None, max_length=100, description="备注。")
+    ttl_seconds: int = Field(default=1800, ge=60, le=86_400, description="会话 TTL 秒。")
+
+
+class OperatorSessionResponse(BaseModel):
+    """联调会话视图。"""
+
+    lease_id: str
+    provider_type: str
+    provider_instance_id: str
+    provider_resource_id: str
+    address: str
+    purpose: str
+    expires_at: datetime
+    created_at: datetime
+    released_at: datetime | None = None
+    last_verification_code: str | None = None
+    last_code_checked_at: datetime | None = None
+
+
+class OperatorSessionListResponse(BaseModel):
+    """联调会话列表。"""
+
+    items: list[OperatorSessionResponse]
+
+
+class OperatorMessageItemResponse(BaseModel):
+    """联调会话中的一封邮件。"""
+
+    id: str | None = None
+    from_address: str | None = None
+    subject: str | None = None
+    intro: str = ""
+    text: str = ""
+    created_at: datetime | None = None
+    code: str | None = None
+
+
+class OperatorSessionMessagesResponse(BaseModel):
+    """联调会话拉信结果。"""
+
+    session: OperatorSessionResponse
+    total: int
+    codes: list[str] = Field(default_factory=list)
+    messages: list[OperatorMessageItemResponse] = Field(default_factory=list)
+
+
 class SmsbowerSettingsResponse(BaseModel):
     """SMSBower 实例配置（不含 API Key 明文）。"""
 

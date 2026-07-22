@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# 构建 mailbox-service 镜像并默认推送到私有仓库 registry.example.com。
+# 构建 mailbox-service 镜像。
 #
-# 流程：buildx --load 装入本机 Docker，再 docker push <registry>/<name>:<tag>。
+# 默认：buildx --load 装入本机 Docker（不推送）。
+# push 时需通过 --registry 或环境变量 REGISTRY 指定镜像仓库主机。
 # 不推送 BuildKit 远程 cache（:buildcache）；依赖复用靠 Dockerfile 分层 + 本机层缓存。
 # 不要用 buildx --push 直推：container 驱动会走 HTTPS，HTTP insecure registry 常报 EOF。
 set -euo pipefail
@@ -9,13 +10,13 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT_DIR}"
 
-# 默认：registry.example.com/mailbox-service:latest，每次构建后自动 push。
-REGISTRY="${REGISTRY:-registry.example.com}"
+# 默认本地镜像名 mailbox-service:latest；push 时再拼 registry。
+REGISTRY="${REGISTRY:-}"
 IMAGE_NAME="${IMAGE_NAME:-mailbox-service}"
 IMAGE_TAG="${IMAGE_TAG:-latest}"
 PLATFORM="${PLATFORM:-linux/arm64}"
-# push=构建后推送私有仓库（默认）；load=仅载入本机；tar=导出归档
-OUTPUT="${OUTPUT:-push}"
+# load=仅载入本机（默认）；push=推送到镜像仓库；tar=导出归档
+OUTPUT="${OUTPUT:-load}"
 BUILDER_NAME="${BUILDER_NAME:-mailbox-service-builder}"
 
 usage() {
@@ -24,21 +25,17 @@ usage() {
   ./scripts/build-image.sh [选项]
 
 默认行为:
-  构建 linux/arm64 镜像 registry.example.com/mailbox-service:latest：
-  1) buildx --load 载入本机 Docker
-  2) docker push registry.example.com/mailbox-service:<tag>
-  仓库无需 docker login；网络可达 registry.example.com 即可。
-  （Docker Desktop / daemon 需已把该地址加入 insecure-registries。）
+  构建 linux/arm64 镜像 mailbox-service:latest，并 load 到本机 Docker。
 
 选项:
   --platform <平台>     目标平台，默认 linux/arm64
                         示例: linux/arm64 | linux/amd64
   --tag <标签>          镜像标签，默认 latest
-  --name <名称>         镜像仓库名，默认 mailbox-service
-  --registry <主机>     私有仓库主机，默认 registry.example.com
-  --output <方式>       push | load | tar（默认 push）
-                        push : 载入本机后 docker push 正式镜像
+  --name <名称>         镜像名，默认 mailbox-service
+  --registry <主机>     镜像仓库主机；--output push 时必填
+  --output <方式>       load | push | tar（默认 load）
                         load : 仅载入本机 Docker（不推送）
+                        push : 载入本机后 docker push 正式镜像
                         tar  : 导出 docker-archive 到 dist/（不推送）
   --builder <名称>      buildx builder 名称，默认 mailbox-service-builder
   -h, --help            显示帮助
@@ -53,13 +50,13 @@ usage() {
   REGISTRY / IMAGE_NAME / IMAGE_TAG / PLATFORM / OUTPUT / BUILDER_NAME
 
 示例:
-  # 默认：构建并 docker push registry.example.com/mailbox-service:latest
+  # 默认：仅本机构建并 load
   ./scripts/build-image.sh
 
-  # 仅本机调试，不推仓库
-  ./scripts/build-image.sh --output load
+  # 推送到你的镜像仓库
+  REGISTRY=registry.example.com ./scripts/build-image.sh --output push
 
-  # 额外打版本标签再推送
+  # 额外打版本标签
   ./scripts/build-image.sh --tag 20260717-abc1234
 EOF
 }
@@ -124,7 +121,16 @@ else
 fi
 docker buildx inspect --bootstrap >/dev/null
 
-FULL_IMAGE_REF="${REGISTRY%/}/${IMAGE_NAME}:${IMAGE_TAG}"
+if [[ -n "${REGISTRY}" ]]; then
+  FULL_IMAGE_REF="${REGISTRY%/}/${IMAGE_NAME}:${IMAGE_TAG}"
+else
+  FULL_IMAGE_REF="${IMAGE_NAME}:${IMAGE_TAG}"
+fi
+
+if [[ "${OUTPUT}" == "push" && -z "${REGISTRY}" ]]; then
+  echo "错误: --output push 需要通过 --registry 或环境变量 REGISTRY 指定镜像仓库。" >&2
+  exit 1
+fi
 
 echo "========================================"
 echo "镜像:     ${FULL_IMAGE_REF}"

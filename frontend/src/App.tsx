@@ -25,7 +25,54 @@ import {
 
 type ProxyStatus = "healthy" | "cooldown" | "unknown";
 type ProxyProtocol = "http_connect" | "socks5";
-type NavigationSection = "dashboard" | "mailboxes" | "leases" | "usage-sites" | "email-site-usages" | "egress-proxies" | "providers" | "client-keys";
+type NavigationSection =
+  | "dashboard"
+  | "mailboxes"
+  | "leases"
+  | "usage-sites"
+  | "email-site-usages"
+  | "egress-proxies"
+  | "providers"
+  | "operator-console"
+  | "client-keys";
+
+interface ProviderHealthItem {
+  provider_type: string;
+  provider_instance_id: string;
+  enabled: boolean;
+  status: string;
+  latency_ms: number | null;
+  checked_at: string | null;
+  domains_preview: string[];
+  error_summary: string | null;
+  detail: Record<string, unknown>;
+  display_name: string | null;
+  supply_mode: string | null;
+}
+
+interface OperatorSession {
+  lease_id: string;
+  provider_type: string;
+  provider_instance_id: string;
+  provider_resource_id: string;
+  address: string;
+  purpose: string;
+  expires_at: string;
+  created_at: string;
+  released_at: string | null;
+  last_verification_code: string | null;
+  last_code_checked_at: string | null;
+}
+
+interface OperatorMessageItem {
+  id: string | null;
+  from_address: string | null;
+  subject: string | null;
+  intro: string;
+  text: string;
+  created_at: string | null;
+  code: string | null;
+}
 
 const LEGACY_ADMIN_TOKEN_STORAGE_KEY = "mailbox-service.admin-token";
 
@@ -593,16 +640,6 @@ function TruncatedHoverField({
   );
 }
 
-function MailboxClientIdSummary({ clientId }: { clientId: string | null }): JSX.Element {
-  return (
-    <TruncatedHoverField
-      value={clientId}
-      emptyLabel="-"
-      className="client-id-summary"
-    />
-  );
-}
-
 function MailboxScopeSummary({ scope }: { scope: string | null }): JSX.Element {
   return (
     <TruncatedHoverField
@@ -813,7 +850,21 @@ function MailboxesPage({
           </div>
         </div>
         <div className="table-wrapper">
-          <table>
+          <table className="mailbox-table">
+            <colgroup>
+              <col className="mailbox-col-select" />
+              <col className="mailbox-col-email" />
+              <col className="mailbox-col-status" />
+              <col className="mailbox-col-scope" />
+              <col className="mailbox-col-capability" />
+              <col className="mailbox-col-token-version" />
+              <col className="mailbox-col-datetime" />
+              <col className="mailbox-col-datetime" />
+              <col className="mailbox-col-proxy" />
+              <col className="mailbox-col-lease" />
+              <col className="mailbox-col-datetime" />
+              <col className="mailbox-col-actions" />
+            </colgroup>
             <thead>
               <tr>
                 <th aria-label="选择邮箱">
@@ -825,13 +876,10 @@ function MailboxesPage({
                 </th>
                 <th>邮箱</th>
                 <th>状态</th>
-                <th>Client ID</th>
                 <th>Scope</th>
                 <th>能力</th>
                 <th>Token 版本</th>
                 <th>AT 过期时间</th>
-                <th>AT 刷新时间</th>
-                <th>RT 更新时间</th>
                 <th>RT 过期时间</th>
                 <th>出口代理</th>
                 <th>活跃租约</th>
@@ -842,7 +890,7 @@ function MailboxesPage({
             <tbody>
               {mailboxes.map((mailbox) => (
                 <tr key={mailbox.id}>
-                  <td>
+                  <td className="cell-center">
                     <input
                       type="checkbox"
                       checked={selectedMailboxIds.has(mailbox.id)}
@@ -850,30 +898,32 @@ function MailboxesPage({
                       onChange={(event) => onToggleMailboxSelection(mailbox.id, event.target.checked)}
                     />
                   </td>
-                  <td><strong>{mailbox.primary_email}</strong><div className="muted-copy">{mailbox.id}</div></td>
-                  <td><MailboxStatusBadge status={mailbox.status} /></td>
-                  <td className="client-id-cell">
-                    <MailboxClientIdSummary clientId={mailbox.client_id} />
+                  <td className="mailbox-email-cell cell-start">
+                    <strong>{mailbox.primary_email}</strong>
+                    <div className="muted-copy">{mailbox.id}</div>
                   </td>
-                  <td className="scope-cell">
+                  <td className="cell-center"><MailboxStatusBadge status={mailbox.status} /></td>
+                  <td className="scope-cell cell-start">
                     <MailboxScopeSummary scope={mailbox.scope} />
                   </td>
-                  <td>
+                  <td className="cell-center">
                     <MailboxCapabilityBadge
                       capability={mailbox.capability}
                       probeError={mailbox.capability_probe_error}
                     />
-                    <div className="muted-copy">{formatTime(mailbox.capability_probed_at)}</div>
                   </td>
-                  <td>{mailbox.token_version}</td>
-                  <td>{mailbox.has_access_token ? formatTime(mailbox.access_token_expires_at) : "未缓存"}</td>
-                  <td>{formatTime(mailbox.access_token_refreshed_at)}</td>
-                  <td>{formatTime(mailbox.refresh_token_updated_at)}</td>
-                  <td>{formatTime(mailbox.refresh_token_expires_at)}</td>
-                  <td>{mailbox.egress_proxy_name ?? "直连 / 未绑定"}<div className="muted-copy">{formatTime(mailbox.proxy_last_switch_at)}</div></td>
-                  <td>{mailbox.active_lease_count}</td>
-                  <td>{formatTime(mailbox.updated_at)}</td>
-                  <td>
+                  <td className="mailbox-token-version-cell cell-center">{mailbox.token_version}</td>
+                  <td className="mailbox-datetime-cell cell-center">
+                    {mailbox.has_access_token ? formatTime(mailbox.access_token_expires_at) : "未缓存"}
+                  </td>
+                  <td className="mailbox-datetime-cell cell-center">{formatTime(mailbox.refresh_token_expires_at)}</td>
+                  <td className="mailbox-proxy-cell cell-start">
+                    {mailbox.egress_proxy_name ?? "直连 / 未绑定"}
+                    <div className="muted-copy">{formatTime(mailbox.proxy_last_switch_at)}</div>
+                  </td>
+                  <td className="mailbox-lease-cell cell-center">{mailbox.active_lease_count}</td>
+                  <td className="mailbox-datetime-cell cell-center">{formatTime(mailbox.updated_at)}</td>
+                  <td className="cell-center">
                     <div className="cell-actions">
                       <button
                         className="button"
@@ -1019,18 +1069,18 @@ function LeasesPage({
           </div>
         </div>
         <div className="table-wrapper">
-          <table>
+          <table className="lease-table">
             <thead><tr><th>邮箱</th><th>模式</th><th>状态</th><th>调用方</th><th>用途</th><th>到期时间</th><th>创建时间</th></tr></thead>
             <tbody>
               {leases.map((lease) => (
                 <tr key={lease.id}>
-                  <td><strong>{lease.primary_email}</strong><div className="muted-copy">{lease.id}</div></td>
-                  <td>{lease.mode}</td>
-                  <td><LeaseStatusBadge status={lease.status} /></td>
-                  <td>{lease.client_tag ?? lease.client_key_id ?? "-"}</td>
-                  <td>{lease.purpose ?? "-"}</td>
-                  <td>{formatTime(lease.expires_at)}</td>
-                  <td>{formatTime(lease.created_at)}</td>
+                  <td className="cell-center"><strong>{lease.primary_email}</strong><div className="muted-copy">{lease.id}</div></td>
+                  <td className="cell-center">{lease.mode}</td>
+                  <td className="cell-center"><LeaseStatusBadge status={lease.status} /></td>
+                  <td className="cell-start">{lease.client_tag ?? lease.client_key_id ?? "-"}</td>
+                  <td className="cell-center">{lease.purpose ?? "-"}</td>
+                  <td className="cell-center">{formatTime(lease.expires_at)}</td>
+                  <td className="cell-center">{formatTime(lease.created_at)}</td>
                 </tr>
               ))}
             </tbody>
@@ -1086,7 +1136,7 @@ function UsageSitesPage({
           </div>
         </div>
         <div className="table-wrapper">
-          <table>
+          <table className="usage-sites-table">
             <thead>
               <tr>
                 <th>code</th>
@@ -1103,16 +1153,16 @@ function UsageSitesPage({
                 const canDelete = activeUsageCount === 0;
                 return (
                 <tr key={site.code}>
-                  <td><strong>{site.code}</strong></td>
-                  <td>{site.display_name}</td>
-                  <td>
+                  <td className="cell-center"><strong>{site.code}</strong></td>
+                  <td className="cell-center">{site.display_name}</td>
+                  <td className="cell-center">
                     <span className={`badge ${site.enabled ? "badge-enabled" : "badge-disabled"}`}>
                       {site.enabled ? "启用中" : "已禁用"}
                     </span>
                   </td>
-                  <td>{activeUsageCount}</td>
-                  <td>{formatTime(site.created_at)}</td>
-                  <td>
+                  <td className="cell-center">{activeUsageCount}</td>
+                  <td className="cell-center">{formatTime(site.created_at)}</td>
+                  <td className="cell-center">
                     <div className="cell-actions">
                       <button className="button" type="button" onClick={() => onToggleEnabled(site)}>
                         {site.enabled ? "禁用" : "启用"}
@@ -1259,7 +1309,7 @@ function EmailSiteUsagesPage({
           </div>
         </div>
         <div className="table-wrapper">
-          <table>
+          <table className="email-site-usages-table">
             <thead>
               <tr>
                 <th>业务地址</th>
@@ -1276,20 +1326,20 @@ function EmailSiteUsagesPage({
                 const isActive = usage.revoked_at === null;
                 return (
                   <tr key={usage.id}>
-                    <td>
+                    <td className="cell-center">
                       <strong>{usage.allocated_email}</strong>
                       <div className="muted-copy">{usage.id}</div>
                     </td>
-                    <td>{usage.usage_site}</td>
-                    <td>
+                    <td className="cell-center">{usage.usage_site}</td>
+                    <td className="cell-center">
                       <span className={`badge ${isActive ? "badge-enabled" : "badge-disabled"}`}>
                         {isActive ? "占用中" : "已撤销"}
                       </span>
                     </td>
-                    <td>{usage.client_key_id ?? "-"}</td>
-                    <td>{formatTime(usage.created_at)}</td>
-                    <td>{formatTime(usage.updated_at)}</td>
-                    <td>
+                    <td className="cell-center">{usage.client_key_id ?? "-"}</td>
+                    <td className="cell-center">{formatTime(usage.created_at)}</td>
+                    <td className="cell-center">{formatTime(usage.updated_at)}</td>
+                    <td className="cell-center">
                       {isActive ? (
                         <button
                           className="button"
@@ -1356,6 +1406,360 @@ function supplyModeLabel(supplyMode: string): string {
   return supplyMode;
 }
 
+function OperatorConsolePage({
+  catalog,
+  adminToken,
+  onError,
+  onNotice,
+}: {
+  catalog: ProviderCatalogItem[];
+  adminToken: string;
+  onError: (message: string) => void;
+  onNotice: (message: string) => void;
+}): JSX.Element {
+  const onDemandProviders = useMemo(
+    () => catalog.filter((item) => item.supply_mode === "on_demand" && item.enabled),
+    [catalog],
+  );
+  const [providerType, setProviderType] = useState("");
+  const [localPart, setLocalPart] = useState("");
+  const [label, setLabel] = useState("");
+  const [sessions, setSessions] = useState<OperatorSession[]>([]);
+  const [currentSession, setCurrentSession] = useState<OperatorSession | null>(null);
+  const [messages, setMessages] = useState<OperatorMessageItem[]>([]);
+  const [codes, setCodes] = useState<string[]>([]);
+  const [selectedMessageId, setSelectedMessageId] = useState<number | null>(null);
+  const [isBusy, setIsBusy] = useState(false);
+  const [autoRefresh, setAutoRefresh] = useState(false);
+
+  useEffect(() => {
+    if (!providerType && onDemandProviders.length > 0) {
+      setProviderType(onDemandProviders[0].provider_type);
+    }
+  }, [onDemandProviders, providerType]);
+
+  async function refreshSessions(): Promise<void> {
+    try {
+      const response = await requestApi<{ items: OperatorSession[] }>(
+        adminToken,
+        "/api/v1/admin/operator/sessions",
+      );
+      setSessions(response.items);
+    } catch (error) {
+      onError(error instanceof Error ? error.message : "无法加载联调会话。");
+    }
+  }
+
+  useEffect(() => {
+    void refreshSessions();
+  }, [adminToken]);
+
+  async function createSession(): Promise<void> {
+    if (!providerType) {
+      onError("请选择已启用的 on-demand Provider。");
+      return;
+    }
+    setIsBusy(true);
+    try {
+      const created = await requestApi<OperatorSession>(adminToken, "/api/v1/admin/operator/sessions", {
+        method: "POST",
+        body: JSON.stringify({
+          provider_type: providerType,
+          local_part: localPart.trim() || null,
+          label: label.trim() || null,
+        }),
+      });
+      setCurrentSession(created);
+      setMessages([]);
+      setCodes([]);
+      setSelectedMessageId(null);
+      onNotice(`已创建联调邮箱：${created.address}`);
+      await refreshSessions();
+      await refreshMessages(created.lease_id);
+    } catch (error) {
+      onError(error instanceof Error ? error.message : "创建联调会话失败。");
+    } finally {
+      setIsBusy(false);
+    }
+  }
+
+  async function refreshMessages(leaseId?: string): Promise<void> {
+    const targetLeaseId = leaseId || currentSession?.lease_id;
+    if (!targetLeaseId) {
+      return;
+    }
+    setIsBusy(true);
+    try {
+      const response = await requestApi<{
+        session: OperatorSession;
+        total: number;
+        codes: string[];
+        messages: OperatorMessageItem[];
+      }>(adminToken, `/api/v1/admin/operator/sessions/${targetLeaseId}/messages`);
+      setCurrentSession(response.session);
+      setMessages(response.messages);
+      setCodes(response.codes);
+      if (response.messages.length > 0 && selectedMessageId == null) {
+        setSelectedMessageId(0);
+      }
+    } catch (error) {
+      onError(error instanceof Error ? error.message : "刷新收件失败。");
+    } finally {
+      setIsBusy(false);
+    }
+  }
+
+  async function releaseSession(leaseId: string): Promise<void> {
+    setIsBusy(true);
+    try {
+      await requestApi<OperatorSession>(adminToken, `/api/v1/admin/operator/sessions/${leaseId}`, {
+        method: "DELETE",
+      });
+      if (currentSession?.lease_id === leaseId) {
+        setCurrentSession(null);
+        setMessages([]);
+        setCodes([]);
+        setSelectedMessageId(null);
+      }
+      onNotice("联调会话已释放。");
+      await refreshSessions();
+    } catch (error) {
+      onError(error instanceof Error ? error.message : "释放会话失败。");
+    } finally {
+      setIsBusy(false);
+    }
+  }
+
+  useEffect(() => {
+    if (!autoRefresh || !currentSession?.lease_id) {
+      return;
+    }
+    const timer = window.setInterval(() => {
+      void refreshMessages(currentSession.lease_id);
+    }, 5000);
+    return () => window.clearInterval(timer);
+  }, [autoRefresh, currentSession?.lease_id]);
+
+  async function copyText(text: string, successMessage: string): Promise<void> {
+    try {
+      await navigator.clipboard.writeText(text);
+      onNotice(successMessage);
+    } catch {
+      onError("复制失败，请手动选择文本。");
+    }
+  }
+
+  const selectedMessage =
+    selectedMessageId != null && selectedMessageId >= 0 && selectedMessageId < messages.length
+      ? messages[selectedMessageId]
+      : null;
+  const latestCode = currentSession?.last_verification_code || codes[0] || "";
+
+  return (
+    <>
+      <header className="page-header">
+        <div>
+          <h1 className="page-title">联调工作台</h1>
+          <p className="page-subtitle">
+            选择已启用的 on-demand Provider，即时开箱、刷新收件并提取验证码。不写入邮箱库存表。
+          </p>
+        </div>
+        <div className="page-header-actions">
+          <label className="muted-copy" style={{ display: "flex", alignItems: "center", gap: 6 }}>
+            <input
+              type="checkbox"
+              checked={autoRefresh}
+              onChange={(event) => setAutoRefresh(event.target.checked)}
+            />
+            5s 自动刷新
+          </label>
+          <button className="button" type="button" onClick={() => void refreshSessions()} disabled={isBusy}>
+            刷新会话列表
+          </button>
+        </div>
+      </header>
+
+      <section className="two-column-grid">
+        <div className="panel">
+          <div className="section-header">
+            <h2 className="section-title">创建临时邮箱</h2>
+          </div>
+          <div className="form-grid">
+            <label className="form-field">
+              Provider
+              <select
+                className="select"
+                value={providerType}
+                onChange={(event) => setProviderType(event.target.value)}
+              >
+                {onDemandProviders.length === 0 && <option value="">无已启用 on-demand</option>}
+                {onDemandProviders.map((item) => (
+                  <option key={item.provider_type} value={item.provider_type}>
+                    {item.display_name} ({item.provider_type})
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="form-field">
+              自定义前缀（可空）
+              <input className="input" value={localPart} onChange={(event) => setLocalPart(event.target.value)} placeholder="例如 debug01" />
+            </label>
+            <label className="form-field">
+              备注（可空）
+              <input className="input" value={label} onChange={(event) => setLabel(event.target.value)} placeholder="手动联调" />
+            </label>
+          </div>
+          <div className="page-header-actions" style={{ marginTop: 12 }}>
+            <button className="button button-primary" type="button" onClick={() => void createSession()} disabled={isBusy || !providerType}>
+              创建临时邮箱
+            </button>
+            <button
+              className="button"
+              type="button"
+              onClick={() => currentSession && void copyText(currentSession.address, "邮箱地址已复制。")}
+              disabled={!currentSession}
+            >
+              复制当前邮箱
+            </button>
+            <button
+              className="button"
+              type="button"
+              onClick={() => latestCode && void copyText(latestCode, "验证码已复制。")}
+              disabled={!latestCode}
+            >
+              复制验证码
+            </button>
+            <button
+              className="button"
+              type="button"
+              onClick={() => void refreshMessages()}
+              disabled={!currentSession || isBusy}
+            >
+              刷新收件
+            </button>
+            <button
+              className="button button-danger"
+              type="button"
+              onClick={() => currentSession && void releaseSession(currentSession.lease_id)}
+              disabled={!currentSession || isBusy}
+            >
+              释放当前
+            </button>
+          </div>
+          <div className="muted-copy" style={{ marginTop: 12 }}>
+            当前邮箱：<strong>{currentSession?.address ?? "未选择"}</strong>
+            <br />
+            Provider：{currentSession?.provider_type ?? "—"}
+            <br />
+            最近验证码：<strong>{latestCode || "—"}</strong>
+          </div>
+          <div style={{ marginTop: 16 }}>
+            <h3 className="section-title">活跃会话</h3>
+            <div className="table-wrap">
+              <table className="data-table">
+                <thead>
+                  <tr>
+                    <th>地址</th>
+                    <th>Provider</th>
+                    <th>最近验证码</th>
+                    <th>操作</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {sessions.map((session) => (
+                    <tr key={session.lease_id}>
+                      <td className="cell-start">
+                        <button
+                          className="button button-ghost"
+                          type="button"
+                          onClick={() => {
+                            setCurrentSession(session);
+                            void refreshMessages(session.lease_id);
+                          }}
+                        >
+                          {session.address}
+                        </button>
+                      </td>
+                      <td className="cell-center">{session.provider_type}</td>
+                      <td className="cell-center">{session.last_verification_code || "—"}</td>
+                      <td className="cell-center">
+                        <button className="button" type="button" onClick={() => void releaseSession(session.lease_id)}>
+                          释放
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                  {sessions.length === 0 && (
+                    <tr>
+                      <td colSpan={4}>
+                        <div className="empty-state">暂无活跃联调会话。</div>
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <div className="panel">
+          <div className="section-header">
+            <h2 className="section-title">收件 / 验证码</h2>
+            <span className="muted-copy">共 {messages.length} 封</span>
+          </div>
+          <div className="table-wrap">
+            <table className="data-table">
+              <thead>
+                <tr>
+                  <th>发件人</th>
+                  <th>主题</th>
+                  <th>验证码</th>
+                </tr>
+              </thead>
+              <tbody>
+                {messages.map((message, index) => (
+                  <tr
+                    key={`${message.subject ?? "msg"}-${index}`}
+                    className={selectedMessageId === index ? "provider-row-selected" : undefined}
+                    style={{ cursor: "pointer" }}
+                    onClick={() => setSelectedMessageId(index)}
+                  >
+                    <td className="cell-start">{message.from_address || "—"}</td>
+                    <td className="cell-start">{message.subject || "(no subject)"}</td>
+                    <td className="cell-center">{message.code || "—"}</td>
+                  </tr>
+                ))}
+                {messages.length === 0 && (
+                  <tr>
+                    <td colSpan={3}>
+                      <div className="empty-state">暂无邮件，创建会话后点击刷新收件。</div>
+                    </td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+          <div style={{ marginTop: 12 }}>
+            <label className="form-field">
+              邮件正文
+              <textarea
+                className="textarea"
+                readOnly
+                rows={12}
+                value={
+                  selectedMessage
+                    ? `${selectedMessage.subject || ""}\nFrom: ${selectedMessage.from_address || ""}\nCode: ${selectedMessage.code || "—"}\n\n${selectedMessage.text || selectedMessage.intro || ""}`
+                    : "选择一封邮件查看内容 / 验证码"
+                }
+              />
+            </label>
+          </div>
+        </div>
+      </section>
+    </>
+  );
+}
+
 function ProvidersPage({
   catalog,
   smsbower,
@@ -1412,6 +1816,9 @@ function ProvidersPage({
   const [isSavingGeneric, setIsSavingGeneric] = useState(false);
   const [isLoadingInstance, setIsLoadingInstance] = useState(false);
   const [enabledDraft, setEnabledDraft] = useState(false);
+  const [healthItems, setHealthItems] = useState<ProviderHealthItem[]>([]);
+  const [isCheckingHealth, setIsCheckingHealth] = useState(false);
+  const [domainsPreview, setDomainsPreview] = useState<string[]>([]);
 
   const configurableProviders = useMemo(
     () => catalog.filter((item) => item.configurable_in_ui),
@@ -1425,6 +1832,41 @@ function ProvidersPage({
     (item) => item.configurable_in_ui && item.enabled && !item.has_api_key,
   ).length;
   const onDemandCount = catalog.filter((item) => item.supply_mode === "on_demand").length;
+
+  async function checkAllProviderHealth(): Promise<void> {
+    setIsCheckingHealth(true);
+    try {
+      const response = await requestApi<{ items: ProviderHealthItem[] }>(
+        adminToken,
+        "/api/v1/admin/providers/health?check=true",
+      );
+      setHealthItems(response.items);
+      onNotice("Provider 健康检查完成。");
+    } catch (error) {
+      onError(error instanceof Error ? error.message : "健康检查失败。");
+    } finally {
+      setIsCheckingHealth(false);
+    }
+  }
+
+  async function probeSelectedDomains(): Promise<void> {
+    if (!selectedProviderType) {
+      return;
+    }
+    const catalogItem = catalog.find((item) => item.provider_type === selectedProviderType);
+    const instanceId = catalogItem?.instance_id || "default";
+    try {
+      const response = await requestApi<{ domains: string[] }>(
+        adminToken,
+        `/api/v1/admin/providers/${selectedProviderType}/instances/${instanceId}/domains`,
+      );
+      setDomainsPreview(response.domains);
+      onNotice(`已获取 ${response.domains.length} 个域名。`);
+    } catch (error) {
+      setDomainsPreview([]);
+      onError(error instanceof Error ? error.message : "域名探测失败。");
+    }
+  }
 
   useEffect(() => {
     if (!smsbower) {
@@ -1653,6 +2095,12 @@ function ProvidersPage({
           </p>
         </div>
         <div className="page-header-actions">
+          <button className="button" type="button" onClick={() => void checkAllProviderHealth()} disabled={isCheckingHealth}>
+            <RefreshCw size={14} /> {isCheckingHealth ? "检测中…" : "检测全部服务"}
+          </button>
+          <button className="button" type="button" onClick={() => void probeSelectedDomains()} disabled={!selectedProviderType}>
+            探测当前域名
+          </button>
           <button className="button" type="button" onClick={onRefresh}>
             <RefreshCw size={14} /> 刷新
           </button>
@@ -1665,6 +2113,53 @@ function ProvidersPage({
         <MetricCard label="缺密钥" value={missingKeyCount} />
         <MetricCard label="即时开箱" value={onDemandCount} />
       </section>
+
+      {healthItems.length > 0 && (
+        <section className="panel">
+          <div className="section-header">
+            <div>
+              <h2 className="section-title">服务连接状态</h2>
+              <p className="page-subtitle">实时探测结果：ok / degraded / down / skipped。</p>
+            </div>
+          </div>
+          <div className="table-wrapper">
+            <table>
+              <thead>
+                <tr>
+                  <th>Provider</th>
+                  <th>状态</th>
+                  <th>延迟</th>
+                  <th>域名预览</th>
+                  <th>错误</th>
+                </tr>
+              </thead>
+              <tbody>
+                {healthItems.map((item) => (
+                  <tr key={`${item.provider_type}:${item.provider_instance_id}`}>
+                    <td className="cell-center">
+                      <strong>{item.display_name || item.provider_type}</strong>
+                      <div className="muted-copy">{item.provider_type}</div>
+                    </td>
+                    <td className="cell-center">
+                      <span className={item.status === "ok" ? "badge badge-healthy" : item.status === "down" ? "badge badge-danger" : "badge badge-unknown"}>
+                        {item.status}
+                      </span>
+                    </td>
+                    <td className="cell-center">{item.latency_ms != null ? `${item.latency_ms} ms` : "—"}</td>
+                    <td className="muted-copy cell-center">{item.domains_preview.slice(0, 3).join(", ") || "—"}</td>
+                    <td className="muted-copy cell-start">{item.error_summary || "—"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          {domainsPreview.length > 0 && (
+            <p className="muted-copy" style={{ marginTop: 12 }}>
+              当前 Provider 域名：{domainsPreview.join(", ")}
+            </p>
+          )}
+        </section>
+      )}
 
       <section className="panel">
         <div className="section-header">
@@ -1701,22 +2196,22 @@ function ProvidersPage({
                     }}
                     style={isSelectable ? { cursor: "pointer" } : undefined}
                   >
-                    <td>
+                    <td className="cell-center">
                       <code className="provider-type-code">{item.provider_type}</code>
                     </td>
-                    <td>
+                    <td className="cell-center">
                       <strong>{item.display_name}</strong>
                     </td>
-                    <td>
+                    <td className="cell-center">
                       <span className="badge badge-unknown">{supplyModeLabel(item.supply_mode)}</span>
                     </td>
-                    <td>
+                    <td className="cell-center">
                       <span className="muted-copy">{item.supported_modes.join(" · ")}</span>
                     </td>
-                    <td>
+                    <td className="cell-center">
                       <span className={status.className}>{status.label}</span>
                     </td>
-                    <td>
+                    <td className="cell-start">
                       <span className="muted-copy">{item.notes ?? "—"}</span>
                     </td>
                   </tr>
@@ -2097,11 +2592,11 @@ function ClientKeysPage({
             <tbody>
               {visibleClientKeys.map((clientKey) => (
                 <tr key={clientKey.id}>
-                  <td>
+                  <td className="cell-start">
                     <strong>{clientKey.name}</strong>
                     <div className="muted-copy">{clientKey.id}</div>
                   </td>
-                  <td>
+                  <td className="cell-center">
                     <div className="scope-chip-list">
                       {clientKey.scopes.map((scope) => (
                         <span key={`${clientKey.id}-${scope}`} className="scope-chip" title={scope}>
@@ -2110,13 +2605,13 @@ function ClientKeysPage({
                       ))}
                     </div>
                   </td>
-                  <td>
+                  <td className="cell-center">
                     <ClientKeyStatusBadge enabled={clientKey.enabled} />
                   </td>
-                  <td>{formatTime(clientKey.last_used_at)}</td>
-                  <td>{formatTime(clientKey.expires_at)}</td>
-                  <td>{formatTime(clientKey.created_at)}</td>
-                  <td>
+                  <td className="cell-center">{formatTime(clientKey.last_used_at)}</td>
+                  <td className="cell-center">{formatTime(clientKey.expires_at)}</td>
+                  <td className="cell-center">{formatTime(clientKey.created_at)}</td>
+                  <td className="cell-center">
                     <div className="cell-actions">
                       <button
                         className="button"
@@ -2733,6 +3228,8 @@ function App(): JSX.Element {
       case "egress-proxies":
         return loadEgressProxies(tokenOverride);
       case "providers":
+        return loadProviders(tokenOverride);
+      case "operator-console":
         return loadProviders(tokenOverride);
       case "client-keys":
         return loadClientKeys(tokenOverride);
@@ -3608,16 +4105,17 @@ function App(): JSX.Element {
           <button className={`navigation-item ${activeNavigationSection === "email-site-usages" ? "active" : ""}`} type="button" onClick={() => navigateToSection("email-site-usages")} aria-current={activeNavigationSection === "email-site-usages" ? "page" : undefined}><ListFilter size={16} /> 站点占用</button>
           <button className={`navigation-item ${activeNavigationSection === "egress-proxies" ? "active" : ""}`} type="button" onClick={() => navigateToSection("egress-proxies")} aria-current={activeNavigationSection === "egress-proxies" ? "page" : undefined}><Settings2 size={16} /> 出口代理</button>
           <button className={`navigation-item ${activeNavigationSection === "providers" ? "active" : ""}`} type="button" onClick={() => navigateToSection("providers")} aria-current={activeNavigationSection === "providers" ? "page" : undefined}><Globe2 size={16} /> 邮箱 Provider</button>
+          <button className={`navigation-item ${activeNavigationSection === "operator-console" ? "active" : ""}`} type="button" onClick={() => navigateToSection("operator-console")} aria-current={activeNavigationSection === "operator-console" ? "page" : undefined}><RefreshCw size={16} /> 联调工作台</button>
           <button className={`navigation-item ${activeNavigationSection === "client-keys" ? "active" : ""}`} type="button" onClick={() => navigateToSection("client-keys")} aria-current={activeNavigationSection === "client-keys" ? "page" : undefined}><KeyRound size={16} /> Client Key</button>
-          <a className="navigation-item" href={`${apiBaseUrl}/redoc`} target="_blank" rel="noreferrer">
-            <BookOpen size={16} /> API 文档
-          </a>
         </nav>
         <div className="sidebar-footer">
           <div className="sidebar-actions">
             <button className="navigation-item" type="button" onClick={handleLogout}>
               <LogOut size={16} /> 退出登录
             </button>
+            <a className="navigation-item" href={`${apiBaseUrl}/redoc`} target="_blank" rel="noreferrer">
+              <BookOpen size={16} /> API 文档
+            </a>
           </div>
         </div>
       </aside>
@@ -3739,6 +4237,13 @@ function App(): JSX.Element {
             onPageChange={(nextPage) => void changeEmailSiteUsagePage(nextPage)}
             onRevoke={(usage) => void revokeEmailSiteUsage(usage)}
           />
+        ) : activeNavigationSection === "operator-console" ? (
+          <OperatorConsolePage
+            catalog={providerCatalog}
+            adminToken={adminToken}
+            onError={setErrorMessage}
+            onNotice={setNotice}
+          />
         ) : activeNavigationSection === "providers" ? (
           <ProvidersPage
             catalog={providerCatalog}
@@ -3850,7 +4355,7 @@ function App(): JSX.Element {
             <input className="input" style={{ maxWidth: 260 }} value={filterText} onChange={(event) => setFilterText(event.target.value)} placeholder="按名称筛选" />
           </div>
           <div className="table-wrapper">
-            <table>
+            <table className="egress-proxies-table">
               <thead>
                 <tr>
                   <th>名称</th>
@@ -3865,16 +4370,16 @@ function App(): JSX.Element {
               <tbody>
                 {visibleProxies.map((proxy) => (
                   <tr key={proxy.id}>
-                    <td>
+                    <td className="cell-start">
                       <strong>{proxy.name}</strong>
                       <div className="muted-copy">{proxy.has_credentials ? "已配置认证" : "无认证"}</div>
                     </td>
-                    <td>{proxy.protocol === "socks5" ? "SOCKS5" : "HTTP CONNECT"}<div className="muted-copy">{proxy.host}:{proxy.port}</div></td>
-                    <td><StatusBadge proxy={proxy} /></td>
-                    <td>{proxy.priority}</td>
-                    <td>{proxy.bound_mailbox_count}</td>
-                    <td>{formatTime(proxy.last_success_at)}</td>
-                    <td>
+                    <td className="cell-center">{proxy.protocol === "socks5" ? "SOCKS5" : "HTTP CONNECT"}<div className="muted-copy">{proxy.host}:{proxy.port}</div></td>
+                    <td className="cell-center"><StatusBadge proxy={proxy} /></td>
+                    <td className="cell-center">{proxy.priority}</td>
+                    <td className="cell-center">{proxy.bound_mailbox_count}</td>
+                    <td className="cell-center">{formatTime(proxy.last_success_at)}</td>
+                    <td className="cell-center">
                       <div className="cell-actions">
                         <button className="button" type="button" onClick={() => void testProxy(proxy)}>测试</button>
                         {proxy.status === "cooldown" && <button className="button" type="button" onClick={() => void recoverProxy(proxy)}>恢复</button>}

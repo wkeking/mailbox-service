@@ -214,6 +214,11 @@ button {
   gap: 16px;
 }
 
+/* 并排/堆叠均由 grid gap 控制间距，避免 .panel + .panel 的 margin-top 把右列顶下去 */
+.two-column-grid > .panel + .panel {
+  margin-top: 0;
+}
+
 .metric-card,
 .panel {
   border-radius: 10px;
@@ -316,25 +321,108 @@ table {
   text-align: left;
 }
 
+/* 表头统一居中；列值默认左对齐，短枚举/数字/时间用 .cell-center */
 th {
   height: 36px;
+  padding: 0 6px;
   color: #737373;
   font-size: 11px;
   font-weight: 400;
+  white-space: nowrap;
+  text-align: center;
 }
 
 td {
   min-height: 52px;
-  padding: 12px 8px 12px 0;
+  padding: 12px 6px;
   border-top: 1px solid #e5e5e5;
   font-size: 12px;
   vertical-align: middle;
+  text-align: left;
 }
 
-.client-id-cell,
+.cell-center {
+  text-align: center;
+}
+
+.cell-start {
+  text-align: left;
+}
+
+.mailbox-table {
+  table-layout: fixed;
+  min-width: 960px;
+}
+
+.mailbox-table .mailbox-email-cell strong,
+.mailbox-table .truncated-hover-field,
+.mailbox-table .truncated-hover-label {
+  max-width: 100%;
+}
+
+.mailbox-col-select {
+  width: 36px;
+}
+
+.mailbox-col-email {
+  width: 22%;
+}
+
+.mailbox-col-status {
+  width: 72px;
+}
+
+.mailbox-col-scope {
+  width: 10%;
+}
+
+.mailbox-col-capability {
+  width: 72px;
+}
+
+.mailbox-col-token-version {
+  width: 84px;
+}
+
+.mailbox-col-datetime {
+  width: 11%;
+}
+
+.mailbox-col-proxy {
+  width: 12%;
+}
+
+.mailbox-col-lease {
+  width: 72px;
+}
+
+.mailbox-col-actions {
+  width: 108px;
+}
+
+.mailbox-email-cell strong {
+  display: inline-block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: bottom;
+}
+
+.mailbox-datetime-cell,
+.mailbox-token-version-cell,
+.mailbox-lease-cell {
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.mailbox-proxy-cell {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .scope-cell {
-  max-width: 88px;
-  min-width: 64px;
+  min-width: 0;
 }
 
 .truncated-hover-field {
@@ -395,7 +483,6 @@ td {
   display: block;
 }
 
-.client-id-summary .truncated-hover-label,
 .scope-summary .truncated-hover-label {
   color: #4a4a4a;
 }
@@ -406,8 +493,9 @@ tbody tr:hover {
 
 .cell-actions {
   display: flex;
-  justify-content: flex-end;
+  justify-content: center;
   gap: 7px;
+  flex-wrap: wrap;
 }
 
 .badge {
@@ -603,6 +691,11 @@ tbody tr:hover {
   flex-wrap: wrap;
   gap: 6px;
   max-width: 320px;
+}
+
+.cell-center .scope-chip-list {
+  justify-content: center;
+  margin-inline: auto;
 }
 
 .scope-chip {
@@ -919,13 +1012,16 @@ tbody tr:hover {
 }
 
 .sidebar-actions {
-  display: grid;
-  gap: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
   margin-top: 14px;
 }
 
 .sidebar-actions .navigation-item {
-  width: 100%;
+  flex: 0 1 auto;
+  min-width: 0;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -1054,7 +1150,6 @@ tbody tr:hover {
     color: #f2f2f2;
   }
 
-  .client-id-summary .truncated-hover-label,
   .scope-summary .truncated-hover-label {
     color: #d4d4d4;
   }

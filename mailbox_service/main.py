@@ -97,8 +97,16 @@ from mailbox_service.schemas import (
     SmsbowerReplenishResponse,
     ProviderCatalogResponse,
     ProviderCatalogItemResponse,
+    ProviderDomainsResponse,
+    ProviderHealthItemResponse,
+    ProviderHealthListResponse,
     ProviderInstanceSettingsResponse,
     ProviderInstanceSettingsUpdate,
+    OperatorMessageItemResponse,
+    OperatorSessionCreateRequest,
+    OperatorSessionListResponse,
+    OperatorSessionMessagesResponse,
+    OperatorSessionResponse,
     SmsbowerSettingsResponse,
     SmsbowerSettingsUpdate,
     MailboxReacquireRequest,
@@ -1904,6 +1912,327 @@ def admin_list_providers(
         ProviderCatalogItemResponse(**item) for item in service.list_provider_summaries()
     ]
     return ProviderCatalogResponse(items=items)
+
+
+@app.get("/api/v1/admin/providers/health", response_model=ProviderHealthListResponse)
+def admin_providers_health(
+    settings: SettingsDependency,
+    _: AdminDependency,
+    check: bool = Query(default=True, description="是否实时探测；false 仅返回 unknown 占位。"),
+) -> ProviderHealthListResponse:
+    """Probe connectivity for all registered providers (Admin only)."""
+    from mailbox_service.provider_health_service import ProviderHealthService
+
+    health_service = ProviderHealthService(
+        settings,
+        credential_cipher=get_credential_cipher(settings),
+        session_factory=SessionFactory,
+    )
+    results = health_service.check_all(check=check)
+    return ProviderHealthListResponse(
+        items=[
+            ProviderHealthItemResponse(
+                provider_type=item.provider_type,
+                provider_instance_id=item.provider_instance_id,
+                enabled=item.enabled,
+                status=item.status,
+                latency_ms=item.latency_ms,
+                checked_at=item.checked_at,
+                domains_preview=list(item.domains_preview),
+                error_summary=item.error_summary,
+                detail=dict(item.detail or {}),
+                display_name=item.display_name,
+                supply_mode=item.supply_mode,
+            )
+            for item in results
+        ]
+    )
+
+
+@app.get(
+    "/api/v1/admin/providers/{provider_type}/instances/{instance_id}/health",
+    response_model=ProviderHealthItemResponse,
+)
+def admin_provider_instance_health(
+    provider_type: str,
+    instance_id: str,
+    settings: SettingsDependency,
+    _: AdminDependency,
+    check: bool = Query(default=True),
+) -> ProviderHealthItemResponse:
+    """Probe one provider instance."""
+    from mailbox_service.provider_health_service import ProviderHealthService
+
+    item = ProviderHealthService(
+        settings,
+        credential_cipher=get_credential_cipher(settings),
+        session_factory=SessionFactory,
+    ).check_one(provider_type, instance_id, check=check)
+    return ProviderHealthItemResponse(
+        provider_type=item.provider_type,
+        provider_instance_id=item.provider_instance_id,
+        enabled=item.enabled,
+        status=item.status,
+        latency_ms=item.latency_ms,
+        checked_at=item.checked_at,
+        domains_preview=list(item.domains_preview),
+        error_summary=item.error_summary,
+        detail=dict(item.detail or {}),
+        display_name=item.display_name,
+        supply_mode=item.supply_mode,
+    )
+
+
+@app.get(
+    "/api/v1/admin/providers/{provider_type}/instances/{instance_id}/domains",
+    response_model=ProviderDomainsResponse,
+)
+def admin_provider_instance_domains(
+    provider_type: str,
+    instance_id: str,
+    settings: SettingsDependency,
+    _: AdminDependency,
+) -> ProviderDomainsResponse:
+    """List domains for one provider instance (Admin only)."""
+    from mailbox_service.provider_health_service import ProviderHealthService
+
+    try:
+        domains = ProviderHealthService(
+            settings,
+            credential_cipher=get_credential_cipher(settings),
+            session_factory=SessionFactory,
+        ).list_domains(provider_type, instance_id)
+    except Exception as error:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "PROVIDER_DOMAINS_FAILED", "message": str(error)},
+        ) from error
+    return ProviderDomainsResponse(
+        provider_type=provider_type,
+        provider_instance_id=instance_id,
+        domains=list(domains),
+    )
+
+
+def _serialize_operator_session(view) -> OperatorSessionResponse:
+    return OperatorSessionResponse(
+        lease_id=view.lease_id,
+        provider_type=view.provider_type,
+        provider_instance_id=view.provider_instance_id,
+        provider_resource_id=view.provider_resource_id,
+        address=view.address,
+        purpose=view.purpose,
+        expires_at=view.expires_at,
+        created_at=view.created_at,
+        released_at=view.released_at,
+        last_verification_code=view.last_verification_code,
+        last_code_checked_at=view.last_code_checked_at,
+    )
+
+
+@app.get("/api/v1/admin/operator/sessions", response_model=OperatorSessionListResponse)
+def admin_list_operator_sessions(
+    session: SessionDependency,
+    settings: SettingsDependency,
+    _: AdminDependency,
+    include_released: bool = Query(default=False),
+) -> OperatorSessionListResponse:
+    """List Admin operator debug sessions."""
+    from mailbox_service.operator_session_service import OperatorSessionService
+    from mailbox_service.providers.ondemand_facade import OnDemandProviderService
+
+    cipher = get_credential_cipher(settings)
+    if cipher is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "CREDENTIAL_ENCRYPTION_NOT_CONFIGURED", "message": "未配置凭证加密密钥"},
+        )
+    service = OperatorSessionService(
+        session,
+        settings,
+        cipher,
+        on_demand_service=OnDemandProviderService(
+            settings, credential_cipher=cipher, session_factory=SessionFactory
+        ),
+    )
+    items = service.list_sessions(include_released=include_released)
+    return OperatorSessionListResponse(items=[_serialize_operator_session(item) for item in items])
+
+
+@app.post("/api/v1/admin/operator/sessions", response_model=OperatorSessionResponse)
+def admin_create_operator_session(
+    payload: OperatorSessionCreateRequest,
+    session: SessionDependency,
+    settings: SettingsDependency,
+    admin_id: AdminDependency,
+) -> OperatorSessionResponse:
+    """Create an on-demand operator debug session (does not write mailboxes)."""
+    from mailbox_service.operator_session_service import (
+        OperatorProviderError,
+        OperatorSessionLimitError,
+        OperatorSessionService,
+    )
+    from mailbox_service.providers.ondemand_facade import OnDemandProviderService
+
+    cipher = get_credential_cipher(settings)
+    if cipher is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "CREDENTIAL_ENCRYPTION_NOT_CONFIGURED", "message": "未配置凭证加密密钥"},
+        )
+    service = OperatorSessionService(
+        session,
+        settings,
+        cipher,
+        on_demand_service=OnDemandProviderService(
+            settings, credential_cipher=cipher, session_factory=SessionFactory
+        ),
+    )
+    try:
+        view = service.create_session(
+            provider_type=payload.provider_type,
+            provider_instance_id=payload.provider_instance_id,
+            domain=payload.domain,
+            local_part=payload.local_part,
+            label=payload.label,
+            ttl_seconds=payload.ttl_seconds,
+            admin_id=admin_id,
+        )
+    except OperatorSessionLimitError as error:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail={"code": "OPERATOR_SESSION_LIMIT", "message": str(error)},
+        ) from error
+    except OperatorProviderError as error:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "OPERATOR_PROVIDER_ERROR", "message": str(error)},
+        ) from error
+    create_audit_log(
+        session,
+        admin_id,
+        "operator.session_created",
+        "operator_session",
+        view.lease_id,
+        {
+            "provider_type": view.provider_type,
+            "provider_resource_id": view.provider_resource_id,
+            "address": view.address,
+        },
+    )
+    return _serialize_operator_session(view)
+
+
+@app.get(
+    "/api/v1/admin/operator/sessions/{lease_id}/messages",
+    response_model=OperatorSessionMessagesResponse,
+)
+def admin_operator_session_messages(
+    lease_id: str,
+    session: SessionDependency,
+    settings: SettingsDependency,
+    _: AdminDependency,
+) -> OperatorSessionMessagesResponse:
+    """Fetch messages and extract codes for an operator debug session."""
+    from mailbox_service.operator_session_service import (
+        OperatorProviderError,
+        OperatorSessionNotFoundError,
+        OperatorSessionService,
+    )
+    from mailbox_service.providers.ondemand_facade import OnDemandProviderService
+
+    cipher = get_credential_cipher(settings)
+    if cipher is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "CREDENTIAL_ENCRYPTION_NOT_CONFIGURED", "message": "未配置凭证加密密钥"},
+        )
+    service = OperatorSessionService(
+        session,
+        settings,
+        cipher,
+        on_demand_service=OnDemandProviderService(
+            settings, credential_cipher=cipher, session_factory=SessionFactory
+        ),
+    )
+    try:
+        session_view, messages, codes = service.fetch_messages(lease_id)
+    except OperatorSessionNotFoundError as error:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "OPERATOR_SESSION_NOT_FOUND", "message": str(error)},
+        ) from error
+    except OperatorProviderError as error:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "OPERATOR_PROVIDER_ERROR", "message": str(error)},
+        ) from error
+    return OperatorSessionMessagesResponse(
+        session=_serialize_operator_session(session_view),
+        total=len(messages),
+        codes=codes,
+        messages=[
+            OperatorMessageItemResponse(
+                id=message.id,
+                from_address=message.from_address,
+                subject=message.subject,
+                intro=message.intro,
+                text=message.text,
+                created_at=message.created_at,
+                code=message.code,
+            )
+            for message in messages
+        ],
+    )
+
+
+@app.delete(
+    "/api/v1/admin/operator/sessions/{lease_id}",
+    response_model=OperatorSessionResponse,
+)
+def admin_release_operator_session(
+    lease_id: str,
+    session: SessionDependency,
+    settings: SettingsDependency,
+    admin_id: AdminDependency,
+) -> OperatorSessionResponse:
+    """Release an operator debug session and retire its provider resource."""
+    from mailbox_service.operator_session_service import (
+        OperatorSessionNotFoundError,
+        OperatorSessionService,
+    )
+    from mailbox_service.providers.ondemand_facade import OnDemandProviderService
+
+    cipher = get_credential_cipher(settings)
+    if cipher is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "CREDENTIAL_ENCRYPTION_NOT_CONFIGURED", "message": "未配置凭证加密密钥"},
+        )
+    service = OperatorSessionService(
+        session,
+        settings,
+        cipher,
+        on_demand_service=OnDemandProviderService(
+            settings, credential_cipher=cipher, session_factory=SessionFactory
+        ),
+    )
+    try:
+        view = service.release_session(lease_id)
+    except OperatorSessionNotFoundError as error:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "OPERATOR_SESSION_NOT_FOUND", "message": str(error)},
+        ) from error
+    create_audit_log(
+        session,
+        admin_id,
+        "operator.session_released",
+        "operator_session",
+        view.lease_id,
+        {"provider_resource_id": view.provider_resource_id},
+    )
+    return _serialize_operator_session(view)
 
 
 @app.get(

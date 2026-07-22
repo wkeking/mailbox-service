@@ -1,39 +1,34 @@
-# Single-host app deployment. MySQL comes from the shared Docker infra stack:
-#   /path/to/infra/docker-compose.yml
-#
-# That stack exposes:
-#   - network: external_network  (compose project "infra", network name "infra")
-#   - MySQL:   mysql-host  (root / change-me, host port 3306)
+# App deployment example.
+# MySQL is expected to already exist on an external Docker network.
 #
 # Prerequisites:
-#   1. cd /path/to/infra && docker compose up -d
-#   2. Create app database (once):
-#        docker exec -i mysql-host mysql -uroot -pchange-me \
-#          -e "CREATE DATABASE IF NOT EXISTS mailbox_service CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
-#   3. cp .env.example .env  # fill secrets
-#      Docker Compose 内 DATABASE_URL 主机名必须用 mysql-host，不要写 127.0.0.1
+#   1. Ensure an external Docker network exists (set INFRA_NETWORK_NAME).
+#   2. Create the application database once.
+#   3. cp .env.example .env  # fill secrets; never commit real .env
 #   4. docker compose up -d
 #
 # Usage:
+#   export MAILBOX_IMAGE=registry.example.com/mailbox-service:latest
+#   export INFRA_NETWORK_NAME=your_external_network
 #   docker compose up -d
 
 services:
   mailbox-service:
-    image: ${MAILBOX_IMAGE:-registry.example.com/mailbox-service:latest}
+    image: ${MAILBOX_IMAGE:-mailbox-service:latest}
     container_name: mailbox-service
     restart: unless-stopped
-    # Prefer loopback publish for local/dev; reverse-proxy peers can share infra network.
+    # Prefer loopback publish for local/dev; expose carefully if putting behind an external reverse proxy.
     ports:
       - "${HOST_BIND_ADDRESS:-127.0.0.1}:${HOST_PORT:-8000}:8000"
     env_file:
       - .env
     environment:
-      # Compose-internal default targets shared infra MySQL; .env may override for host uvicorn.
-      DATABASE_URL: ${DATABASE_URL:-mysql+pymysql://root:change-me@mysql-host:3306/mailbox_service}
+      # Prefer values from .env; no real credentials are hard-coded here.
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL must be set in .env}
       APP_ENV: ${APP_ENV:-production}
       CORS_ALLOW_ORIGINS: ${CORS_ALLOW_ORIGINS:-*}
       FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS:-127.0.0.1}
-      TLS_MODE: ${TLS_MODE:-terminated_at_proxy}
+      TLS_MODE: ${TLS_MODE:-disabled}
       AUTO_MIGRATE_ON_STARTUP: ${AUTO_MIGRATE_ON_STARTUP:-true}
     networks:
       - infra
@@ -59,36 +54,9 @@ services:
       retries: 3
       start_period: 20s
 
-  # Optional reverse proxy profile for TLS termination on the same host.
-  # Enable with: docker compose --profile tls up -d
-  caddy:
-    profiles: ["tls"]
-    image: caddy:2.9-alpine
-    container_name: mailbox-caddy
-    restart: unless-stopped
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
-      - caddy_data:/data
-      - caddy_config:/config
-    networks:
-      - infra
-    depends_on:
-      - mailbox-service
-    logging:
-      driver: local
-      options:
-        max-size: "10m"
-        max-file: "3"
-
 networks:
-  # Matches Docker/infra compose network "infra" (external name: external_network).
+  # Attach to an existing external network that can reach MySQL.
   infra:
     external: true
-    name: external_network
+    name: ${INFRA_NETWORK_NAME:-infra_default}
 
-volumes:
-  caddy_data:
-  caddy_config:
