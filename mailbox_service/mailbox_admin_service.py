@@ -180,7 +180,9 @@ class MailboxAdminService:
                 event_type="mailbox.invalid_deleted_chunk",
                 target_type="mailbox",
                 target_id=None,
-                operation_id=f"{operation_id}:{chunk_index}",
+                # Must stay within audit_logs.operation_id VARCHAR(36) (UUID only).
+                # chunk_index is recorded in metadata for correlation.
+                operation_id=operation_id,
                 metadata={
                     "operation_id": operation_id,
                     "chunk_index": chunk_index,

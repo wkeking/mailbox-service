@@ -117,3 +117,17 @@ def test_delete_invalid_chunk_writes_chunk_audit() -> None:
         session.scalars(select(AuditLog).where(AuditLog.event_type == "mailbox.invalid_deleted_chunk"))
     )
     assert len(chunk_audits) >= 2
+    # Regression: MySQL rejects operation_id longer than VARCHAR(36).
+    # Never use composite keys like "{uuid}:{chunk_index}" here.
+    for chunk_audit in chunk_audits:
+        assert chunk_audit.operation_id is not None
+        assert len(chunk_audit.operation_id) <= 36
+        assert ":" not in chunk_audit.operation_id
+        assert chunk_audit.metadata_json.get("chunk_index") is not None
+    parent_operation_ids = {chunk_audit.operation_id for chunk_audit in chunk_audits}
+    assert len(parent_operation_ids) == 1
+    summary_audits = list(
+        session.scalars(select(AuditLog).where(AuditLog.event_type == "mailbox.invalid_deleted"))
+    )
+    assert len(summary_audits) == 1
+    assert summary_audits[0].operation_id == next(iter(parent_operation_ids))
